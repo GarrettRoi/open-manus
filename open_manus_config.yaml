@@ -1,0 +1,101 @@
+# ============================================================
+# Open Manus — Default Configuration
+# Based on Hermes-Agent by Nous Research
+# This file is deployed to /root/.hermes/config.yaml
+# ============================================================
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model:
+  # Primary model: Use OpenRouter for access to 200+ models
+  # Override with OPENROUTER_API_KEY env var and LLM_MODEL env var
+  default: "anthropic/claude-opus-4.6"
+  provider: "openrouter"
+  base_url: "https://openrouter.ai/api/v1"
+
+# =============================================================================
+# Agent Identity (Open Manus Persona)
+# =============================================================================
+agent:
+  name: "Open Manus"
+  description: "An autonomous general AI agent — an open-source replica of Manus.im"
+  # The system prompt file to use for the agent's identity and behavioral rules
+  system_prompt_file: "/app/open_manus_system_prompt.md"
+
+# =============================================================================
+# Terminal Tool Configuration
+# =============================================================================
+terminal:
+  # Use local execution within the Docker container
+  backend: "local"
+  cwd: "/root/.hermes/workspace"
+  timeout: 180
+  lifetime_seconds: 600
+
+# =============================================================================
+# Memory Configuration
+# =============================================================================
+memory:
+  enabled: true
+  # Use the built-in SQLite-based memory (FTS5 search)
+  backend: "core"
+  # Auto-save memories after complex tasks
+  auto_capture: true
+
+# =============================================================================
+# Context Compression
+# =============================================================================
+compression:
+  enabled: true
+  threshold: 0.85
+  # Use a fast, cheap model for summarization
+  summary_model: "google/gemini-2.0-flash-001"
+
+# =============================================================================
+# Toolsets — Enable all core Open Manus capabilities
+# =============================================================================
+tools:
+  enabled_toolsets:
+    - "web"           # Web search (Firecrawl) and extraction
+    - "terminal"      # Shell command execution
+    - "files"         # File read/write/edit
+    - "vision"        # Image and PDF understanding
+    - "browser"       # Browser automation (Browserbase)
+    - "image_gen"     # Image generation (FAL.ai)
+    - "tts"           # Text-to-speech (ElevenLabs)
+    - "memory"        # Persistent memory
+    - "cron"          # Task scheduling
+    - "skills"        # Skill management
+    - "delegate"      # Sub-agent delegation
+    - "mcp"           # MCP server integrations
+    - "productivity"  # Presentations, map-reduce (Open Manus custom)
+    - "todo"          # Task tracking
+    - "transcription" # Audio/video transcription
+
+# =============================================================================
+# Gateway Configuration (for messaging integrations)
+# =============================================================================
+gateway:
+  host: "0.0.0.0"
+  port: 8080
+  # Allow all users in headless/API mode
+  allow_all_users: true
+  # Web UI is enabled by default
+  web_ui: true
+
+# =============================================================================
+# Display / Branding (Open Manus theme)
+# =============================================================================
+display:
+  skin: "open-manus"
+
+# =============================================================================
+# Skills Configuration
+# =============================================================================
+skills:
+  # Directories to scan for skills
+  directories:
+    - "/root/.hermes/skills"
+    - "/app/skills"
+    - "/app/optional-skills"
