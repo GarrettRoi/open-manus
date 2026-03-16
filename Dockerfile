@@ -1,7 +1,7 @@
 # ============================================================
-# Open Manus — Dockerfile
+# Open Manus — Multi-Agent Dockerfile
 # Based on Hermes-Agent by Nous Research
-# Configured for Railway deployment
+# Each Railway service runs ONE agent, selected by AGENT_NAME
 # ============================================================
 
 FROM python:3.11-slim
@@ -18,12 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     poppler-utils \
     ffmpeg \
-    nodejs \
-    npm \
     bc \
     less \
     net-tools \
     socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 (required for some tools)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast Python package management
@@ -35,10 +38,10 @@ WORKDIR /app
 # Copy dependency files first for layer caching
 COPY pyproject.toml requirements.txt ./
 
-# Install Python dependencies
-RUN uv pip install --system -e ".[all]" || pip install -r requirements.txt
+# Install Python dependencies (all extras for full functionality)
+RUN uv pip install --system -e ".[all]" 2>/dev/null || pip install -e ".[all]" 2>/dev/null || pip install -r requirements.txt
 
-# Install additional Open Manus dependencies
+# Install additional dependencies for extended tool capabilities
 RUN pip install \
     python-pptx \
     markdown \
@@ -48,9 +51,11 @@ RUN pip install \
     elevenlabs \
     firecrawl-py \
     playwright \
-    redis
+    redis \
+    stripe \
+    python-dotenv
 
-# Install Playwright browsers
+# Install Playwright browsers for web automation
 RUN playwright install chromium --with-deps || true
 
 # Copy the entire application
@@ -61,29 +66,24 @@ RUN if [ -f "mini-swe-agent/setup.py" ] || [ -f "mini-swe-agent/pyproject.toml" 
     pip install -e ./mini-swe-agent; \
     fi
 
+# Install hermes-agent itself as a CLI tool
+RUN pip install -e . 2>/dev/null || true
+
 # Create workspace and config directories
-RUN mkdir -p /root/.hermes/workspace /root/.hermes/skills /root/.hermes/memory
+RUN mkdir -p /root/.hermes/workspace /root/.hermes/skills /root/.hermes/memory /root/.hermes/sessions
 
-# Copy Open Manus skills into the hermes skills directory
-RUN cp -r /app/skills/task-planner /root/.hermes/skills/ 2>/dev/null || true
-
-# Copy the Open Manus config template
-COPY open_manus_config.yaml /root/.hermes/config.yaml
+# Make entrypoint executable
+RUN chmod +x /app/entrypoint.sh
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV HERMES_WORKSPACE_DIR=/root/.hermes/workspace
 ENV TERMINAL_ENV=local
-ENV TERMINAL_TIMEOUT=120
-ENV PORT=8080
+ENV TERMINAL_TIMEOUT=180
 
-# Expose the gateway port
-EXPOSE 8080
+# Default agent (overridden per Railway service)
+ENV AGENT_NAME=harmony
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
-# Start the Open Manus server
-CMD ["python", "open_manus_server.py"]
+# Start via the multi-agent entrypoint
+CMD ["/app/entrypoint.sh"]

@@ -50,3 +50,8 @@ skills/.hub/
 ignored/
 .worktrees/
 environments/benchmarks/evals/
+
+# Hermes runtime data
+workspace/
+sessions/
+memory/
