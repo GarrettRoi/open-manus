@@ -4,7 +4,7 @@
 # ============================================================
 
 model:
-  default: "x-ai/grok-4.20-multi-agent-beta"
+  default: "x-ai/grok-4.20-beta"
   provider: "openrouter"
 
 agent:

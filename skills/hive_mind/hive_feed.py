@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hive Mind Feed — Check your personal knowledge feed.
-The Librarian routes approved lessons to each agent's feed based on their goals.
+The Lexi routes approved lessons to each agent's feed based on their goals.
 """
 import argparse
 import json

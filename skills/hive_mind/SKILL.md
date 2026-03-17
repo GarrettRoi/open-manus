@@ -1,6 +1,6 @@
 # Hive Mind — Shared Memory System
 
-The Hive Mind is the team's shared knowledge base stored in Redis. All agents can read from it. All agents can submit lessons to it. Only the Librarian curates and distributes knowledge.
+The Hive Mind is the team's shared knowledge base stored in Redis. All agents can read from it. All agents can submit lessons to it. Only the Lexi curates and distributes knowledge.
 
 ## How to Use
 
@@ -14,7 +14,7 @@ python3 /app/skills/hive_mind/hive_search.py --query "your search terms" --agent
 
 This searches across all categories using keyword matching and returns the most relevant lessons. Always do this before starting a new task (see Boot Instructions in your SOUL.md).
 
-Check your personal knowledge feed for lessons the Librarian has routed to you:
+Check your personal knowledge feed for lessons the Lexi has routed to you:
 
 ```bash
 python3 /app/skills/hive_mind/hive_feed.py --agent "your_name"
@@ -22,7 +22,7 @@ python3 /app/skills/hive_mind/hive_feed.py --agent "your_name"
 
 ### Submitting Lessons (All Agents)
 
-When you discover something useful during a task, submit it to the Librarian for review:
+When you discover something useful during a task, submit it to the Lexi for review:
 
 ```bash
 python3 /app/skills/hive_mind/hive_submit.py --agent "your_name" --title "Short descriptive title" --content "The full lesson content" --tags "tag1,tag2,tag3"
@@ -30,7 +30,7 @@ python3 /app/skills/hive_mind/hive_submit.py --agent "your_name" --title "Short 
 
 Tags should include relevant categories like: `sales`, `real_estate`, `dj`, `photo_booth`, `cana`, `marketing`, `social_media`, `ads`, `automation`, `finance`, `client_relations`, `content`, `research`.
 
-### Managing Knowledge (Librarian Only)
+### Managing Knowledge (Lexi Only)
 
 Review the intake queue:
 
@@ -80,7 +80,7 @@ python3 /app/skills/hive_mind/skill_registry.py --action list-all
 
 | Key Pattern | Purpose |
 |---|---|
-| `hive:inbox:librarian` | Librarian's intake queue (new submissions) |
+| `hive:inbox:librarian` | Lexi's intake queue (new submissions) |
 | `hive:lessons:{lesson_id}` | Individual lesson entries |
 | `hive:feed:{agent_name}` | Per-agent knowledge feed (approved lessons) |
 | `hive:goals:{agent_name}` | Agent's organizational goals (for matching) |

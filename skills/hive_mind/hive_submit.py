@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hive Mind Submit — Submit a lesson to the Librarian for review.
+Hive Mind Submit — Submit a lesson to the Lexi for review.
 All agents use this when they discover something useful during a task.
 """
 import argparse
@@ -23,7 +23,7 @@ def get_redis():
 
 
 def submit_lesson(r, agent_name, title, content, tags):
-    """Submit a new lesson to the Librarian's intake queue."""
+    """Submit a new lesson to the Lexi's intake queue."""
     lesson_id = f"lesson_{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow().isoformat()
 
@@ -40,7 +40,7 @@ def submit_lesson(r, agent_name, title, content, tags):
     # Store the lesson data
     r.hset(f"hive:lessons:{lesson_id}", mapping=lesson)
 
-    # Add to Librarian's inbox
+    # Add to Lexi's inbox
     r.rpush("hive:inbox:librarian", json.dumps(lesson))
 
     return lesson_id
@@ -62,7 +62,7 @@ def main():
     print(f"  Title: {args.title}")
     print(f"  From:  {args.agent}")
     print(f"  Tags:  {args.tags}")
-    print(f"  Status: pending (awaiting Librarian review)")
+    print(f"  Status: pending (awaiting Lexi review)")
 
 
 if __name__ == "__main__":

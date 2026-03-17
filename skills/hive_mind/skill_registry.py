@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Skill Registry — Manage and query what tools/skills each agent has access to.
-The Librarian maintains this registry. Any agent can query it.
+The Lexi maintains this registry. Any agent can query it.
 """
 import argparse
 import json

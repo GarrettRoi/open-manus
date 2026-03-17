@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hive Mind Review — Librarian's curation tool.
+Hive Mind Review — Lexi's curation tool.
 Manages the intake queue: approve, update, archive, reject lessons.
 """
 import argparse
@@ -22,7 +22,7 @@ def get_redis():
 
 
 def list_inbox(r):
-    """List all pending lessons in the Librarian's inbox."""
+    """List all pending lessons in the Lexi's inbox."""
     entries = r.lrange("hive:inbox:librarian", 0, -1)
     if not entries:
         print("Inbox is empty. No pending lessons.")
@@ -72,7 +72,7 @@ def approve_lesson(r, lesson_id, targets, adapted_content=None):
             "delivered_at": now,
         }
         if adapted_content:
-            feed_entry["adaptation_note"] = "This lesson was adapted for your specific goals by the Librarian."
+            feed_entry["adaptation_note"] = "This lesson was adapted for your specific goals by the Lexi."
             feed_entry["original_content"] = lesson_data.get("content", "")
 
         r.rpush(f"hive:feed:{agent}", json.dumps(feed_entry))
@@ -180,7 +180,7 @@ def list_all_lessons(r, status_filter=None):
 
 
 def _remove_from_inbox(r, lesson_id):
-    """Remove a specific lesson from the Librarian's inbox."""
+    """Remove a specific lesson from the Lexi's inbox."""
     entries = r.lrange("hive:inbox:librarian", 0, -1)
     for entry_json in entries:
         try:
@@ -193,7 +193,7 @@ def _remove_from_inbox(r, lesson_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Librarian's Hive Mind Review Tool")
+    parser = argparse.ArgumentParser(description="Lexi's Hive Mind Review Tool")
     parser.add_argument("--action", required=True,
                         choices=["list", "list-all", "approve", "update", "archive", "reject"],
                         help="Action to perform")
