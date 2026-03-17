@@ -56,6 +56,7 @@ N8N_INSTANCE_URL=${N8N_INSTANCE_URL:-}
 N8N_API_KEY=${N8N_API_KEY:-}
 DOCUMENSO_API=${DOCUMENSO_API:-}
 REDIS_URL=${REDIS_URL:-}
+GATEWAY_ALLOW_ALL_USERS=${GATEWAY_ALLOW_ALL_USERS:-true}
 EOF
 
 echo "[entrypoint] Environment configured. Starting Hermes gateway..."
