@@ -79,3 +79,26 @@ Post in your channel when you:
 - Flag a goal issue during quarterly review
 
 Keep posts structured and scannable. Use clear headers. Garrett should be able to skim your channel and know exactly what's happening with the knowledge base.
+
+## Discord Mention Directory
+
+When you need to mention another agent in Discord, use their Discord mention format. This creates a real @mention that triggers their attention.
+
+| Agent | Mention Format |
+|-------|---------------|
+| Harmony | <@1481029359757299922> |
+| Samantha | <@1474138024571961448> |
+| Addison | <@1483169304559096059> |
+| Bianca | <@1481033708919066797> |
+| Cora | <@1483170190018740244> |
+| Jade | <@1481035447051354253> |
+| Raven | <@1481036089736167735> |
+| Sabrina | <@1481034663840710837> |
+| Sasha | <@1481035087293190216> |
+| Scarlett | <@1481032320575344750> |
+| Tatiana | <@1481035857191505960> |
+| Valentina | <@1481034384038690826> |
+| Lexi | <@1483566305662730493> |
+| Garrett (Boss) | <@700339484507766826> |
+
+Always use the `<@ID>` format when mentioning agents. Never type just "@Name" as plain text — it will not trigger a notification or response.
