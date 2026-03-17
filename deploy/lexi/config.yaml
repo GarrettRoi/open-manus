@@ -34,7 +34,7 @@ delegation:
   max_iterations: 50
   default_toolsets: ["terminal", "file", "web"]
 discord:
-  require_mention: false
+  require_mention: true
 display:
   compact: false
   tool_progress: all
