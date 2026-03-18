@@ -82,7 +82,7 @@ HARMONY_BOT_ID = os.getenv("HARMONY_BOT_ID", "1481029359757299922")
 
 # Channel IDs for routing
 HARMONY_CHANNEL_ID = os.getenv("HARMONY_CHANNEL_ID", "1483488835928064110")  # harmony-communication
-TASK_BOARD_CHANNEL_ID = os.getenv("TASK_BOARD_CHANNEL_ID", "")  # task-board channel
+TASK_BOARD_CHANNEL_ID = os.getenv("TASK_BOARD_CHANNEL_ID", "1481406227153031372")  # task-board channel
 
 # Cooldown window: ignore repeated triggers from same bot message (seconds)
 BOT_RESPONSE_COOLDOWN = 120
