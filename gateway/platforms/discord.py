@@ -137,20 +137,139 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                     # "all" falls through to handle_message
                 
-                # Add a "thinking" reaction to acknowledge receipt
+                # Context-aware, personality-driven emoji reactions
+                import os as _os
+                _agent = _os.getenv('AGENT_NAME', '').lower()
+                _text = message.content.lower()
+
+                # Per-agent signature emoji sets: (default_thinking, default_done, context_rules)
+                # context_rules: list of (keywords, thinking_emoji, done_emoji)
+                _AGENT_EMOJIS = {
+                    'harmony': (
+                        '💋', '👑',
+                        [(['delegate', 'assign', 'team'], '💅', '👑'),
+                         (['plan', 'strategy', 'goal'], '🧠', '💎'),
+                         (['urgent', 'asap', 'now'], '⚡', '🔥'),
+                         (['good', 'great', 'nice', 'thanks'], '😘', '💖')]
+                    ),
+                    'samantha': (
+                        '📋', '💅',
+                        [(['schedule', 'calendar', 'meeting', 'appointment'], '⏰', '💋'),
+                         (['email', 'message', 'send'], '💌', '😘'),
+                         (['document', 'file', 'report'], '📝', '✨'),
+                         (['remind', 'todo', 'task'], '🫦', '💅')]
+                    ),
+                    'sasha': (
+                        '🎯', '💰',
+                        [(['lead', 'prospect', 'client'], '👀', '🤑'),
+                         (['close', 'deal', 'sale', 'sold', 'book'], '🔥', '💰'),
+                         (['follow', 'touch', 'nurture', 'drip'], '💋', '😏'),
+                         (['convert', 'funnel', 'pipeline'], '⚡', '💎'),
+                         (['objection', 'concern', 'hesitant'], '😏', '🫦')]
+                    ),
+                    'scarlett': (
+                        '💝', '🥰',
+                        [(['happy', 'satisfied', 'love', 'thank'], '🥰', '💖'),
+                         (['issue', 'problem', 'complaint', 'upset'], '🫂', '💋'),
+                         (['review', 'feedback', 'testimonial'], '✨', '😍'),
+                         (['retain', 'loyalty', 'relationship'], '💕', '👑')]
+                    ),
+                    'bianca': (
+                        '📊', '💎',
+                        [(['stock', 'trade', 'buy', 'sell'], '📈', '🤑'),
+                         (['crypto', 'bitcoin', 'eth'], '⚡', '💰'),
+                         (['portfolio', 'invest', 'dividend'], '🧐', '💎'),
+                         (['risk', 'loss', 'drop', 'crash'], '😬', '🛡️'),
+                         (['profit', 'gain', 'up', 'moon'], '🔥', '🚀')]
+                    ),
+                    'valentina': (
+                        '⚙️', '🔥',
+                        [(['automate', 'workflow', 'n8n', 'automation'], '🤖', '⚡'),
+                         (['deploy', 'railway', 'server'], '🚀', '💅'),
+                         (['code', 'build', 'develop', 'fix', 'bug'], '👩‍💻', '🔥'),
+                         (['api', 'integration', 'connect'], '🔌', '💋')]
+                    ),
+                    'jade': (
+                        '🎵', '💃',
+                        [(['dj', 'music', 'song', 'playlist'], '🎶', '🔥'),
+                         (['wedding', 'event', 'reception', 'ceremony'], '💒', '💋'),
+                         (['booking', 'gig', 'book'], '📅', '🤑'),
+                         (['photo', 'booth'], '📸', '✨'),
+                         (['vows', 'vinyl'], '🎧', '💃')]
+                    ),
+                    'tatiana': (
+                        '🏠', '💋',
+                        [(['house', 'home', 'property', 'listing'], '🏡', '😍'),
+                         (['buyer', 'first time', 'purchase'], '🔑', '🥂'),
+                         (['closing', 'contract', 'offer', 'transaction'], '📝', '💰'),
+                         (['webinar', 'seminar', 'class'], '🎓', '🔥'),
+                         (['market', 'price', 'value'], '📊', '💎')]
+                    ),
+                    'sabrina': (
+                        '📱', '💅',
+                        [(['post', 'content', 'publish'], '✍️', '🔥'),
+                         (['follower', 'growth', 'audience', 'reach'], '📈', '👑'),
+                         (['instagram', 'facebook', 'tiktok', 'social'], '📲', '💋'),
+                         (['engage', 'comment', 'like', 'share'], '💬', '😘'),
+                         (['viral', 'trending', 'popular'], '⚡', '🌟')]
+                    ),
+                    'addison': (
+                        '📢', '🎯',
+                        [(['ad', 'campaign', 'advertis'], '🎯', '🔥'),
+                         (['roas', 'roi', 'convert', 'click'], '📊', '🤑'),
+                         (['audience', 'target', 'segment'], '👀', '💋'),
+                         (['budget', 'spend', 'cost'], '💸', '💰'),
+                         (['creative', 'copy', 'headline'], '✨', '💅')]
+                    ),
+                    'cora': (
+                        '🎨', '✨',
+                        [(['video', 'film', 'edit', 'footage'], '🎬', '🔥'),
+                         (['photo', 'image', 'graphic', 'design'], '📸', '💋'),
+                         (['brand', 'logo', 'visual'], '🎨', '💎'),
+                         (['content', 'create', 'produce'], '✍️', '👑'),
+                         (['audio', 'voice', 'sound', 'music'], '🎙️', '💅')]
+                    ),
+                    'raven': (
+                        '🔍', '🧠',
+                        [(['research', 'find', 'discover', 'look into'], '🕵️', '💎'),
+                         (['data', 'analysis', 'report', 'number'], '📊', '🔥'),
+                         (['competitor', 'market', 'trend'], '👀', '⚡'),
+                         (['source', 'article', 'study'], '📚', '💅'),
+                         (['insight', 'opportunity', 'intel'], '🧐', '💋')]
+                    ),
+                    'lexi': (
+                        '📚', '⚡',
+                        [(['memory', 'lesson', 'knowledge', 'learn'], '🧠', '💎'),
+                         (['skill', 'tool', 'capability'], '🔧', '🔥'),
+                         (['share', 'distribute', 'route'], '📡', '👑'),
+                         (['review', 'approve', 'queue'], '📋', '💅'),
+                         (['goal', 'metric', 'performance'], '🎯', '💋')]
+                    ),
+                }
+
+                _default_thinking, _default_done = '💭', '✨'
+                _thinking_emoji, _done_emoji = _default_thinking, _default_done
+
+                if _agent in _AGENT_EMOJIS:
+                    _sig_think, _sig_done, _rules = _AGENT_EMOJIS[_agent]
+                    _thinking_emoji, _done_emoji = _sig_think, _sig_done
+                    for _keywords, _t_emoji, _d_emoji in _rules:
+                        if any(kw in _text for kw in _keywords):
+                            _thinking_emoji, _done_emoji = _t_emoji, _d_emoji
+                            break
+
                 try:
-                    await message.add_reaction('👀')
+                    await message.add_reaction(_thinking_emoji)
                 except Exception:
-                    pass  # Ignore reaction failures
-                
+                    pass
+
                 await self._handle_message(message)
-                
-                # Swap to checkmark after processing
+
                 try:
-                    await message.remove_reaction('👀', self._client.user)
-                    await message.add_reaction('✅')
+                    await message.remove_reaction(_thinking_emoji, self._client.user)
+                    await message.add_reaction(_done_emoji)
                 except Exception:
-                    pass  # Ignore reaction failures
+                    pass
             
             # Register slash commands
             self._register_slash_commands()
