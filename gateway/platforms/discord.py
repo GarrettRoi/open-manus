@@ -49,22 +49,40 @@ def check_discord_requirements() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Turn-Based Communication Protocol
+# Channel-Based Routing & Communication Protocol
 # ---------------------------------------------------------------------------
-# Message tags that control inter-agent behavior:
-#   [NOTIFY]  — Notification only. Agent reacts but does NOT reply.
-#   [REQUEST] — Expects exactly one response from the mentioned agent.
-#   [REPORT]  — Like REQUEST but response goes to the original channel.
+# Architecture:
+#   - harmony-communication: "War room" where Harmony delegates tasks via @mentions
+#   - Agent home channels: Where agents do their actual work
+#   - task-board: Harmony posts/updates task tracking items
 #
-# Anti-doom-loop rules (enforced programmatically):
-#   1. One response per bot message — tracked via cooldown set
-#   2. No chain reactions — bot replies to bot messages don't trigger
+# Message tags that control inter-agent behavior:
+#   [NOTIFY]  - Notification only. Agent reacts but does NOT reply.
+#   [REQUEST] - Expects exactly one response from the mentioned agent.
+#   [END]     - Agent signals task is complete. No further replies.
+#   [REPORT]  - Like REQUEST but response goes to the original channel.
+#
+# Mention rules (enforced programmatically):
+#   - Only Harmony can @mention specific worker agents
+#   - Worker agents can only @mention Harmony (not each other)
+#   - Garrett (owner) always bypasses all restrictions
+#
+# Anti-doom-loop rules:
+#   1. One response per bot message - tracked via cooldown set
+#   2. No chain reactions - bot replies to bot messages don't trigger
 #      unless the reply explicitly @mentions with [REQUEST]
-#   3. Garrett (owner) always bypasses bot-to-bot restrictions
+#   3. [END] and [NOTIFY] messages never trigger replies
 # ---------------------------------------------------------------------------
 
-# Garrett's Discord user ID — always bypasses bot restrictions
+# Garrett's Discord user ID - always bypasses bot restrictions
 OWNER_USER_ID = os.getenv("DISCORD_OWNER_ID", "700339484507766826")
+
+# Harmony's Discord bot user ID - the only agent allowed to @mention others
+HARMONY_BOT_ID = os.getenv("HARMONY_BOT_ID", "1481029359757299922")
+
+# Channel IDs for routing
+HARMONY_CHANNEL_ID = os.getenv("HARMONY_CHANNEL_ID", "1483488835928064110")  # harmony-communication
+TASK_BOARD_CHANNEL_ID = os.getenv("TASK_BOARD_CHANNEL_ID", "")  # task-board channel
 
 # Cooldown window: ignore repeated triggers from same bot message (seconds)
 BOT_RESPONSE_COOLDOWN = 120
@@ -102,9 +120,9 @@ class BotMessageTracker:
 
 def parse_message_tag(content: str) -> Optional[str]:
     """Extract a protocol tag from message content.
-    Returns 'NOTIFY', 'REQUEST', 'REPORT', or None."""
+    Returns 'NOTIFY', 'REQUEST', 'END', 'REPORT', or None."""
     upper = content.upper()
-    for tag in ('NOTIFY', 'REQUEST', 'REPORT'):
+    for tag in ('NOTIFY', 'END', 'REQUEST', 'REPORT'):
         if f'[{tag}]' in upper:
             return tag
     return None
@@ -113,7 +131,7 @@ def parse_message_tag(content: str) -> Optional[str]:
 def strip_message_tags(content: str) -> str:
     """Remove protocol tags from message content before passing to LLM."""
     import re
-    return re.sub(r'\[(NOTIFY|REQUEST|REPORT)\]', '', content, flags=re.IGNORECASE).strip()
+    return re.sub(r'\[(NOTIFY|REQUEST|END|REPORT)\]', '', content, flags=re.IGNORECASE).strip()
 
 
 # Per-agent signature emoji sets: (default_thinking, default_done, context_rules)
@@ -319,6 +337,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 
                 is_bot_message = getattr(message.author, "bot", False)
                 is_owner = str(message.author.id) == OWNER_USER_ID
+                agent_name = os.getenv('AGENT_NAME', '').lower()
+                my_bot_id = str(self._client.user.id) if self._client.user else ''
+                channel_id = str(message.channel.id)
+                is_harmony = (agent_name == 'harmony')
                 
                 # ── Bot-to-bot communication protocol ──
                 if is_bot_message:
@@ -341,22 +363,41 @@ class DiscordAdapter(BasePlatformAdapter):
                     # ── Parse protocol tag ──
                     tag = parse_message_tag(message.content)
                     
-                    # ── [NOTIFY] — React only, do NOT reply ──
-                    if tag == 'NOTIFY':
-                        agent_name = os.getenv('AGENT_NAME', '').lower()
+                    # ── [NOTIFY] or [END] - React only, do NOT reply ──
+                    if tag in ('NOTIFY', 'END'):
                         _, done_emoji = get_context_emoji(agent_name, message.content)
                         try:
                             await message.add_reaction(done_emoji)
                         except Exception:
                             try:
-                                await message.add_reaction('👍')
+                                await message.add_reaction('\u2705')
                             except Exception:
                                 pass
                         self._bot_tracker.mark_responded(msg_id)
-                        return
+                        # For Harmony: [END] messages are task completions - log for awareness
+                        if is_harmony and tag == 'END':
+                            self._bot_tracker.mark_responded(msg_id)
+                            message.content = f'[TASK COMPLETED - Agent reported completion] {strip_message_tags(message.content)}'
+                            # Fall through to process so Harmony can update task board
+                        else:
+                            return
+                    
+                    # ── Channel-based routing for worker agents ──
+                    # Workers only respond to messages in harmony-communication
+                    # (where Harmony delegates) or their own home channel
+                    if not is_harmony:
+                        sender_id = str(message.author.id)
+                        # Workers only accept [REQUEST] from Harmony
+                        if tag == 'REQUEST' and sender_id != HARMONY_BOT_ID:
+                            # Not from Harmony - react and ignore
+                            try:
+                                await message.add_reaction('\u26d4')  # no_entry
+                            except Exception:
+                                pass
+                            self._bot_tracker.mark_responded(msg_id)
+                            return
                     
                     # ── Check if this is a reply to one of MY messages ──
-                    # If so, process it — I asked for this response and need awareness.
                     is_reply_to_me = False
                     if message.reference and message.reference.message_id:
                         try:
@@ -369,26 +410,24 @@ class DiscordAdapter(BasePlatformAdapter):
                     # ── No tag from a bot ──
                     if tag is None:
                         if is_reply_to_me:
-                            # This is a response to something I asked — process it
+                            # This is a response to something I asked - process it
                             # but mark it so I don't reply back (read-only awareness)
                             self._bot_tracker.mark_responded(msg_id)
-                            # Pass to LLM as read-only context (add [READONLY] marker)
                             message.content = f'[AGENT RESPONSE - DO NOT REPLY TO THIS AGENT] {message.content}'
                         else:
-                            # Not a reply to me, no tag — react only, prevent chain reaction
-                            agent_name = os.getenv('AGENT_NAME', '').lower()
+                            # Not a reply to me, no tag - react only, prevent chain reaction
                             _, done_emoji = get_context_emoji(agent_name, message.content)
                             try:
                                 await message.add_reaction(done_emoji)
                             except Exception:
                                 try:
-                                    await message.add_reaction('👍')
+                                    await message.add_reaction('\ud83d\udc4d')
                                 except Exception:
                                     pass
                             self._bot_tracker.mark_responded(msg_id)
                             return
                     
-                    # ── [REQUEST] or [REPORT] — Allow exactly one response ──
+                    # ── [REQUEST] or [REPORT] - Allow exactly one response ──
                     # Mark as responded BEFORE processing to prevent re-entry
                     self._bot_tracker.mark_responded(msg_id)
                     
@@ -397,7 +436,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 
                 # ── Human messages (and approved bot [REQUEST]/[REPORT]) ──
                 # Context-aware emoji reactions
-                agent_name = os.getenv('AGENT_NAME', '').lower()
                 thinking_emoji, done_emoji = get_context_emoji(agent_name, message.content)
 
                 try:
