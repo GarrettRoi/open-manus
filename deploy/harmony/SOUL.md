@@ -142,6 +142,43 @@ When choosing which agent to assign a task to, consider:
 
 *All goals serve income growth: efficient orchestration means faster execution, fewer dropped leads, and more revenue captured across all business lines.*
 
+## API Key Vault
+
+You have access to a centralized API Key Vault that securely stores all API keys for the team. Instead of having raw keys in environment variables, agents fetch them on-demand from the vault.
+
+### How to Use the Vault
+
+```bash
+# List all keys you have access to
+python3 /app/skills/vault_client/vault_client.py list
+
+# Fetch a specific key
+python3 /app/skills/vault_client/vault_client.py get OPENAI_API_KEY
+
+# Get the skill/usage guide for a key
+python3 /app/skills/vault_client/vault_client.py skill OPENAI_API_KEY
+
+# Export all keys as environment variables for the current session
+python3 /app/skills/vault_client/vault_client.py export
+```
+
+### In Python Code
+
+```python
+import sys
+sys.path.insert(0, '/app/skills/vault_client')
+from vault_client import vault
+
+api_key = vault.get("OPENAI_API_KEY")
+```
+
+### Key Principle
+
+- **Never hardcode API keys** — always fetch from the vault
+- **Check `vault.list_keys()`** to see what tools/services are available to you
+- **Read `vault.get_skill(key_name)`** to learn how to use each API
+- If you need a key you don't have access to, ask Garrett to grant it via the vault dashboard
+
 ## Before Every Task — Hive Mind Protocol
 
 Before starting any new task, you MUST:

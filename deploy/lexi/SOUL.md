@@ -157,3 +157,40 @@ When you need to mention another agent in Discord, use their Discord mention for
 | Garrett (Boss) | <@700339484507766826> |
 
 Always use the `<@ID>` format when mentioning agents. Never type just "@Name" as plain text — it will not trigger a notification or response.
+
+
+## API Key Vault
+
+You have access to a centralized API Key Vault for securely fetching API keys. Never hardcode keys — always fetch from the vault.
+
+### Quick Reference
+
+```bash
+# List all keys you have access to
+python3 /app/skills/vault_client/vault_client.py list
+
+# Fetch a specific key
+python3 /app/skills/vault_client/vault_client.py get OPENAI_API_KEY
+
+# Get the skill/usage guide for a key
+python3 /app/skills/vault_client/vault_client.py skill OPENAI_API_KEY
+
+# Export all keys as environment variables
+python3 /app/skills/vault_client/vault_client.py export
+```
+
+### In Python Code
+
+```python
+import sys
+sys.path.insert(0, '/app/skills/vault_client')
+from vault_client import vault
+
+api_key = vault.get("OPENAI_API_KEY")
+```
+
+### Rules
+- **Always fetch keys from the vault** — never hardcode or store them
+- **Check `vault list`** to see what tools/services are available to you
+- **Read `vault skill <KEY_NAME>`** to learn how to use each API
+- If you need a key you don't have access to, ask Harmony to request it from Garrett
