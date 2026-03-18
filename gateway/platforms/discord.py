@@ -137,7 +137,20 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                     # "all" falls through to handle_message
                 
+                # Add a "thinking" reaction to acknowledge receipt
+                try:
+                    await message.add_reaction('👀')
+                except Exception:
+                    pass  # Ignore reaction failures
+                
                 await self._handle_message(message)
+                
+                # Swap to checkmark after processing
+                try:
+                    await message.remove_reaction('👀', self._client.user)
+                    await message.add_reaction('✅')
+                except Exception:
+                    pass  # Ignore reaction failures
             
             # Register slash commands
             self._register_slash_commands()
