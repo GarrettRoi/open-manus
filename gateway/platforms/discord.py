@@ -5,12 +5,14 @@ Uses discord.py library for:
 - Receiving messages from servers and DMs
 - Sending responses back
 - Handling threads and channels
+- Turn-based inter-agent communication protocol
 """
 
 import asyncio
 import logging
 import os
-from typing import Dict, List, Optional, Any
+import time
+from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,195 @@ def check_discord_requirements() -> bool:
     return DISCORD_AVAILABLE
 
 
+# ---------------------------------------------------------------------------
+# Turn-Based Communication Protocol
+# ---------------------------------------------------------------------------
+# Message tags that control inter-agent behavior:
+#   [NOTIFY]  — Notification only. Agent reacts but does NOT reply.
+#   [REQUEST] — Expects exactly one response from the mentioned agent.
+#   [REPORT]  — Like REQUEST but response goes to the original channel.
+#
+# Anti-doom-loop rules (enforced programmatically):
+#   1. One response per bot message — tracked via cooldown set
+#   2. No chain reactions — bot replies to bot messages don't trigger
+#      unless the reply explicitly @mentions with [REQUEST]
+#   3. Garrett (owner) always bypasses bot-to-bot restrictions
+# ---------------------------------------------------------------------------
+
+# Garrett's Discord user ID — always bypasses bot restrictions
+OWNER_USER_ID = os.getenv("DISCORD_OWNER_ID", "700339484507766826")
+
+# Cooldown window: ignore repeated triggers from same bot message (seconds)
+BOT_RESPONSE_COOLDOWN = 120
+
+
+class BotMessageTracker:
+    """Tracks which bot messages this agent has already responded to,
+    preventing doom loops and enforcing one-response-per-trigger."""
+
+    def __init__(self):
+        self._responded_to: Dict[str, float] = {}  # message_id -> timestamp
+        self._cleanup_interval = 300  # Clean old entries every 5 min
+        self._last_cleanup = time.time()
+
+    def has_responded(self, message_id: str) -> bool:
+        """Check if we already responded to this message."""
+        self._maybe_cleanup()
+        return message_id in self._responded_to
+
+    def mark_responded(self, message_id: str) -> None:
+        """Mark a message as responded to."""
+        self._responded_to[message_id] = time.time()
+
+    def _maybe_cleanup(self) -> None:
+        """Remove entries older than cooldown to prevent memory leak."""
+        now = time.time()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        cutoff = now - BOT_RESPONSE_COOLDOWN * 2
+        self._responded_to = {
+            mid: ts for mid, ts in self._responded_to.items() if ts > cutoff
+        }
+
+
+def parse_message_tag(content: str) -> Optional[str]:
+    """Extract a protocol tag from message content.
+    Returns 'NOTIFY', 'REQUEST', 'REPORT', or None."""
+    upper = content.upper()
+    for tag in ('NOTIFY', 'REQUEST', 'REPORT'):
+        if f'[{tag}]' in upper:
+            return tag
+    return None
+
+
+def strip_message_tags(content: str) -> str:
+    """Remove protocol tags from message content before passing to LLM."""
+    import re
+    return re.sub(r'\[(NOTIFY|REQUEST|REPORT)\]', '', content, flags=re.IGNORECASE).strip()
+
+
+# Per-agent signature emoji sets: (default_thinking, default_done, context_rules)
+# context_rules: list of (keywords, thinking_emoji, done_emoji)
+_AGENT_EMOJIS = {
+    'harmony': (
+        '💋', '👑',
+        [(['delegate', 'assign', 'team'], '💅', '👑'),
+         (['plan', 'strategy', 'goal'], '🧠', '💎'),
+         (['urgent', 'asap', 'now'], '⚡', '🔥'),
+         (['good', 'great', 'nice', 'thanks'], '😘', '💖')]
+    ),
+    'samantha': (
+        '📋', '💅',
+        [(['schedule', 'calendar', 'meeting', 'appointment'], '⏰', '💋'),
+         (['email', 'message', 'send'], '💌', '😘'),
+         (['document', 'file', 'report'], '📝', '✨'),
+         (['remind', 'todo', 'task'], '🫦', '💅')]
+    ),
+    'sasha': (
+        '🎯', '💰',
+        [(['lead', 'prospect', 'client'], '👀', '🤑'),
+         (['close', 'deal', 'sale', 'sold', 'book'], '🔥', '💰'),
+         (['follow', 'touch', 'nurture', 'drip'], '💋', '😏'),
+         (['convert', 'funnel', 'pipeline'], '⚡', '💎'),
+         (['objection', 'concern', 'hesitant'], '😏', '🫦')]
+    ),
+    'scarlett': (
+        '💝', '🥰',
+        [(['happy', 'satisfied', 'love', 'thank'], '🥰', '💖'),
+         (['issue', 'problem', 'complaint', 'upset'], '🫂', '💋'),
+         (['review', 'feedback', 'testimonial'], '✨', '😍'),
+         (['retain', 'loyalty', 'relationship'], '💕', '👑')]
+    ),
+    'bianca': (
+        '📊', '💎',
+        [(['stock', 'trade', 'buy', 'sell'], '📈', '🤑'),
+         (['crypto', 'bitcoin', 'eth'], '⚡', '💰'),
+         (['portfolio', 'invest', 'dividend'], '🧐', '💎'),
+         (['risk', 'loss', 'drop', 'crash'], '😬', '🛡️'),
+         (['profit', 'gain', 'up', 'moon'], '🔥', '🚀')]
+    ),
+    'valentina': (
+        '⚙️', '🔥',
+        [(['automate', 'workflow', 'n8n', 'automation'], '🤖', '⚡'),
+         (['deploy', 'railway', 'server'], '🚀', '💅'),
+         (['code', 'build', 'develop', 'fix', 'bug'], '👩‍💻', '🔥'),
+         (['api', 'integration', 'connect'], '🔌', '💋')]
+    ),
+    'jade': (
+        '🎵', '💃',
+        [(['dj', 'music', 'song', 'playlist'], '🎶', '🔥'),
+         (['wedding', 'event', 'reception', 'ceremony'], '💒', '💋'),
+         (['booking', 'gig', 'book'], '📅', '🤑'),
+         (['photo', 'booth'], '📸', '✨'),
+         (['vows', 'vinyl'], '🎧', '💃')]
+    ),
+    'tatiana': (
+        '🏠', '💋',
+        [(['house', 'home', 'property', 'listing'], '🏡', '😍'),
+         (['buyer', 'first time', 'purchase'], '🔑', '🥂'),
+         (['closing', 'contract', 'offer', 'transaction'], '📝', '💰'),
+         (['webinar', 'seminar', 'class'], '🎓', '🔥'),
+         (['market', 'price', 'value'], '📊', '💎')]
+    ),
+    'sabrina': (
+        '📱', '💅',
+        [(['post', 'content', 'publish'], '✍️', '🔥'),
+         (['follower', 'growth', 'audience', 'reach'], '📈', '👑'),
+         (['instagram', 'facebook', 'tiktok', 'social'], '📲', '💋'),
+         (['engage', 'comment', 'like', 'share'], '💬', '😘'),
+         (['viral', 'trending', 'popular'], '⚡', '🌟')]
+    ),
+    'addison': (
+        '📢', '🎯',
+        [(['ad', 'campaign', 'advertis'], '🎯', '🔥'),
+         (['roas', 'roi', 'convert', 'click'], '📊', '🤑'),
+         (['audience', 'target', 'segment'], '👀', '💋'),
+         (['budget', 'spend', 'cost'], '💸', '💰'),
+         (['creative', 'copy', 'headline'], '✨', '💅')]
+    ),
+    'cora': (
+        '🎨', '✨',
+        [(['video', 'film', 'edit', 'footage'], '🎬', '🔥'),
+         (['photo', 'image', 'graphic', 'design'], '📸', '💋'),
+         (['brand', 'logo', 'visual'], '🎨', '💎'),
+         (['content', 'create', 'produce'], '✍️', '👑'),
+         (['audio', 'voice', 'sound', 'music'], '🎙️', '💅')]
+    ),
+    'raven': (
+        '🔍', '🧠',
+        [(['research', 'find', 'discover', 'look into'], '🕵️', '💎'),
+         (['data', 'analysis', 'report', 'number'], '📊', '🔥'),
+         (['competitor', 'market', 'trend'], '👀', '⚡'),
+         (['source', 'article', 'study'], '📚', '💅'),
+         (['insight', 'opportunity', 'intel'], '🧐', '💋')]
+    ),
+    'lexi': (
+        '📚', '⚡',
+        [(['memory', 'lesson', 'knowledge', 'learn'], '🧠', '💎'),
+         (['skill', 'tool', 'capability'], '🔧', '🔥'),
+         (['share', 'distribute', 'route'], '📡', '👑'),
+         (['review', 'approve', 'queue'], '📋', '💅'),
+         (['goal', 'metric', 'performance'], '🎯', '💋')]
+    ),
+}
+
+
+def get_context_emoji(agent_name: str, text: str):
+    """Return (thinking_emoji, done_emoji) based on agent personality and message context."""
+    default_thinking, default_done = '💭', '✨'
+    agent_key = agent_name.lower()
+    if agent_key not in _AGENT_EMOJIS:
+        return default_thinking, default_done
+
+    sig_think, sig_done, rules = _AGENT_EMOJIS[agent_key]
+    text_lower = text.lower()
+    for keywords, t_emoji, d_emoji in rules:
+        if any(kw in text_lower for kw in keywords):
+            return t_emoji, d_emoji
+    return sig_think, sig_done
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -58,6 +249,7 @@ class DiscordAdapter(BasePlatformAdapter):
     - Button-based exec approvals
     - Auto-threading for long conversations
     - Reaction-based feedback
+    - Turn-based inter-agent communication protocol
     """
     
     # Discord message limits
@@ -68,6 +260,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._bot_tracker = BotMessageTracker()  # Anti-doom-loop tracker
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -124,150 +317,82 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.author == self._client.user:
                     return
                 
-                # Bot message filtering (DISCORD_ALLOW_BOTS):
-                #   "none"     — ignore all other bots (default)
-                #   "mentions" — accept bot messages only when they @mention us
-                #   "all"      — accept all bot messages
-                if getattr(message.author, "bot", False):
+                is_bot_message = getattr(message.author, "bot", False)
+                is_owner = str(message.author.id) == OWNER_USER_ID
+                
+                # ── Bot-to-bot communication protocol ──
+                if is_bot_message:
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                    
+                    # If bot messages completely disabled, drop it
                     if allow_bots == "none":
                         return
-                    elif allow_bots == "mentions":
+                    
+                    # If "mentions" mode, only process if we're explicitly @mentioned
+                    if allow_bots == "mentions":
                         if not self._client.user or self._client.user not in message.mentions:
                             return
-                    # "all" falls through to handle_message
+                    
+                    # ── Anti-doom-loop: have we already responded to this message? ──
+                    msg_id = str(message.id)
+                    if self._bot_tracker.has_responded(msg_id):
+                        return
+                    
+                    # ── Parse protocol tag ──
+                    tag = parse_message_tag(message.content)
+                    
+                    # ── [NOTIFY] — React only, do NOT reply ──
+                    if tag == 'NOTIFY':
+                        agent_name = os.getenv('AGENT_NAME', '').lower()
+                        _, done_emoji = get_context_emoji(agent_name, message.content)
+                        try:
+                            await message.add_reaction(done_emoji)
+                        except Exception:
+                            try:
+                                await message.add_reaction('👍')
+                            except Exception:
+                                pass
+                        self._bot_tracker.mark_responded(msg_id)
+                        return
+                    
+                    # ── No tag from a bot = treat as notification (react only) ──
+                    # This prevents chain reactions. Bots must explicitly use
+                    # [REQUEST] or [REPORT] to get a spoken response.
+                    if tag is None:
+                        agent_name = os.getenv('AGENT_NAME', '').lower()
+                        _, done_emoji = get_context_emoji(agent_name, message.content)
+                        try:
+                            await message.add_reaction(done_emoji)
+                        except Exception:
+                            try:
+                                await message.add_reaction('👍')
+                            except Exception:
+                                pass
+                        self._bot_tracker.mark_responded(msg_id)
+                        return
+                    
+                    # ── [REQUEST] or [REPORT] — Allow exactly one response ──
+                    # Mark as responded BEFORE processing to prevent re-entry
+                    self._bot_tracker.mark_responded(msg_id)
+                    
+                    # Strip the tag before passing to LLM
+                    message.content = strip_message_tags(message.content)
                 
-                # Context-aware, personality-driven emoji reactions
-                import os as _os
-                _agent = _os.getenv('AGENT_NAME', '').lower()
-                _text = message.content.lower()
-
-                # Per-agent signature emoji sets: (default_thinking, default_done, context_rules)
-                # context_rules: list of (keywords, thinking_emoji, done_emoji)
-                _AGENT_EMOJIS = {
-                    'harmony': (
-                        '💋', '👑',
-                        [(['delegate', 'assign', 'team'], '💅', '👑'),
-                         (['plan', 'strategy', 'goal'], '🧠', '💎'),
-                         (['urgent', 'asap', 'now'], '⚡', '🔥'),
-                         (['good', 'great', 'nice', 'thanks'], '😘', '💖')]
-                    ),
-                    'samantha': (
-                        '📋', '💅',
-                        [(['schedule', 'calendar', 'meeting', 'appointment'], '⏰', '💋'),
-                         (['email', 'message', 'send'], '💌', '😘'),
-                         (['document', 'file', 'report'], '📝', '✨'),
-                         (['remind', 'todo', 'task'], '🫦', '💅')]
-                    ),
-                    'sasha': (
-                        '🎯', '💰',
-                        [(['lead', 'prospect', 'client'], '👀', '🤑'),
-                         (['close', 'deal', 'sale', 'sold', 'book'], '🔥', '💰'),
-                         (['follow', 'touch', 'nurture', 'drip'], '💋', '😏'),
-                         (['convert', 'funnel', 'pipeline'], '⚡', '💎'),
-                         (['objection', 'concern', 'hesitant'], '😏', '🫦')]
-                    ),
-                    'scarlett': (
-                        '💝', '🥰',
-                        [(['happy', 'satisfied', 'love', 'thank'], '🥰', '💖'),
-                         (['issue', 'problem', 'complaint', 'upset'], '🫂', '💋'),
-                         (['review', 'feedback', 'testimonial'], '✨', '😍'),
-                         (['retain', 'loyalty', 'relationship'], '💕', '👑')]
-                    ),
-                    'bianca': (
-                        '📊', '💎',
-                        [(['stock', 'trade', 'buy', 'sell'], '📈', '🤑'),
-                         (['crypto', 'bitcoin', 'eth'], '⚡', '💰'),
-                         (['portfolio', 'invest', 'dividend'], '🧐', '💎'),
-                         (['risk', 'loss', 'drop', 'crash'], '😬', '🛡️'),
-                         (['profit', 'gain', 'up', 'moon'], '🔥', '🚀')]
-                    ),
-                    'valentina': (
-                        '⚙️', '🔥',
-                        [(['automate', 'workflow', 'n8n', 'automation'], '🤖', '⚡'),
-                         (['deploy', 'railway', 'server'], '🚀', '💅'),
-                         (['code', 'build', 'develop', 'fix', 'bug'], '👩‍💻', '🔥'),
-                         (['api', 'integration', 'connect'], '🔌', '💋')]
-                    ),
-                    'jade': (
-                        '🎵', '💃',
-                        [(['dj', 'music', 'song', 'playlist'], '🎶', '🔥'),
-                         (['wedding', 'event', 'reception', 'ceremony'], '💒', '💋'),
-                         (['booking', 'gig', 'book'], '📅', '🤑'),
-                         (['photo', 'booth'], '📸', '✨'),
-                         (['vows', 'vinyl'], '🎧', '💃')]
-                    ),
-                    'tatiana': (
-                        '🏠', '💋',
-                        [(['house', 'home', 'property', 'listing'], '🏡', '😍'),
-                         (['buyer', 'first time', 'purchase'], '🔑', '🥂'),
-                         (['closing', 'contract', 'offer', 'transaction'], '📝', '💰'),
-                         (['webinar', 'seminar', 'class'], '🎓', '🔥'),
-                         (['market', 'price', 'value'], '📊', '💎')]
-                    ),
-                    'sabrina': (
-                        '📱', '💅',
-                        [(['post', 'content', 'publish'], '✍️', '🔥'),
-                         (['follower', 'growth', 'audience', 'reach'], '📈', '👑'),
-                         (['instagram', 'facebook', 'tiktok', 'social'], '📲', '💋'),
-                         (['engage', 'comment', 'like', 'share'], '💬', '😘'),
-                         (['viral', 'trending', 'popular'], '⚡', '🌟')]
-                    ),
-                    'addison': (
-                        '📢', '🎯',
-                        [(['ad', 'campaign', 'advertis'], '🎯', '🔥'),
-                         (['roas', 'roi', 'convert', 'click'], '📊', '🤑'),
-                         (['audience', 'target', 'segment'], '👀', '💋'),
-                         (['budget', 'spend', 'cost'], '💸', '💰'),
-                         (['creative', 'copy', 'headline'], '✨', '💅')]
-                    ),
-                    'cora': (
-                        '🎨', '✨',
-                        [(['video', 'film', 'edit', 'footage'], '🎬', '🔥'),
-                         (['photo', 'image', 'graphic', 'design'], '📸', '💋'),
-                         (['brand', 'logo', 'visual'], '🎨', '💎'),
-                         (['content', 'create', 'produce'], '✍️', '👑'),
-                         (['audio', 'voice', 'sound', 'music'], '🎙️', '💅')]
-                    ),
-                    'raven': (
-                        '🔍', '🧠',
-                        [(['research', 'find', 'discover', 'look into'], '🕵️', '💎'),
-                         (['data', 'analysis', 'report', 'number'], '📊', '🔥'),
-                         (['competitor', 'market', 'trend'], '👀', '⚡'),
-                         (['source', 'article', 'study'], '📚', '💅'),
-                         (['insight', 'opportunity', 'intel'], '🧐', '💋')]
-                    ),
-                    'lexi': (
-                        '📚', '⚡',
-                        [(['memory', 'lesson', 'knowledge', 'learn'], '🧠', '💎'),
-                         (['skill', 'tool', 'capability'], '🔧', '🔥'),
-                         (['share', 'distribute', 'route'], '📡', '👑'),
-                         (['review', 'approve', 'queue'], '📋', '💅'),
-                         (['goal', 'metric', 'performance'], '🎯', '💋')]
-                    ),
-                }
-
-                _default_thinking, _default_done = '💭', '✨'
-                _thinking_emoji, _done_emoji = _default_thinking, _default_done
-
-                if _agent in _AGENT_EMOJIS:
-                    _sig_think, _sig_done, _rules = _AGENT_EMOJIS[_agent]
-                    _thinking_emoji, _done_emoji = _sig_think, _sig_done
-                    for _keywords, _t_emoji, _d_emoji in _rules:
-                        if any(kw in _text for kw in _keywords):
-                            _thinking_emoji, _done_emoji = _t_emoji, _d_emoji
-                            break
+                # ── Human messages (and approved bot [REQUEST]/[REPORT]) ──
+                # Context-aware emoji reactions
+                agent_name = os.getenv('AGENT_NAME', '').lower()
+                thinking_emoji, done_emoji = get_context_emoji(agent_name, message.content)
 
                 try:
-                    await message.add_reaction(_thinking_emoji)
+                    await message.add_reaction(thinking_emoji)
                 except Exception:
                     pass
 
                 await self._handle_message(message)
 
                 try:
-                    await message.remove_reaction(_thinking_emoji, self._client.user)
-                    await message.add_reaction(_done_emoji)
+                    await message.remove_reaction(thinking_emoji, self._client.user)
+                    await message.add_reaction(done_emoji)
                 except Exception:
                     pass
             
@@ -400,7 +525,6 @@ class DiscordAdapter(BasePlatformAdapter):
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
             
-            # Determine filename from path
             filename = os.path.basename(audio_path)
             
             with open(audio_path, "rb") as f:
@@ -412,9 +536,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=str(msg.id))
         
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to)
-    
+            logger.error("[%s] Failed to send voice: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -425,19 +549,19 @@ class DiscordAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Discord file attachment."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             import io
-            
+
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
-            
+
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=f"Image file not found: {image_path}")
-            
+
             filename = os.path.basename(image_path)
             
             with open(image_path, "rb") as f:
@@ -651,8 +775,6 @@ class DiscordAdapter(BasePlatformAdapter):
             await interaction.response.defer()
             event = self._build_slash_event(interaction, question)
             await self.handle_message(event)
-            # The response is sent via the normal send() flow
-            # Send a followup to close the interaction if needed
             try:
                 await interaction.followup.send("Processing complete~", ephemeral=True)
             except Exception as e:
