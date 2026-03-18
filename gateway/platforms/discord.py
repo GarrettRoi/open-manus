@@ -355,21 +355,38 @@ class DiscordAdapter(BasePlatformAdapter):
                         self._bot_tracker.mark_responded(msg_id)
                         return
                     
-                    # ── No tag from a bot = treat as notification (react only) ──
-                    # This prevents chain reactions. Bots must explicitly use
-                    # [REQUEST] or [REPORT] to get a spoken response.
-                    if tag is None:
-                        agent_name = os.getenv('AGENT_NAME', '').lower()
-                        _, done_emoji = get_context_emoji(agent_name, message.content)
+                    # ── Check if this is a reply to one of MY messages ──
+                    # If so, process it — I asked for this response and need awareness.
+                    is_reply_to_me = False
+                    if message.reference and message.reference.message_id:
                         try:
-                            await message.add_reaction(done_emoji)
+                            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                            if ref_msg.author == self._client.user:
+                                is_reply_to_me = True
                         except Exception:
+                            pass
+                    
+                    # ── No tag from a bot ──
+                    if tag is None:
+                        if is_reply_to_me:
+                            # This is a response to something I asked — process it
+                            # but mark it so I don't reply back (read-only awareness)
+                            self._bot_tracker.mark_responded(msg_id)
+                            # Pass to LLM as read-only context (add [READONLY] marker)
+                            message.content = f'[AGENT RESPONSE - DO NOT REPLY TO THIS AGENT] {message.content}'
+                        else:
+                            # Not a reply to me, no tag — react only, prevent chain reaction
+                            agent_name = os.getenv('AGENT_NAME', '').lower()
+                            _, done_emoji = get_context_emoji(agent_name, message.content)
                             try:
-                                await message.add_reaction('👍')
+                                await message.add_reaction(done_emoji)
                             except Exception:
-                                pass
-                        self._bot_tracker.mark_responded(msg_id)
-                        return
+                                try:
+                                    await message.add_reaction('👍')
+                                except Exception:
+                                    pass
+                            self._bot_tracker.mark_responded(msg_id)
+                            return
                     
                     # ── [REQUEST] or [REPORT] — Allow exactly one response ──
                     # Mark as responded BEFORE processing to prevent re-entry
