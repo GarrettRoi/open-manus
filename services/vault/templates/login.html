@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Key Vault</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --border: #2a2e3f;
+            --text: #e4e6f0;
+            --text-muted: #8b8fa3;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --danger: #ef4444;
+            --radius: 8px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 40px;
+            width: 400px;
+            max-width: 90vw;
+        }
+        .login-card h1 {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent);
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        .login-card p {
+            color: var(--text-muted);
+            font-size: 14px;
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text);
+            font-size: 15px;
+        }
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+        }
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: var(--radius);
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .btn:hover { background: var(--accent-hover); }
+        .error {
+            color: var(--danger);
+            font-size: 13px;
+            text-align: center;
+            margin-bottom: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>&#128272; Key Vault</h1>
+        <p>Open Manus Agent Team</p>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="/login">
+            <div class="form-group">
+                <label>Admin Password</label>
+                <input type="password" name="password" autofocus required placeholder="Enter vault password">
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>

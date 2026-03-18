@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% set active_page = "keys" %}
+
+{% block title %}Keys{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>API Key Management</h2>
+    <p>View and manage all stored API keys with their service descriptions and skill documentation.</p>
+</div>
+
+{% for key in keys %}
+<div class="card">
+    <h3>{{ key.name }}</h3>
+    <table style="margin-bottom: 16px;">
+        <tr>
+            <td style="width: 140px; color: var(--text-muted); font-weight: 500;">Service</td>
+            <td>{{ key.service or '—' }}</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted); font-weight: 500;">Description</td>
+            <td>{{ key.description or '—' }}</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted); font-weight: 500;">Value (masked)</td>
+            <td><code style="font-size: 13px;">{{ key.masked_value }}</code></td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted); font-weight: 500;">Created</td>
+            <td style="font-size: 13px;">{{ key.created_at[:19] if key.created_at else '—' }}</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted); font-weight: 500;">Updated</td>
+            <td style="font-size: 13px;">{{ key.updated_at[:19] if key.updated_at else '—' }}</td>
+        </tr>
+    </table>
+
+    {% if key.skill_description %}
+    <div style="background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 16px;">
+        <div style="font-size: 12px; color: var(--accent); font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;">Skill / Tool Usage Guide</div>
+        <div style="font-size: 13px; line-height: 1.6; white-space: pre-wrap;">{{ key.skill_description }}</div>
+    </div>
+    {% endif %}
+</div>
+{% endfor %}
+
+{% if not keys %}
+<div class="card">
+    <p style="color: var(--text-muted); padding: 20px 0;">No API keys stored yet. <a href="/" style="color: var(--accent);">Go to the dashboard</a> to add your first key.</p>
+</div>
+{% endif %}
+{% endblock %}

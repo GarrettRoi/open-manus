@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% set active_page = "dashboard" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Dashboard</h2>
+    <p>Overview of your API keys and agent access</p>
+</div>
+
+<div class="stats">
+    <div class="stat-card">
+        <div class="label">Total Keys</div>
+        <div class="value">{{ keys|length }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Active Agents</div>
+        <div class="value">{{ agents|length }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Total Grants</div>
+        <div class="value">{{ keys|sum(attribute='grant_count') }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Keys w/ Skills</div>
+        <div class="value">{{ keys|selectattr('skill_description')|list|length }}</div>
+    </div>
+</div>
+
+<!-- Quick Add Key -->
+<div class="card">
+    <h3>&#10133; Add New API Key</h3>
+    <form method="post" action="/keys/add">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Key Name (e.g., OPENAI_API_KEY)</label>
+                <input type="text" name="key_name" required placeholder="OPENAI_API_KEY" style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+                <label>Service Name</label>
+                <input type="text" name="service" placeholder="OpenAI">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>API Key Value</label>
+            <input type="password" name="key_value" required placeholder="sk-...">
+        </div>
+        <div class="form-group">
+            <label>Description (what this key is for)</label>
+            <input type="text" name="description" placeholder="GPT-4 access for content generation">
+        </div>
+        <div class="form-group">
+            <label>Skill / Tool Usage Description (how agents should use this key)</label>
+            <textarea name="skill_description" placeholder="Use this key with the OpenAI Python SDK. Example: client = OpenAI(api_key=key). Supports gpt-4, gpt-3.5-turbo models. Use for content generation, summarization, and analysis tasks."></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Add Key</button>
+    </form>
+</div>
+
+<!-- Keys Overview -->
+<div class="card">
+    <h3>&#128273; API Keys</h3>
+    {% if keys %}
+    <table>
+        <thead>
+            <tr>
+                <th>Key Name</th>
+                <th>Service</th>
+                <th>Value (masked)</th>
+                <th>Agents</th>
+                <th>Has Skill Doc</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for key in keys %}
+            <tr>
+                <td><strong>{{ key.name }}</strong></td>
+                <td>{{ key.service or '—' }}</td>
+                <td><code style="font-size: 12px; color: var(--text-muted);">{{ key.masked_value }}</code></td>
+                <td>
+                    {% if key.granted_agents %}
+                        {% for agent in key.granted_agents %}
+                        <span class="badge badge-success">{{ agent }}</span>
+                        {% endfor %}
+                    {% else %}
+                        <span class="badge badge-muted">none</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if key.skill_description %}
+                        <span class="badge badge-success">Yes</span>
+                    {% else %}
+                        <span class="badge badge-muted">No</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <button class="btn btn-sm btn-outline" onclick="openEditModal('{{ key.name }}', '{{ key.service }}', '{{ key.description }}', `{{ key.skill_description|e }}`)">Edit</button>
+                    <form method="post" action="/keys/delete" style="display:inline;" onsubmit="return confirm('Delete {{ key.name }}?')">
+                        <input type="hidden" name="key_name" value="{{ key.name }}">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--text-muted); padding: 20px 0;">No API keys stored yet. Add your first key above.</p>
+    {% endif %}
+</div>
+
+<!-- Agent Overview -->
+<div class="card">
+    <h3>&#129302; Agent Access Summary</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Agent</th>
+                <th>Keys Granted</th>
+                <th>Key List</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for agent in agents %}
+            <tr>
+                <td><strong>{{ agent.name|capitalize }}</strong></td>
+                <td>
+                    {% if agent.key_count > 0 %}
+                        <span class="badge badge-success">{{ agent.key_count }}</span>
+                    {% else %}
+                        <span class="badge badge-muted">0</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% for kn in agent.granted_keys %}
+                        <span class="badge badge-warning" style="margin: 2px;">{{ kn }}</span>
+                    {% endfor %}
+                    {% if not agent.granted_keys %}
+                        <span style="color: var(--text-muted); font-size: 13px;">No keys assigned</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Edit Modal -->
+<div class="modal-overlay" id="editModal">
+    <div class="modal">
+        <h3>Edit Key</h3>
+        <form method="post" action="/keys/update">
+            <input type="hidden" name="key_name" id="edit_key_name">
+            <div class="form-group">
+                <label>New Value (leave blank to keep current)</label>
+                <input type="password" name="key_value" placeholder="Leave blank to keep current value">
+            </div>
+            <div class="form-group">
+                <label>Service</label>
+                <input type="text" name="service" id="edit_service">
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <input type="text" name="description" id="edit_description">
+            </div>
+            <div class="form-group">
+                <label>Skill / Tool Usage Description</label>
+                <textarea name="skill_description" id="edit_skill_description"></textarea>
+            </div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeEditModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function openEditModal(name, service, description, skillDesc) {
+    document.getElementById('edit_key_name').value = name;
+    document.getElementById('edit_service').value = service;
+    document.getElementById('edit_description').value = description;
+    document.getElementById('edit_skill_description').value = skillDesc;
+    document.getElementById('editModal').classList.add('active');
+}
+function closeEditModal() {
+    document.getElementById('editModal').classList.remove('active');
+}
+document.getElementById('editModal').addEventListener('click', function(e) {
+    if (e.target === this) closeEditModal();
+});
+</script>
+{% endblock %}

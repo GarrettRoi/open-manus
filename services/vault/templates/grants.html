@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% set active_page = "grants" %}
+
+{% block title %}Access Grants{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Access Grants</h2>
+    <p>Control which agents can access which API keys. Check the box to grant access.</p>
+</div>
+
+<div class="card">
+    {% if key_names %}
+    <form method="post" action="/grants/update">
+        <div class="grant-matrix">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="min-width: 120px;">Agent</th>
+                        {% for kn in key_names %}
+                        <th style="text-align: center; min-width: 100px; font-size: 11px; writing-mode: vertical-lr; transform: rotate(180deg); height: 120px;">{{ kn }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for agent in agents %}
+                    <tr>
+                        <td><strong>{{ agent|capitalize }}</strong></td>
+                        {% for kn in key_names %}
+                        <td style="text-align: center;">
+                            <input type="checkbox" name="grant_{{ agent }}_{{ kn }}" 
+                                   {% if matrix[agent][kn] %}checked{% endif %}>
+                        </td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <div style="margin-top: 20px; display: flex; gap: 12px; align-items: center;">
+            <button type="submit" class="btn btn-primary">Save All Grants</button>
+            <span style="color: var(--text-muted); font-size: 13px;">Changes take effect immediately for all agents.</span>
+        </div>
+    </form>
+    {% else %}
+    <p style="color: var(--text-muted); padding: 20px 0;">No API keys stored yet. <a href="/" style="color: var(--accent);">Add keys first</a>, then come back to set up access grants.</p>
+    {% endif %}
+</div>
+
+{% if key_names %}
+<div class="card">
+    <h3>Quick Actions</h3>
+    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+        <button class="btn btn-outline btn-sm" onclick="selectAll()">Select All</button>
+        <button class="btn btn-outline btn-sm" onclick="deselectAll()">Deselect All</button>
+        <button class="btn btn-outline btn-sm" onclick="grantAllToHarmony()">Grant All to Harmony</button>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function selectAll() {
+    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => cb.checked = true);
+}
+function deselectAll() {
+    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => cb.checked = false);
+}
+function grantAllToHarmony() {
+    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => {
+        if (cb.name.startsWith('grant_harmony_')) cb.checked = true;
+    });
+}
+</script>
+{% endblock %}

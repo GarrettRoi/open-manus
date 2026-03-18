@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Key Vault{% endblock %} — Open Manus</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --surface-hover: #22263a;
+            --border: #2a2e3f;
+            --text: #e4e6f0;
+            --text-muted: #8b8fa3;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --danger: #ef4444;
+            --danger-hover: #f87171;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --radius: 8px;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        .layout {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 240px;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            padding: 24px 0;
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar-brand {
+            padding: 0 20px 24px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .sidebar-brand h1 {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sidebar-brand p {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .sidebar nav {
+            flex: 1;
+        }
+
+        .sidebar nav a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 20px;
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 14px;
+            transition: all 0.15s;
+        }
+
+        .sidebar nav a:hover, .sidebar nav a.active {
+            color: var(--text);
+            background: var(--surface-hover);
+        }
+
+        .sidebar nav a.active {
+            border-left: 3px solid var(--accent);
+            padding-left: 17px;
+        }
+
+        .sidebar-footer {
+            padding: 16px 20px;
+            border-top: 1px solid var(--border);
+        }
+
+        .sidebar-footer a {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .sidebar-footer a:hover { color: var(--danger); }
+
+        /* Main content */
+        .main {
+            margin-left: 240px;
+            flex: 1;
+            padding: 32px 40px;
+            max-width: 1200px;
+        }
+
+        .page-header {
+            margin-bottom: 32px;
+        }
+
+        .page-header h2 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .page-header p {
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+
+        .card h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* Stats row */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .stat-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+        }
+
+        .stat-card .label {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .stat-card .value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+
+        th {
+            color: var(--text-muted);
+            font-weight: 500;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        tr:hover td { background: var(--surface-hover); }
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+
+        input[type="text"], input[type="password"], textarea, select {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text);
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+        }
+
+        textarea { resize: vertical; min-height: 80px; }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 16px;
+            border-radius: var(--radius);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.15s;
+            text-decoration: none;
+            color: white;
+        }
+
+        .btn-primary { background: var(--accent); }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-danger { background: var(--danger); }
+        .btn-danger:hover { background: var(--danger-hover); }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .btn-outline:hover { background: var(--surface-hover); }
+
+        /* Badges */
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .badge-success { background: rgba(34, 197, 94, 0.15); color: var(--success); }
+        .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+        .badge-danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+        .badge-muted { background: rgba(139, 143, 163, 0.15); color: var(--text-muted); }
+
+        /* Grant matrix */
+        .grant-matrix {
+            overflow-x: auto;
+        }
+
+        .grant-matrix table th:first-child {
+            position: sticky;
+            left: 0;
+            background: var(--surface);
+            z-index: 1;
+        }
+
+        .grant-matrix table td:first-child {
+            position: sticky;
+            left: 0;
+            background: var(--surface);
+            z-index: 1;
+            font-weight: 600;
+        }
+
+        .grant-matrix input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        /* Token display */
+        .token-display {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            background: var(--bg);
+            padding: 6px 10px;
+            border-radius: 4px;
+            word-break: break-all;
+            color: var(--text-muted);
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-overlay.active { display: flex; }
+
+        .modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            width: 500px;
+            max-width: 90vw;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal h3 { margin-bottom: 20px; }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+            .main { margin-left: 0; padding: 16px; }
+        }
+
+        /* Copy button */
+        .copy-btn {
+            cursor: pointer;
+            padding: 2px 8px;
+            font-size: 11px;
+            background: var(--surface-hover);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-muted);
+        }
+        .copy-btn:hover { color: var(--text); }
+
+        /* Flash messages */
+        .flash {
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        .flash-success { background: rgba(34, 197, 94, 0.1); border: 1px solid var(--success); color: var(--success); }
+        .flash-error { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        {% block sidebar %}
+        <aside class="sidebar">
+            <div class="sidebar-brand">
+                <h1>&#128272; Key Vault</h1>
+                <p>Open Manus Agent Team</p>
+            </div>
+            <nav>
+                <a href="/" class="{% if active_page == 'dashboard' %}active{% endif %}">&#128202; Dashboard</a>
+                <a href="/keys" class="{% if active_page == 'keys' %}active{% endif %}">&#128273; Keys</a>
+                <a href="/grants" class="{% if active_page == 'grants' %}active{% endif %}">&#128274; Access Grants</a>
+                <a href="/agents" class="{% if active_page == 'agents' %}active{% endif %}">&#129302; Agents</a>
+                <a href="/audit" class="{% if active_page == 'audit' %}active{% endif %}">&#128220; Audit Log</a>
+            </nav>
+            <div class="sidebar-footer">
+                <a href="/logout">&#128682; Sign Out</a>
+            </div>
+        </aside>
+        {% endblock %}
+
+        <main class="main">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    <script>
+        function copyToClipboard(text, btn) {
+            navigator.clipboard.writeText(text).then(() => {
+                const orig = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = orig, 1500);
+            });
+        }
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
