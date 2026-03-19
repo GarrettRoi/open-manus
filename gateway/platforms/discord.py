@@ -877,6 +877,37 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        @tree.command(name="nsfw", description="Toggle NSFW/unfiltered mode on or off")
+        @discord.app_commands.describe(toggle="on or off. Leave empty to check current state.")
+        async def slash_nsfw(interaction: discord.Interaction, toggle: str = ""):
+            await interaction.response.defer(ephemeral=True)
+            toggle = toggle.strip().lower()
+            if toggle in ("on", "yes", "true", "enable", "1"):
+                event = self._build_slash_event(interaction, "/personality unfiltered")
+                await self.handle_message(event)
+                try:
+                    await interaction.followup.send("\U0001f525 NSFW mode **enabled** — unfiltered personality active.\n_Use `/nsfw off` to return to normal._", ephemeral=True)
+                except Exception as e:
+                    logger.debug("Discord followup failed: %s", e)
+            elif toggle in ("off", "no", "false", "disable", "0"):
+                event = self._build_slash_event(interaction, "/personality normal")
+                await self.handle_message(event)
+                try:
+                    await interaction.followup.send("\u2705 NSFW mode **disabled** — normal personality restored.\n_Use `/nsfw on` to re-enable._", ephemeral=True)
+                except Exception as e:
+                    logger.debug("Discord followup failed: %s", e)
+            else:
+                try:
+                    await interaction.followup.send(
+                        "**NSFW Toggle**\n\n"
+                        "`/nsfw on` — Enable unfiltered mode (no content restrictions)\n"
+                        "`/nsfw off` — Return to normal professional mode\n\n"
+                        "_This sets the agent's personality. Use `/personality` to see all options._",
+                        ephemeral=True
+                    )
+                except Exception as e:
+                    logger.debug("Discord followup failed: %s", e)
+
         @tree.command(name="retry", description="Retry your last message")
         async def slash_retry(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
