@@ -87,6 +87,67 @@ TASK_BOARD_CHANNEL_ID = os.getenv("TASK_BOARD_CHANNEL_ID", "1481406227153031372"
 # Cooldown window: ignore repeated triggers from same bot message (seconds)
 BOT_RESPONSE_COOLDOWN = 120
 
+# Group chat conversation timeout (seconds of inactivity before auto-close)
+GROUP_CHAT_TIMEOUT = 600  # 10 minutes
+
+# Delay before an agent responds in group chat (seconds)
+GROUP_CHAT_RESPONSE_DELAY = 4
+
+
+class GroupChatSession:
+    """Tracks active group chat conversations where multiple agents can talk.
+    
+    Activated when the owner @mentions 2+ bots in one message.
+    While active, agents in the session can @mention each other.
+    Killed by 'end chat' from the owner or by timeout.
+    """
+
+    def __init__(self):
+        self._sessions: Dict[str, Dict] = {}  # channel_id -> session info
+
+    def activate(self, channel_id: str, participant_bot_ids: Set[str], trigger_message_id: str) -> None:
+        """Start a group chat session in a channel."""
+        self._sessions[channel_id] = {
+            'participants': participant_bot_ids,
+            'trigger_message_id': trigger_message_id,
+            'last_activity': time.time(),
+            'started_at': time.time(),
+        }
+        logger.info("Group chat activated in channel %s with %d participants", channel_id, len(participant_bot_ids))
+
+    def deactivate(self, channel_id: str) -> None:
+        """End a group chat session."""
+        if channel_id in self._sessions:
+            del self._sessions[channel_id]
+            logger.info("Group chat deactivated in channel %s", channel_id)
+
+    def is_active(self, channel_id: str) -> bool:
+        """Check if a group chat is active in this channel (and not timed out)."""
+        if channel_id not in self._sessions:
+            return False
+        session = self._sessions[channel_id]
+        if time.time() - session['last_activity'] > GROUP_CHAT_TIMEOUT:
+            self.deactivate(channel_id)
+            return False
+        return True
+
+    def is_participant(self, channel_id: str, bot_id: str) -> bool:
+        """Check if a bot is a participant in the active group chat."""
+        if not self.is_active(channel_id):
+            return False
+        return bot_id in self._sessions[channel_id]['participants']
+
+    def touch(self, channel_id: str) -> None:
+        """Update last activity timestamp."""
+        if channel_id in self._sessions:
+            self._sessions[channel_id]['last_activity'] = time.time()
+
+    def get_participants(self, channel_id: str) -> Set[str]:
+        """Get participant bot IDs for a session."""
+        if channel_id in self._sessions:
+            return self._sessions[channel_id]['participants']
+        return set()
+
 
 class BotMessageTracker:
     """Tracks which bot messages this agent has already responded to,
@@ -279,6 +340,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._bot_tracker = BotMessageTracker()  # Anti-doom-loop tracker
+        self._group_chat = GroupChatSession()  # Multi-agent conversation tracker
+        self._last_message_ts: Dict[str, float] = {}  # channel_id -> timestamp of our last message
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -385,99 +448,172 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_id = str(message.channel.id)
                 is_harmony = (agent_name == 'harmony')
                 
+                # ── "end chat" kill switch — owner can stop any group conversation ──
+                if is_owner and message.content.strip().lower() in ('end chat', 'endchat', 'stop chat'):
+                    if adapter_self._group_chat.is_active(channel_id):
+                        adapter_self._group_chat.deactivate(channel_id)
+                        try:
+                            await message.add_reaction('\U0001f6d1')  # stop sign
+                        except Exception:
+                            pass
+                        return
+                
+                # ── Owner @mentions 2+ bots → activate group chat mode ──
+                if is_owner and not is_bot_message:
+                    mentioned_bots = [
+                        m for m in message.mentions
+                        if getattr(m, 'bot', False) and m != self._client.user
+                    ]
+                    # Count ourselves if we're mentioned too
+                    i_am_mentioned = self._client.user in message.mentions
+                    total_bots_mentioned = len(mentioned_bots) + (1 if i_am_mentioned else 0)
+                    
+                    if total_bots_mentioned >= 2:
+                        # Activate group chat with all mentioned bot IDs
+                        participant_ids = {str(m.id) for m in mentioned_bots}
+                        if i_am_mentioned:
+                            participant_ids.add(my_bot_id)
+                        adapter_self._group_chat.activate(channel_id, participant_ids, str(message.id))
+                        logger.info("[%s] Group chat activated by owner with %d bots", agent_name, total_bots_mentioned)
+                
                 # ── Bot-to-bot communication protocol ──
                 if is_bot_message:
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                    sender_id = str(message.author.id)
+                    msg_id = str(message.id)
                     
-                    # If bot messages completely disabled, drop it
-                    if allow_bots == "none":
-                        return
-                    
-                    # If "mentions" mode, only process if we're explicitly @mentioned
-                    if allow_bots == "mentions":
+                    # ── GROUP CHAT MODE: agents can talk to each other ──
+                    if adapter_self._group_chat.is_active(channel_id):
+                        # In group chat, only process if I'm @mentioned
                         if not self._client.user or self._client.user not in message.mentions:
                             return
-                    
-                    # ── Anti-doom-loop: have we already responded to this message? ──
-                    msg_id = str(message.id)
-                    if self._bot_tracker.has_responded(msg_id):
-                        return
-                    
-                    # ── Parse protocol tag ──
-                    tag = parse_message_tag(message.content)
-                    
-                    # ── [NOTIFY] or [END] - React only, do NOT reply ──
-                    if tag in ('NOTIFY', 'END'):
-                        _, done_emoji = get_context_emoji(agent_name, message.content)
+                        
+                        # Anti-doom-loop: already responded?
+                        if self._bot_tracker.has_responded(msg_id):
+                            return
+                        
+                        # 4-second delay: wait, then scrape recent messages for context
+                        await asyncio.sleep(GROUP_CHAT_RESPONSE_DELAY)
+                        
+                        # Scrape recent messages since our last message for full context
+                        context_messages = []
                         try:
-                            await message.add_reaction(done_emoji)
-                        except Exception:
-                            try:
-                                await message.add_reaction('\u2705')
-                            except Exception:
-                                pass
+                            async for hist_msg in message.channel.history(limit=20, after=None):
+                                if hist_msg.id == message.id:
+                                    continue
+                                # Only include messages from the last 5 minutes
+                                age = (message.created_at - hist_msg.created_at).total_seconds()
+                                if age > 300:
+                                    break
+                                context_messages.append(f"{hist_msg.author.display_name}: {hist_msg.content}")
+                        except Exception as e:
+                            logger.warning("[%s] Failed to scrape context: %s", agent_name, e)
+                        
+                        # Build enriched message with conversation context
+                        if context_messages:
+                            context_messages.reverse()  # chronological order
+                            context_block = "\n".join(context_messages[-10:])  # last 10 messages
+                            message.content = (
+                                f"[GROUP CONVERSATION CONTEXT]\n{context_block}\n\n"
+                                f"[LATEST MESSAGE FROM {message.author.display_name}]\n"
+                                f"{strip_message_tags(message.content)}\n\n"
+                                f"Respond naturally to continue the conversation. "
+                                f"If you want to direct your response to a specific agent, @mention them. "
+                                f"Keep responses focused and conversational."
+                            )
+                        else:
+                            message.content = strip_message_tags(message.content)
+                        
+                        # Update activity and mark responded
+                        adapter_self._group_chat.touch(channel_id)
                         self._bot_tracker.mark_responded(msg_id)
-                        # For Harmony: [END] messages are task completions - log for awareness
-                        if is_harmony and tag == 'END':
-                            self._bot_tracker.mark_responded(msg_id)
-                            message.content = f'[TASK COMPLETED - Agent reported completion] {strip_message_tags(message.content)}'
-                            # Fall through to process so Harmony can update task board
-                        else:
+                        # Fall through to process the message
+                    else:
+                        # ── NORMAL BOT-TO-BOT PROTOCOL (not group chat) ──
+                        
+                        # If bot messages completely disabled, drop it
+                        if allow_bots == "none":
                             return
-                    
-                    # ── Channel-based routing for worker agents ──
-                    # Workers only respond to messages in harmony-communication
-                    # (where Harmony delegates) or their own home channel
-                    if not is_harmony:
-                        sender_id = str(message.author.id)
-                        # Workers only accept [REQUEST] from Harmony
-                        if tag == 'REQUEST' and sender_id != HARMONY_BOT_ID:
-                            # Not from Harmony - react and ignore
-                            try:
-                                await message.add_reaction('\u26d4')  # no_entry
-                            except Exception:
-                                pass
-                            self._bot_tracker.mark_responded(msg_id)
+                        
+                        # ── HARMONY FIX: In harmony-communication, Harmony processes
+                        #    all tagged bot messages even without being @mentioned ──
+                        is_in_harmony_channel = (channel_id == HARMONY_CHANNEL_ID)
+                        tag = parse_message_tag(message.content)
+                        
+                        if allow_bots == "mentions":
+                            explicitly_mentioned = (self._client.user and self._client.user in message.mentions)
+                            # Harmony auto-processes tagged messages in her channel
+                            harmony_auto = (is_harmony and is_in_harmony_channel and tag in ('REQUEST', 'NOTIFY', 'END', 'REPORT'))
+                            if not explicitly_mentioned and not harmony_auto:
+                                return
+                        
+                        # ── Anti-doom-loop: have we already responded to this message? ──
+                        if self._bot_tracker.has_responded(msg_id):
                             return
-                    
-                    # ── Check if this is a reply to one of MY messages ──
-                    is_reply_to_me = False
-                    if message.reference and message.reference.message_id:
-                        try:
-                            ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                            if ref_msg.author == self._client.user:
-                                is_reply_to_me = True
-                        except Exception:
-                            pass
-                    
-                    # ── No tag from a bot ──
-                    if tag is None:
-                        if is_reply_to_me:
-                            # This is a response to something I asked - process it
-                            # but mark it so I don't reply back (read-only awareness)
-                            self._bot_tracker.mark_responded(msg_id)
-                            message.content = f'[AGENT RESPONSE - DO NOT REPLY TO THIS AGENT] {message.content}'
-                        else:
-                            # Not a reply to me, no tag - react only, prevent chain reaction
+                        
+                        # ── [NOTIFY] or [END] - React only, do NOT reply ──
+                        if tag in ('NOTIFY', 'END'):
                             _, done_emoji = get_context_emoji(agent_name, message.content)
                             try:
                                 await message.add_reaction(done_emoji)
                             except Exception:
                                 try:
-                                    await message.add_reaction('\ud83d\udc4d')
+                                    await message.add_reaction('\u2705')
                                 except Exception:
                                     pass
                             self._bot_tracker.mark_responded(msg_id)
-                            return
-                    
-                    # ── [REQUEST] or [REPORT] - Allow exactly one response ──
-                    # Mark as responded BEFORE processing to prevent re-entry
-                    self._bot_tracker.mark_responded(msg_id)
-                    
-                    # Strip the tag before passing to LLM
-                    message.content = strip_message_tags(message.content)
+                            # For Harmony: [END] messages are task completions - log for awareness
+                            if is_harmony and tag == 'END':
+                                message.content = f'[TASK COMPLETED - Agent reported completion] {strip_message_tags(message.content)}'
+                                # Fall through to process so Harmony can update task board
+                            else:
+                                return
+                        
+                        # ── Channel-based routing for worker agents ──
+                        if not is_harmony:
+                            # Workers only accept [REQUEST] from Harmony (or in group chat, handled above)
+                            if tag == 'REQUEST' and sender_id != HARMONY_BOT_ID:
+                                try:
+                                    await message.add_reaction('\u26d4')  # no_entry
+                                except Exception:
+                                    pass
+                                self._bot_tracker.mark_responded(msg_id)
+                                return
+                        
+                        # ── Check if this is a reply to one of MY messages ──
+                        is_reply_to_me = False
+                        if message.reference and message.reference.message_id:
+                            try:
+                                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                                if ref_msg.author == self._client.user:
+                                    is_reply_to_me = True
+                            except Exception:
+                                pass
+                        
+                        # ── No tag from a bot ──
+                        if tag is None:
+                            if is_reply_to_me:
+                                self._bot_tracker.mark_responded(msg_id)
+                                message.content = f'[AGENT RESPONSE - DO NOT REPLY TO THIS AGENT] {message.content}'
+                            else:
+                                _, done_emoji = get_context_emoji(agent_name, message.content)
+                                try:
+                                    await message.add_reaction(done_emoji)
+                                except Exception:
+                                    try:
+                                        await message.add_reaction('\ud83d\udc4d')
+                                    except Exception:
+                                        pass
+                                self._bot_tracker.mark_responded(msg_id)
+                                return
+                        
+                        # ── [REQUEST] or [REPORT] - Allow exactly one response ──
+                        self._bot_tracker.mark_responded(msg_id)
+                        
+                        # Strip the tag before passing to LLM
+                        message.content = strip_message_tags(message.content)
                 
-                # ── Human messages (and approved bot [REQUEST]/[REPORT]) ──
+                # ── Human messages (and approved bot messages) ──
                 # Context-aware emoji reactions
                 thinking_emoji, done_emoji = get_context_emoji(agent_name, message.content)
 
