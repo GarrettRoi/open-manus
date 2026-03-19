@@ -328,6 +328,49 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
                 adapter_self._ready_event.set()
+                
+                # ── Post-deployment startup notification ──
+                # Send a message to the agent's home channel so the owner
+                # can see who's online without checking Railway.
+                try:
+                    agent_name = os.getenv('AGENT_NAME', 'unknown').capitalize()
+                    home_channel_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                    if home_channel_id:
+                        channel = adapter_self._client.get_channel(int(home_channel_id))
+                        if not channel:
+                            channel = await adapter_self._client.fetch_channel(int(home_channel_id))
+                        if channel:
+                            import datetime
+                            now = datetime.datetime.now(datetime.timezone.utc)
+                            timestamp = now.strftime('%b %d, %I:%M %p UTC')
+                            model_name = os.getenv('HERMES_MODEL', 'default')
+                            # Pick a signature emoji for the agent
+                            agent_key = agent_name.lower()
+                            emoji_map = {
+                                'harmony': '\U0001f451',   # crown
+                                'jade': '\U0001f3b5',      # music note
+                                'lexi': '\U0001f4da',      # books
+                                'sasha': '\U0001f3af',     # target
+                                'scarlett': '\U0001f49d',  # heart ribbon
+                                'raven': '\U0001f50d',     # magnifying glass
+                                'cora': '\U0001f3a8',      # palette
+                                'sabrina': '\U0001f4f1',   # phone
+                                'addison': '\U0001f4e2',   # loudspeaker
+                                'samantha': '\U0001f4cb',  # clipboard
+                                'tatiana': '\U0001f3e0',   # house
+                                'valentina': '\u2699\ufe0f',  # gear
+                                'bianca': '\U0001f4ca',    # chart
+                            }
+                            emoji = emoji_map.get(agent_key, '\u2705')
+                            await channel.send(
+                                f"{emoji} **{agent_name}** is online and ready.\n"
+                                f"> Deployed: {timestamp}\n"
+                                f"> Slash commands synced: {len(synced)}\n"
+                                f"> Status: All systems operational"
+                            )
+                            logger.info("[%s] Startup notification sent to channel %s", adapter_self.name, home_channel_id)
+                except Exception as e:
+                    logger.warning("[%s] Failed to send startup notification: %s", adapter_self.name, e)
             
             @self._client.event
             async def on_message(message: DiscordMessage):
