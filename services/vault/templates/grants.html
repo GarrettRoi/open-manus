@@ -6,12 +6,14 @@
 {% block content %}
 <div class="page-header">
     <h2>Access Grants</h2>
-    <p>Control which agents can access which API keys. Check the box to grant access.</p>
+    <p>Control which agents can access which API keys.</p>
 </div>
 
 <div class="card">
     {% if key_names %}
-    <form method="post" action="/grants/update">
+    <form method="post" action="/grants/update" id="grantsForm">
+
+        <!-- DESKTOP: Classic matrix table -->
         <div class="grant-matrix">
             <table>
                 <thead>
@@ -37,8 +39,40 @@
                 </tbody>
             </table>
         </div>
-        <div style="margin-top: 20px; display: flex; gap: 12px; align-items: center;">
-            <button type="submit" class="btn btn-primary">Save All Grants</button>
+
+        <!-- MOBILE: Card-based layout with toggle switches -->
+        <div class="grant-cards">
+            {% for agent in agents %}
+            <div class="grant-card">
+                <div class="grant-card-header">
+                    <h4>{{ agent|capitalize }}</h4>
+                    <span class="count" id="count_{{ agent }}">
+                        {% set ns = namespace(count=0) %}
+                        {% for kn in key_names %}
+                            {% if matrix[agent][kn] %}{% set ns.count = ns.count + 1 %}{% endif %}
+                        {% endfor %}
+                        {{ ns.count }} / {{ key_names|length }} keys
+                    </span>
+                </div>
+                {% for kn in key_names %}
+                <div class="grant-toggle">
+                    <label for="mobile_grant_{{ agent }}_{{ kn }}">{{ kn }}</label>
+                    <div class="toggle-switch">
+                        <input type="checkbox" 
+                               id="mobile_grant_{{ agent }}_{{ kn }}"
+                               name="grant_{{ agent }}_{{ kn }}" 
+                               {% if matrix[agent][kn] %}checked{% endif %}
+                               onchange="syncGrant('{{ agent }}', '{{ kn }}', this.checked); updateCount('{{ agent }}')">
+                        <span class="toggle-slider"></span>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+
+        <div style="margin-top: 20px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <button type="submit" class="btn btn-primary" style="min-width: 160px; justify-content: center;">&#128190; Save All Grants</button>
             <span style="color: var(--text-muted); font-size: 13px;">Changes take effect immediately for all agents.</span>
         </div>
     </form>
@@ -50,10 +84,12 @@
 {% if key_names %}
 <div class="card">
     <h3>Quick Actions</h3>
-    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+    <div style="display: flex; gap: 12px; flex-wrap: wrap;" class="quick-actions">
         <button class="btn btn-outline btn-sm" onclick="selectAll()">Select All</button>
         <button class="btn btn-outline btn-sm" onclick="deselectAll()">Deselect All</button>
-        <button class="btn btn-outline btn-sm" onclick="grantAllToHarmony()">Grant All to Harmony</button>
+        {% for agent in agents %}
+        <button class="btn btn-outline btn-sm" onclick="grantAllTo('{{ agent }}')">Grant All → {{ agent|capitalize }}</button>
+        {% endfor %}
     </div>
 </div>
 {% endif %}
@@ -61,16 +97,75 @@
 
 {% block scripts %}
 <script>
-function selectAll() {
-    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => cb.checked = true);
+// Sync checkboxes between desktop matrix and mobile cards
+function syncGrant(agent, key, checked) {
+    // Find the desktop matrix checkbox and sync
+    var desktopCb = document.querySelector('.grant-matrix input[name="grant_' + agent + '_' + key + '"]');
+    if (desktopCb) desktopCb.checked = checked;
+    // Sync mobile toggle too (in case called from desktop)
+    var mobileCb = document.getElementById('mobile_grant_' + agent + '_' + key);
+    if (mobileCb) mobileCb.checked = checked;
 }
-function deselectAll() {
-    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => cb.checked = false);
-}
-function grantAllToHarmony() {
-    document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(cb => {
-        if (cb.name.startsWith('grant_harmony_')) cb.checked = true;
+
+function updateCount(agent) {
+    var total = 0;
+    var checked = 0;
+    document.querySelectorAll('.grant-cards input[id^="mobile_grant_' + agent + '_"]').forEach(function(cb) {
+        total++;
+        if (cb.checked) checked++;
     });
+    var el = document.getElementById('count_' + agent);
+    if (el) el.textContent = checked + ' / ' + total + ' keys';
 }
+
+function updateAllCounts() {
+    {% for agent in agents %}
+    updateCount('{{ agent }}');
+    {% endfor %}
+}
+
+function selectAll() {
+    document.querySelectorAll('#grantsForm input[type="checkbox"]').forEach(function(cb) { cb.checked = true; });
+    updateAllCounts();
+}
+
+function deselectAll() {
+    document.querySelectorAll('#grantsForm input[type="checkbox"]').forEach(function(cb) { cb.checked = false; });
+    updateAllCounts();
+}
+
+function grantAllTo(agent) {
+    // Check all boxes for this agent (both desktop and mobile)
+    document.querySelectorAll('#grantsForm input[name^="grant_' + agent + '_"]').forEach(function(cb) { cb.checked = true; });
+    updateCount(agent);
+}
+
+// Before submit: ensure desktop and mobile checkboxes are synced
+// Since both have the same name attribute, we need to deduplicate.
+// The form will naturally include all checked ones — but if BOTH are present
+// with the same name, duplicate submissions are fine (server just sees the field exists).
+// However, to avoid confusion, let's disable the hidden set before submit.
+document.getElementById('grantsForm')?.addEventListener('submit', function() {
+    var isMobile = window.innerWidth <= 768;
+    if (isMobile) {
+        // Disable desktop checkboxes so only mobile ones submit
+        document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(function(cb) { cb.disabled = true; });
+    } else {
+        // Disable mobile checkboxes so only desktop ones submit
+        document.querySelectorAll('.grant-cards input[type="checkbox"]').forEach(function(cb) { cb.disabled = true; });
+    }
+});
+
+// Also sync on desktop checkbox changes
+document.querySelectorAll('.grant-matrix input[type="checkbox"]').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+        var name = this.name;
+        var parts = name.replace('grant_', '').split('_');
+        var agent = parts[0];
+        var key = parts.slice(1).join('_');
+        syncGrant(agent, key, this.checked);
+        updateCount(agent);
+    });
+});
 </script>
 {% endblock %}

@@ -52,7 +52,7 @@
         </div>
         <div class="form-group">
             <label>Skill / Tool Usage Description (how agents should use this key)</label>
-            <textarea name="skill_description" placeholder="Use this key with the OpenAI Python SDK. Example: client = OpenAI(api_key=key). Supports gpt-4, gpt-3.5-turbo models. Use for content generation, summarization, and analysis tasks."></textarea>
+            <textarea name="skill_description" placeholder="Use this key with the OpenAI Python SDK..."></textarea>
         </div>
         <button type="submit" class="btn btn-primary">Add Key</button>
     </form>
@@ -62,50 +62,88 @@
 <div class="card">
     <h3>&#128273; API Keys</h3>
     {% if keys %}
-    <table>
-        <thead>
-            <tr>
-                <th>Key Name</th>
-                <th>Service</th>
-                <th>Value (masked)</th>
-                <th>Agents</th>
-                <th>Has Skill Doc</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for key in keys %}
-            <tr>
-                <td><strong>{{ key.name }}</strong></td>
-                <td>{{ key.service or '—' }}</td>
-                <td><code style="font-size: 12px; color: var(--text-muted);">{{ key.masked_value }}</code></td>
-                <td>
-                    {% if key.granted_agents %}
-                        {% for agent in key.granted_agents %}
-                        <span class="badge badge-success">{{ agent }}</span>
-                        {% endfor %}
-                    {% else %}
-                        <span class="badge badge-muted">none</span>
-                    {% endif %}
-                </td>
-                <td>
-                    {% if key.skill_description %}
-                        <span class="badge badge-success">Yes</span>
-                    {% else %}
-                        <span class="badge badge-muted">No</span>
-                    {% endif %}
-                </td>
-                <td>
-                    <button class="btn btn-sm btn-outline" onclick="openEditModal('{{ key.name }}', '{{ key.service }}', '{{ key.description }}', `{{ key.skill_description|e }}`)">Edit</button>
-                    <form method="post" action="/keys/delete" style="display:inline;" onsubmit="return confirm('Delete {{ key.name }}?')">
-                        <input type="hidden" name="key_name" value="{{ key.name }}">
-                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th>Key Name</th>
+                    <th>Service</th>
+                    <th>Value (masked)</th>
+                    <th>Agents</th>
+                    <th>Skill Doc</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for key in keys %}
+                <tr>
+                    <td><strong>{{ key.name }}</strong></td>
+                    <td>{{ key.service or '&#8212;' }}</td>
+                    <td><code style="font-size: 12px; color: var(--text-muted);">{{ key.masked_value }}</code></td>
+                    <td>
+                        {% if key.granted_agents %}
+                            {% for agent in key.granted_agents %}
+                            <span class="badge badge-success">{{ agent }}</span>
+                            {% endfor %}
+                        {% else %}
+                            <span class="badge badge-muted">none</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if key.skill_description %}
+                            <span class="badge badge-success">Yes</span>
+                        {% else %}
+                            <span class="badge badge-muted">No</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button class="btn btn-sm btn-outline" onclick="openEditModal('{{ key.name }}', '{{ key.service }}', '{{ key.description }}', `{{ key.skill_description|e }}`)">Edit</button>
+                        <form method="post" action="/keys/delete" style="display:inline;" onsubmit="return confirm('Delete {{ key.name }}?')">
+                            <input type="hidden" name="key_name" value="{{ key.name }}">
+                            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Mobile card view for keys -->
+    <div class="mobile-key-cards">
+        {% for key in keys %}
+        <div class="grant-card" style="margin-top: 12px;">
+            <div class="grant-card-header">
+                <h4>{{ key.name }}</h4>
+                {% if key.skill_description %}
+                    <span class="badge badge-success">Skill Doc</span>
+                {% endif %}
+            </div>
+            {% if key.service %}
+            <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">Service: {{ key.service }}</div>
+            {% endif %}
+            <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+                <code style="font-size: 11px;">{{ key.masked_value }}</code>
+            </div>
+            <div style="margin-bottom: 12px;">
+                {% if key.granted_agents %}
+                    {% for agent in key.granted_agents %}
+                    <span class="badge badge-success" style="margin: 2px;">{{ agent }}</span>
+                    {% endfor %}
+                {% else %}
+                    <span class="badge badge-muted">no agents</span>
+                {% endif %}
+            </div>
+            <div style="display: flex; gap: 8px;">
+                <button type="button" class="btn btn-sm btn-outline" style="flex: 1; justify-content: center;" onclick="openEditModal('{{ key.name }}', '{{ key.service }}', '{{ key.description }}', `{{ key.skill_description|e }}`)">Edit</button>
+                <form method="post" action="/keys/delete" style="flex: 1;" onsubmit="return confirm('Delete {{ key.name }}?')">
+                    <input type="hidden" name="key_name" value="{{ key.name }}">
+                    <button type="submit" class="btn btn-sm btn-danger" style="width: 100%; justify-content: center;">Delete</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
     {% else %}
     <p style="color: var(--text-muted); padding: 20px 0;">No API keys stored yet. Add your first key above.</p>
     {% endif %}
@@ -114,37 +152,39 @@
 <!-- Agent Overview -->
 <div class="card">
     <h3>&#129302; Agent Access Summary</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>Agent</th>
-                <th>Keys Granted</th>
-                <th>Key List</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for agent in agents %}
-            <tr>
-                <td><strong>{{ agent.name|capitalize }}</strong></td>
-                <td>
-                    {% if agent.key_count > 0 %}
-                        <span class="badge badge-success">{{ agent.key_count }}</span>
-                    {% else %}
-                        <span class="badge badge-muted">0</span>
-                    {% endif %}
-                </td>
-                <td>
-                    {% for kn in agent.granted_keys %}
-                        <span class="badge badge-warning" style="margin: 2px;">{{ kn }}</span>
-                    {% endfor %}
-                    {% if not agent.granted_keys %}
-                        <span style="color: var(--text-muted); font-size: 13px;">No keys assigned</span>
-                    {% endif %}
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>Keys Granted</th>
+                    <th>Key List</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for agent in agents %}
+                <tr>
+                    <td><strong>{{ agent.name|capitalize }}</strong></td>
+                    <td>
+                        {% if agent.key_count > 0 %}
+                            <span class="badge badge-success">{{ agent.key_count }}</span>
+                        {% else %}
+                            <span class="badge badge-muted">0</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% for kn in agent.granted_keys %}
+                            <span class="badge badge-warning" style="margin: 2px;">{{ kn }}</span>
+                        {% endfor %}
+                        {% if not agent.granted_keys %}
+                            <span style="color: var(--text-muted); font-size: 13px;">No keys assigned</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <!-- Edit Modal -->
@@ -179,6 +219,15 @@
 {% endblock %}
 
 {% block scripts %}
+<style>
+    /* Hide mobile cards on desktop, show table */
+    .mobile-key-cards { display: none; }
+
+    @media (max-width: 768px) {
+        .mobile-key-cards { display: block; }
+        .table-responsive { display: none; }
+    }
+</style>
 <script>
 function openEditModal(name, service, description, skillDesc) {
     document.getElementById('edit_key_name').value = name;

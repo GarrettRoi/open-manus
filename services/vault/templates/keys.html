@@ -12,28 +12,30 @@
 {% for key in keys %}
 <div class="card">
     <h3>{{ key.name }}</h3>
-    <table style="margin-bottom: 16px;">
-        <tr>
-            <td style="width: 140px; color: var(--text-muted); font-weight: 500;">Service</td>
-            <td>{{ key.service or '—' }}</td>
-        </tr>
-        <tr>
-            <td style="color: var(--text-muted); font-weight: 500;">Description</td>
-            <td>{{ key.description or '—' }}</td>
-        </tr>
-        <tr>
-            <td style="color: var(--text-muted); font-weight: 500;">Value (masked)</td>
-            <td><code style="font-size: 13px;">{{ key.masked_value }}</code></td>
-        </tr>
-        <tr>
-            <td style="color: var(--text-muted); font-weight: 500;">Created</td>
-            <td style="font-size: 13px;">{{ key.created_at[:19] if key.created_at else '—' }}</td>
-        </tr>
-        <tr>
-            <td style="color: var(--text-muted); font-weight: 500;">Updated</td>
-            <td style="font-size: 13px;">{{ key.updated_at[:19] if key.updated_at else '—' }}</td>
-        </tr>
-    </table>
+    <div class="table-responsive">
+        <table style="margin-bottom: 16px;">
+            <tr>
+                <td style="width: 140px; color: var(--text-muted); font-weight: 500;">Service</td>
+                <td>{{ key.service or '&#8212;' }}</td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-muted); font-weight: 500;">Description</td>
+                <td>{{ key.description or '&#8212;' }}</td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-muted); font-weight: 500;">Value (masked)</td>
+                <td><code style="font-size: 13px;">{{ key.masked_value }}</code></td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-muted); font-weight: 500;">Created</td>
+                <td style="font-size: 13px;">{{ key.created_at[:19] if key.created_at else '&#8212;' }}</td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-muted); font-weight: 500;">Updated</td>
+                <td style="font-size: 13px;">{{ key.updated_at[:19] if key.updated_at else '&#8212;' }}</td>
+            </tr>
+        </table>
+    </div>
 
     {% if key.skill_description %}
     <div style="background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 16px;">

@@ -6,49 +6,87 @@
 {% block content %}
 <div class="page-header">
     <h2>Agent Tokens</h2>
-    <p>Each agent uses a unique token to authenticate with the vault. These tokens are set as VAULT_TOKEN in each agent's Railway environment.</p>
+    <p>Each agent uses a unique token to authenticate with the vault.</p>
 </div>
 
 <div class="card">
-    <table>
-        <thead>
-            <tr>
-                <th>Agent</th>
-                <th>Token</th>
-                <th>Created</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for agent in agents %}
-            <tr>
-                <td><strong>{{ agent.name|capitalize }}</strong></td>
-                <td>
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <span class="token-display" id="token_{{ agent.name }}">{{ agent.token_plain }}</span>
-                        <button class="copy-btn" onclick="copyToClipboard('{{ agent.token_plain }}', this)">Copy</button>
-                    </div>
-                </td>
-                <td style="color: var(--text-muted); font-size: 13px;">{{ agent.created_at[:10] if agent.created_at else '—' }}</td>
-                <td>
-                    <form method="post" action="/agents/regenerate" style="display:inline;" onsubmit="return confirm('Regenerate token for {{ agent.name|capitalize }}? The old token will stop working immediately.')">
-                        <input type="hidden" name="agent_name" value="{{ agent.name }}">
-                        <button type="submit" class="btn btn-sm btn-outline">Regenerate</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <!-- Desktop table -->
+    <div class="table-responsive desktop-only">
+        <table>
+            <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>Token</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for agent in agents %}
+                <tr>
+                    <td><strong>{{ agent.name|capitalize }}</strong></td>
+                    <td>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span class="token-display" id="token_{{ agent.name }}">{{ agent.token_plain }}</span>
+                            <button class="copy-btn" onclick="copyToClipboard('{{ agent.token_plain }}', this)">Copy</button>
+                        </div>
+                    </td>
+                    <td style="color: var(--text-muted); font-size: 13px;">{{ agent.created_at[:10] if agent.created_at else '&#8212;' }}</td>
+                    <td>
+                        <form method="post" action="/agents/regenerate" style="display:inline;" onsubmit="return confirm('Regenerate token for {{ agent.name|capitalize }}? The old token will stop working immediately.')">
+                            <input type="hidden" name="agent_name" value="{{ agent.name }}">
+                            <button type="submit" class="btn btn-sm btn-outline">Regenerate</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Mobile card view -->
+    <div class="mobile-only">
+        {% for agent in agents %}
+        <div class="grant-card" {% if not loop.first %}style="margin-top: 12px;"{% endif %}>
+            <div class="grant-card-header">
+                <h4>{{ agent.name|capitalize }}</h4>
+                <span style="font-size: 12px; color: var(--text-muted);">{{ agent.created_at[:10] if agent.created_at else '' }}</span>
+            </div>
+            <div style="margin-bottom: 12px;">
+                <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Token:</div>
+                <div class="token-display" style="font-size: 11px; padding: 8px;">{{ agent.token_plain }}</div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn btn-sm btn-outline" style="flex: 1; justify-content: center;" onclick="copyToClipboard('{{ agent.token_plain }}', this)">&#128203; Copy Token</button>
+                <form method="post" action="/agents/regenerate" style="flex: 1;" onsubmit="return confirm('Regenerate token for {{ agent.name|capitalize }}?')">
+                    <input type="hidden" name="agent_name" value="{{ agent.name }}">
+                    <button type="submit" class="btn btn-sm btn-danger" style="width: 100%; justify-content: center;">&#128260; Regenerate</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
 </div>
 
 <div class="card">
     <h3>&#128161; Setup Instructions</h3>
     <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6;">
         Each agent needs two environment variables set in Railway:<br><br>
-        <code style="background: var(--bg); padding: 4px 8px; border-radius: 4px;">VAULT_URL</code> — The internal URL of this vault service (e.g., <code>http://vault.railway.internal:8080</code>)<br>
-        <code style="background: var(--bg); padding: 4px 8px; border-radius: 4px;">VAULT_TOKEN</code> — The agent's unique token from the table above<br><br>
+        <code style="background: var(--bg); padding: 4px 8px; border-radius: 4px;">VAULT_URL</code> — The internal URL of this vault service<br>
+        <code style="background: var(--bg); padding: 4px 8px; border-radius: 4px;">VAULT_TOKEN</code> — The agent's unique token from above<br><br>
         Agents use these to fetch API keys securely without ever seeing the raw values in their environment variables.
     </p>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+    .desktop-only { display: block; }
+    .mobile-only { display: none; }
+
+    @media (max-width: 768px) {
+        .desktop-only { display: none !important; }
+        .mobile-only { display: block !important; }
+    }
+</style>
 {% endblock %}

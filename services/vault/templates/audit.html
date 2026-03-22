@@ -11,48 +11,94 @@
 
 <div class="card">
     {% if entries %}
-    <table>
-        <thead>
-            <tr>
-                <th>Timestamp</th>
-                <th>Agent</th>
-                <th>Key</th>
-                <th>Action</th>
-                <th>Detail</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for entry in entries %}
-            <tr>
-                <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">{{ entry.timestamp[:19] }}</td>
-                <td>
+    <!-- Desktop table -->
+    <div class="table-responsive desktop-only">
+        <table>
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>Agent</th>
+                    <th>Key</th>
+                    <th>Action</th>
+                    <th>Detail</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for entry in entries %}
+                <tr>
+                    <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">{{ entry.timestamp[:19] }}</td>
+                    <td>
+                        {% if entry.agent == 'admin' %}
+                            <span class="badge badge-warning">admin</span>
+                        {% else %}
+                            <span class="badge badge-success">{{ entry.agent }}</span>
+                        {% endif %}
+                    </td>
+                    <td><strong>{{ entry.key_name }}</strong></td>
+                    <td>
+                        {% if 'denied' in entry.action %}
+                            <span class="badge badge-danger">{{ entry.action }}</span>
+                        {% elif 'success' in entry.action or 'created' in entry.action or 'added' in entry.action %}
+                            <span class="badge badge-success">{{ entry.action }}</span>
+                        {% elif 'deleted' in entry.action or 'removed' in entry.action %}
+                            <span class="badge badge-danger">{{ entry.action }}</span>
+                        {% else %}
+                            <span class="badge badge-muted">{{ entry.action }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="color: var(--text-muted); font-size: 13px;">{{ entry.detail or '&#8212;' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Mobile card view -->
+    <div class="mobile-only">
+        {% for entry in entries %}
+        <div style="padding: 12px 0; border-bottom: 1px solid var(--border);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <div>
                     {% if entry.agent == 'admin' %}
                         <span class="badge badge-warning">admin</span>
                     {% else %}
                         <span class="badge badge-success">{{ entry.agent }}</span>
                     {% endif %}
-                </td>
-                <td><strong>{{ entry.key_name }}</strong></td>
-                <td>
-                    {% if 'denied' in entry.action %}
-                        <span class="badge badge-danger">{{ entry.action }}</span>
-                    {% elif 'success' in entry.action %}
-                        <span class="badge badge-success">{{ entry.action }}</span>
-                    {% elif 'created' in entry.action or 'added' in entry.action %}
-                        <span class="badge badge-success">{{ entry.action }}</span>
-                    {% elif 'deleted' in entry.action or 'removed' in entry.action %}
-                        <span class="badge badge-danger">{{ entry.action }}</span>
-                    {% else %}
-                        <span class="badge badge-muted">{{ entry.action }}</span>
-                    {% endif %}
-                </td>
-                <td style="color: var(--text-muted); font-size: 13px;">{{ entry.detail or '—' }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+                    <strong style="margin-left: 6px;">{{ entry.key_name }}</strong>
+                </div>
+                {% if 'denied' in entry.action %}
+                    <span class="badge badge-danger">{{ entry.action }}</span>
+                {% elif 'success' in entry.action or 'created' in entry.action or 'added' in entry.action %}
+                    <span class="badge badge-success">{{ entry.action }}</span>
+                {% elif 'deleted' in entry.action or 'removed' in entry.action %}
+                    <span class="badge badge-danger">{{ entry.action }}</span>
+                {% else %}
+                    <span class="badge badge-muted">{{ entry.action }}</span>
+                {% endif %}
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted);">
+                <span>{{ entry.timestamp[:19] }}</span>
+                {% if entry.detail %}
+                <span>{{ entry.detail }}</span>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
     {% else %}
     <p style="color: var(--text-muted); padding: 20px 0;">No audit entries yet. Actions will be logged as agents access keys and you manage the vault.</p>
     {% endif %}
 </div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+    .desktop-only { display: block; }
+    .mobile-only { display: none; }
+
+    @media (max-width: 768px) {
+        .desktop-only { display: none !important; }
+        .mobile-only { display: block !important; }
+    }
+</style>
 {% endblock %}
