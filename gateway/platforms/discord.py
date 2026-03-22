@@ -489,7 +489,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                         
                         # Anti-doom-loop: already responded?
-                        if self._bot_tracker.has_responded(msg_id):
+                        if adapter_self._bot_tracker.has_responded(msg_id):
                             return
                         
                         # 4-second delay: wait, then scrape recent messages for context
@@ -526,7 +526,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         
                         # Update activity and mark responded
                         adapter_self._group_chat.touch(channel_id)
-                        self._bot_tracker.mark_responded(msg_id)
+                        adapter_self._bot_tracker.mark_responded(msg_id)
                         # Fall through to process the message
                     else:
                         # ── NORMAL BOT-TO-BOT PROTOCOL (not group chat) ──
@@ -548,7 +548,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                 return
                         
                         # ── Anti-doom-loop: have we already responded to this message? ──
-                        if self._bot_tracker.has_responded(msg_id):
+                        if adapter_self._bot_tracker.has_responded(msg_id):
                             return
                         
                         # ── [NOTIFY] or [END] - React only, do NOT reply ──
@@ -561,7 +561,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                     await message.add_reaction('\u2705')
                                 except Exception:
                                     pass
-                            self._bot_tracker.mark_responded(msg_id)
+                            adapter_self._bot_tracker.mark_responded(msg_id)
                             # For Harmony: [END] messages are task completions - log for awareness
                             if is_harmony and tag == 'END':
                                 message.content = f'[TASK COMPLETED - Agent reported completion] {strip_message_tags(message.content)}'
@@ -577,7 +577,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                     await message.add_reaction('\u26d4')  # no_entry
                                 except Exception:
                                     pass
-                                self._bot_tracker.mark_responded(msg_id)
+                                adapter_self._bot_tracker.mark_responded(msg_id)
                                 return
                         
                         # ── Check if this is a reply to one of MY messages ──
@@ -593,7 +593,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         # ── No tag from a bot ──
                         if tag is None:
                             if is_reply_to_me:
-                                self._bot_tracker.mark_responded(msg_id)
+                                adapter_self._bot_tracker.mark_responded(msg_id)
                                 message.content = f'[AGENT RESPONSE - DO NOT REPLY TO THIS AGENT] {message.content}'
                             else:
                                 _, done_emoji = get_context_emoji(agent_name, message.content)
@@ -604,11 +604,11 @@ class DiscordAdapter(BasePlatformAdapter):
                                         await message.add_reaction('\ud83d\udc4d')
                                     except Exception:
                                         pass
-                                self._bot_tracker.mark_responded(msg_id)
+                                adapter_self._bot_tracker.mark_responded(msg_id)
                                 return
                         
                         # ── [REQUEST] or [REPORT] - Allow exactly one response ──
-                        self._bot_tracker.mark_responded(msg_id)
+                        adapter_self._bot_tracker.mark_responded(msg_id)
                         
                         # Strip the tag before passing to LLM
                         message.content = strip_message_tags(message.content)
