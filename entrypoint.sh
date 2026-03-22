@@ -40,6 +40,12 @@ fi
 # Copy shared skills
 cp -r /app/skills/* /root/.hermes/skills/ 2>/dev/null || true
 
+# Pull latest dynamic skills from Redis Skill Store
+if [ -n "$REDIS_URL" ]; then
+    echo "[entrypoint] Syncing dynamic skills from Redis Skill Store..."
+    python3 /app/skills/hive_mind/skill_sync.py --action pull --target /root/.hermes/skills/ || true
+fi
+
 # Write the .env file for Hermes from environment variables
 cat > /root/.hermes/.env << EOF
 OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}

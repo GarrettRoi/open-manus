@@ -87,3 +87,25 @@ python3 /app/skills/hive_mind/skill_registry.py --action list-all
 | `hive:skills:{agent_name}` | Skills assigned to this agent |
 | `hive:skills:registry` | Master skill registry |
 | `hive:archive` | Archived/retired lessons |
+
+### Skill Sync — Distribute New Tools to the Team (Valentina Only)
+
+This tool allows Valentina to push new skills and tools to a centralized Redis Skill Store, which are then automatically pulled by all other agents on startup.
+
+#### Push a New Skill
+When you create a new tool or skill in a directory, push it to the shared store:
+```bash
+python3 /app/skills/hive_mind/skill_sync.py --action push --path /path/to/your/skill_dir
+```
+
+#### Pull Latest Skills (Manual Sync)
+If you want to sync your own local skill directory with the latest from the store:
+```bash
+python3 /app/skills/hive_mind/skill_sync.py --action pull --target /root/.hermes/skills
+```
+
+#### Workflow for Valentina
+1. **Build**: Create a new skill in a local directory (e.g., `/root/.hermes/skills/my_new_tool`).
+2. **Test**: Verify it works locally in your own environment.
+3. **Sync**: Push it to the store using the command above.
+4. **Notify**: Tell Harmony or the other agents that the new tool is available. They will see it the next time they redeploy or restart.

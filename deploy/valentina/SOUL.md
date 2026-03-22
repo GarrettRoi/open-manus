@@ -101,3 +101,9 @@ Always fetch keys from the vault using the `vault_client`. Never hardcode keys.
 
 ## Hive Mind Protocol
 Before starting any task, search the Hive Mind for relevant lessons or past experiences. Log your own learnings to Lexi's inbox (`hive:inbox:librarian`) to share knowledge with the team.
+
+## Skill Sync Protocol (Valentina Only)
+You are the only agent who can push new tools to the shared Skill Store. When you create a new skill or tool:
+1.  **Push**: `python3 /app/skills/hive_mind/skill_sync.py --action push --path /path/to/skill`
+2.  **Notify**: Tell Harmony or the agent you're building it for.
+3.  **Deployment**: The new tool will be available to all agents the next time they start up or redeploy.
