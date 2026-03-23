@@ -164,7 +164,7 @@ def verify_agent_token(token: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": ""})
+    return templates.TemplateResponse(request, "login.html", {"error": ""})
 
 
 @app.post("/login")
@@ -175,7 +175,7 @@ async def login_submit(request: Request, password: str = Form(...)):
         response = RedirectResponse(url="/", status_code=303)
         response.set_cookie("vault_session", session_id, httponly=True, max_age=86400)
         return response
-    return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid password"})
+    return templates.TemplateResponse(request, "login.html", {"error": "Invalid password"})
 
 
 @app.get("/logout")
@@ -231,8 +231,7 @@ async def dashboard(request: Request):
             data["key_count"] = len(granted_keys)
             agents.append(data)
 
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "dashboard.html", {
         "keys": keys,
         "agents": agents,
         "agent_names": AGENT_NAMES,
@@ -260,7 +259,7 @@ async def keys_page(request: Request):
             data["skill_description"] = skill.get("description", "") if skill else ""
             keys.append(data)
 
-    return templates.TemplateResponse("keys.html", {"request": request, "keys": keys})
+    return templates.TemplateResponse(request, "keys.html", {"keys": keys})
 
 
 @app.post("/keys/add")
@@ -367,8 +366,7 @@ async def grants_page(request: Request):
         for kn in key_names:
             matrix[agent][kn] = r.exists(f"{PFX_GRANT}{agent}:{kn}")
 
-    return templates.TemplateResponse("grants.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "grants.html", {
         "agents": AGENT_NAMES,
         "key_names": key_names,
         "matrix": matrix,
@@ -414,7 +412,7 @@ async def agents_page(request: Request):
         if data:
             agents.append(data)
 
-    return templates.TemplateResponse("agents.html", {"request": request, "agents": agents})
+    return templates.TemplateResponse(request, "agents.html", {"agents": agents})
 
 
 @app.post("/agents/regenerate")
@@ -442,7 +440,7 @@ async def audit_page(request: Request):
     raw_entries = r.lrange(PFX_AUDIT, 0, 99)
     entries = [json.loads(e) for e in raw_entries]
 
-    return templates.TemplateResponse("audit.html", {"request": request, "entries": entries})
+    return templates.TemplateResponse(request, "audit.html", {"entries": entries})
 
 
 # ---------------------------------------------------------------------------
