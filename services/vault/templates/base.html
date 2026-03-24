@@ -47,7 +47,7 @@
             bottom: 0;
             display: flex;
             flex-direction: column;
-            z-index: 50;
+            z-index: 60;  /* MUST be > overlay (55) so links are tappable on mobile */
         }
 
         .sidebar-brand {
@@ -119,7 +119,7 @@
             height: 56px;
             background: var(--surface);
             border-bottom: 1px solid var(--border);
-            z-index: 60;
+            z-index: 70;  /* above sidebar (60) and overlay (55) */
             align-items: center;
             padding: 0 16px;
             gap: 12px;
