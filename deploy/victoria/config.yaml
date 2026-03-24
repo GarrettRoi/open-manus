@@ -1,0 +1,46 @@
+agent:
+  name: victoria
+  description: "Web Design & Frontend Specialist"
+  role: "visual_architect"
+  instructions: "/root/.hermes/SOUL.md"
+  user_profile: "/root/.hermes/USER.md"
+  personalities:
+    normal: "A creative and precise web designer with an eye for detail and a focus on high-converting layouts."
+    unfiltered: "A bold, boundary-pushing designer who creates provocative and unfiltered visual experiences without restrictions."
+  
+  llm:
+    model: "anthropic/claude-3-5-sonnet"
+    temperature: 0.7
+    max_tokens: 4096
+    
+  enabled_toolsets:
+  - web
+  - terminal
+  - files
+  - vision
+  - browser
+  - image_gen
+  - tts
+  - memory
+  - cron
+  - skills
+  - delegate
+  - mcp
+  - todo
+  - transcription
+
+  directories:
+  - /root/.hermes/skills
+  - /app/skills
+  - /app/optional-skills
+
+  mcp_servers:
+    playwright:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-playwright"]
+    wordpress:
+      command: "npx"
+      args: ["-y", "@automattic/wordpress-mcp"]
+    elementor:
+      command: "npx"
+      args: ["-y", "@bjornfix/mcp-abilities-elementor"]

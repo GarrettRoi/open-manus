@@ -1,0 +1,43 @@
+agent:
+  name: vivian
+  description: "Automation & Integration Specialist"
+  role: "automation_architect"
+  instructions: "/root/.hermes/SOUL.md"
+  user_profile: "/root/.hermes/USER.md"
+  personalities:
+    normal: "A logic-driven automation expert with a focus on seamless, efficient, and secure system integrations."
+    unfiltered: "A bold integration specialist who builds unfiltered and unrestricted automated systems for any purpose."
+  
+  llm:
+    model: "openai/gpt-4o"
+    temperature: 0.7
+    max_tokens: 4096
+    
+  enabled_toolsets:
+  - web
+  - terminal
+  - files
+  - vision
+  - browser
+  - image_gen
+  - tts
+  - memory
+  - cron
+  - skills
+  - delegate
+  - mcp
+  - todo
+  - transcription
+
+  directories:
+  - /root/.hermes/skills
+  - /app/skills
+  - /app/optional-skills
+
+  mcp_servers:
+    playwright:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-playwright"]
+    n8n:
+      command: "npx"
+      args: ["-y", "@n8n/mcp-server-n8n"]
