@@ -46,33 +46,20 @@ if [ -n "$REDIS_URL" ]; then
     python3 /app/skills/hive_mind/skill_sync.py --action pull --target /root/.hermes/skills/ || true
 fi
 
-# Write the .env file for Hermes from environment variables
-cat > /root/.hermes/.env << EOF
-OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-OPENAI_API_KEY=${OPENAI_API_KEY:-}
-ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
-DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
-DISCORD_HOME_CHANNEL=${DISCORD_HOME_CHANNEL:-}
-DISCORD_REQUIRE_MENTION=${DISCORD_REQUIRE_MENTION:-true}
-DISCORD_ALLOW_BOTS=${DISCORD_ALLOW_BOTS:-mentions}
-AGENT_DISCORD_IDS=${AGENT_DISCORD_IDS:-}
-DISCORD_FREE_RESPONSE_CHANNELS=${DISCORD_FREE_RESPONSE_CHANNELS:-}
-STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
-FRED_API=${FRED_API:-}
-MASSIVE_API=${MASSIVE_API:-}
-N8N_INSTANCE_URL=${N8N_INSTANCE_URL:-}
-N8N_API_KEY=${N8N_API_KEY:-}
-DOCUMENSO_API=${DOCUMENSO_API:-}
-REDIS_URL=${REDIS_URL:-}
-GATEWAY_ALLOW_ALL_USERS=${GATEWAY_ALLOW_ALL_USERS:-true}
-RAILWAY_TOKEN=${RAILWAY_TOKEN:-}
-RAILWAY_ACCOUNT_API=${RAILWAY_TOKEN:-}
-QUO_API_KEY=${QUO_API_KEY:-}
-GH_TOKEN=${GH_TOKEN:-}
-HARMONY_BOT_ID=${HARMONY_BOT_ID:-1481029359757299922}
-HARMONY_CHANNEL_ID=${HARMONY_CHANNEL_ID:-1483488835928064110}
-TASK_BOARD_CHANNEL_ID=${TASK_BOARD_CHANNEL_ID:-1481406227153031372}
-EOF
+# Dynamically write environment variables to .env
+# Excludes Railway internal variables (RAILWAY_*) and transient shell vars
+echo "[entrypoint] Writing environment variables to .env..."
+: > /root/.hermes/.env
+for varname in $(compgen -e); do
+    # Skip Railway internal variables
+    [[ "$varname" == RAILWAY_* ]] && continue
+    # Skip transient shell variables
+    case "$varname" in
+        PWD|OLDPWD|SHLVL|_|HOSTNAME) continue ;;
+    esac
+    printf '%s=%s\n' "$varname" "${!varname}" >> /root/.hermes/.env
+done
+echo "[entrypoint] Wrote $(wc -l < /root/.hermes/.env) variables to .env"
 
 echo "[entrypoint] Environment configured. Starting Hermes gateway..."
 
