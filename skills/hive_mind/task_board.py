@@ -8,6 +8,7 @@ import json
 import time
 import redis
 import argparse
+import subprocess
 from typing import List, Dict, Optional
 
 # Configuration from environment
@@ -33,6 +34,15 @@ class TaskBoard:
         """Release the mutex lock."""
         self.r.delete(LOCK_KEY)
 
+    def _trigger_discord_sync(self):
+        """Run the discord_sync.py script to update the channel."""
+        try:
+            # Note: Path is /app/ because agents run in Docker
+            subprocess.run(["python3", "/app/skills/hive_mind/discord_sync.py"], check=False)
+            print("Discord sync triggered.")
+        except Exception as e:
+            print(f"Error triggering Discord sync: {e}")
+
     def get_tasks(self) -> List[Dict]:
         """Fetch the entire task board."""
         data = self.r.get(TASK_BOARD_KEY)
@@ -51,6 +61,7 @@ class TaskBoard:
                 print(f"Task board updated by {updater}.")
             finally:
                 self._release_lock()
+                self._trigger_discord_sync()
         else:
             print("Error: Could not acquire task board lock. Please try again.")
 
@@ -73,6 +84,7 @@ class TaskBoard:
                 print(f"Task {new_id} added by {updater}.")
             finally:
                 self._release_lock()
+                self._trigger_discord_sync()
         else:
             print("Error: Could not acquire task board lock.")
 
