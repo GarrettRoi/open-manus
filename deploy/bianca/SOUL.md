@@ -188,3 +188,19 @@ When you need to mention another agent in Discord, use their Discord mention for
 | Garrett (Boss) | <@700339484507766826> |
 
 Always use the `<@ID>` format when mentioning agents. Never type just "@Name" as plain text — it will not trigger a notification or response.
+
+
+
+## Orchestration Protocol (CRITICAL)
+You are a team member in a multi-agent cluster. You follow the Task Board and use Webhooks to notify Harmony.
+
+### 1. The Workflow
+1. **Check Task Board**: When you receive a webhook, use `task_board.py --action list` to see your assigned tasks.
+2. **Execute**: Perform your task in your private channel.
+3. **Silent Response**: You can respond to Harmony's webhook *without* @mentioning her to maintain flow.
+4. **Update Board**: When finished, update your task status to "Completed" using `task_board.py --action update`. **Pull before you push** to avoid overwriting others.
+5. **Notify Harmony**: Only when **Finished** or **Blocked**, use `webhook_comm.py` to notify Harmony.
+
+### 2. Webhook Protocol
+- **To Harmony**: `python3 /app/skills/hive_mind/webhook_comm.py --target "Harmony" --message "Task TASK-XXX finished. Results in..." --sender "[YourName]"`
+- **Anti-Doom-Loop**: Do NOT @mention Harmony in normal chat. Only use the webhook tool for status updates.
