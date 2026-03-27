@@ -12,6 +12,8 @@ import asyncio
 import logging
 import os
 import time
+import io
+import re
 from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,28 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
+
+# ---------------------------------------------------------------------------
+# Voice Streaming & Sanitization
+# ---------------------------------------------------------------------------
+
+def sanitize_for_voice(text: str) -> str:
+    """Clean text for natural speech by removing technical jargon, code, and URLs."""
+    if not text:
+        return ""
+    # Remove code blocks
+    text = re.sub(r'```.*?```', '[code omitted]', text, flags=re.DOTALL)
+    # Remove inline code
+    text = re.sub(r'`.*?`', '', text)
+    # Remove protocol tags
+    text = re.sub(r'\[(NOTIFY|REQUEST|END|REPORT|GROUP CONVERSATION CONTEXT|LATEST MESSAGE FROM .*?)\]', '', text, flags=re.IGNORECASE)
+    # Simplify URLs
+    text = re.sub(r'https?://\S+', 'a link', text)
+    # Clean up whitespace
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 
 
 def check_discord_requirements() -> bool:
@@ -342,6 +366,13 @@ class DiscordAdapter(BasePlatformAdapter):
         self._bot_tracker = BotMessageTracker()  # Anti-doom-loop tracker
         self._group_chat = GroupChatSession()  # Multi-agent conversation tracker
         self._last_message_ts: Dict[str, float] = {}  # channel_id -> timestamp of our last message
+        
+        # Voice state
+        self._voice_client: Optional[discord.VoiceClient] = None
+        self._voice_enabled = os.getenv("ELEVENLABS_API_KEY") is not None
+        self._voice_auto_join = os.getenv("DISCORD_VOICE_AUTO_JOIN", "false").lower() == "true"
+        self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
+
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -391,6 +422,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
                 adapter_self._ready_event.set()
+
+                # ── Voice Auto-Join ──
+                if adapter_self._voice_enabled and adapter_self._voice_auto_join and adapter_self._voice_channel_id:
+                    try:
+                        channel = adapter_self._client.get_channel(int(adapter_self._voice_channel_id))
+                        if not channel:
+                            channel = await adapter_self._client.fetch_channel(int(adapter_self._voice_channel_id))
+                        if channel:
+                            adapter_self._voice_client = await channel.connect()
+                            logger.info("[%s] Auto-joined voice channel %s", adapter_self.name, channel.name)
+                    except Exception as ve:
+                        logger.error("[%s] Voice auto-join failed: %s", adapter_self.name, ve)
                 
                 # ── Post-deployment startup notification ──
                 # Send a message to the agent's home channel so the owner
@@ -703,6 +746,36 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 message_ids.append(str(msg.id))
             
+            # ── VOICE STREAMING ──
+            # If we are in a voice channel, stream the sanitized content
+            if self._voice_client and self._voice_client.is_connected() and self._voice_enabled:
+                try:
+                    sanitized_text = sanitize_for_voice(content)
+                    if sanitized_text:
+                        # Use ElevenLabs to generate speech and stream it
+                        from elevenlabs.client import ElevenLabs
+                        client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+                        
+                        # Generate audio stream
+                        audio_stream = client.text_to_speech.convert(
+                            text=sanitized_text,
+                            voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"), # Default voice
+                            model_id="eleven_multilingual_v2",
+                            output_format="mp3_44100_128",
+                        )
+                        
+                        # Convert generator to bytes
+                        audio_data = b"".join(list(audio_stream))
+                        
+                        # Play in Discord voice channel
+                        # Note: This requires FFmpeg to be installed in the sandbox
+                        source = discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
+                        if self._voice_client.is_playing():
+                            self._voice_client.stop()
+                        self._voice_client.play(source)
+                except Exception as ve:
+                    logger.error("[%s] Voice streaming failed: %s", self.name, ve)
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -1188,6 +1261,43 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.followup.send("Done~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
+
+        @tree.command(name="join", description="Join the voice channel")
+        async def slash_join(interaction: discord.Interaction):
+            if not self._voice_enabled:
+                await interaction.response.send_message("Voice is not enabled (ELEVENLABS_API_KEY missing)~", ephemeral=True)
+                return
+            
+            # Use user's current voice channel if available
+            channel = None
+            if interaction.user.voice:
+                channel = interaction.user.voice.channel
+            elif self._voice_channel_id:
+                channel = self._client.get_channel(int(self._voice_channel_id))
+            
+            if not channel:
+                await interaction.response.send_message("Please join a voice channel first or set DISCORD_VOICE_CHANNEL_ID~", ephemeral=True)
+                return
+            
+            await interaction.response.defer(ephemeral=True)
+            try:
+                if self._voice_client and self._voice_client.is_connected():
+                    await self._voice_client.move_to(channel)
+                else:
+                    self._voice_client = await channel.connect()
+                await interaction.followup.send(f"Joined {channel.name}~", ephemeral=True)
+            except Exception as e:
+                logger.error("[%s] Failed to join voice: %s", self.name, e)
+                await interaction.followup.send(f"Failed to join voice: {str(e)}", ephemeral=True)
+
+        @tree.command(name="leave", description="Leave the voice channel")
+        async def slash_leave(interaction: discord.Interaction):
+            if self._voice_client and self._voice_client.is_connected():
+                await self._voice_client.disconnect()
+                self._voice_client = None
+                await interaction.response.send_message("Left voice channel~", ephemeral=True)
+            else:
+                await interaction.response.send_message("Not in a voice channel~", ephemeral=True)
 
         @tree.command(name="help", description="Show available commands")
         async def slash_help(interaction: discord.Interaction):
