@@ -1262,30 +1262,71 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
-        @tree.command(name="join", description="Join the voice channel")
-        async def slash_join(interaction: discord.Interaction):
+        @tree.command(name="join", description="Join a voice channel")
+        @discord.app_commands.describe(
+            channel="Name or ID of the voice channel to join (e.g., 'General' or voice channel ID). Leave empty to join your current channel."
+        )
+        async def slash_join(interaction: discord.Interaction, channel: str = None):
             if not self._voice_enabled:
                 await interaction.response.send_message("Voice is not enabled (ELEVENLABS_API_KEY missing)~", ephemeral=True)
                 return
             
-            # Use user's current voice channel if available
-            channel = None
-            if interaction.user.voice:
-                channel = interaction.user.voice.channel
-            elif self._voice_channel_id:
-                channel = self._client.get_channel(int(self._voice_channel_id))
+            target_channel = None
             
-            if not channel:
-                await interaction.response.send_message("Please join a voice channel first or set DISCORD_VOICE_CHANNEL_ID~", ephemeral=True)
-                return
+            # If a channel name/ID was provided, try to find it
+            if channel:
+                # Try to find by ID first
+                try:
+                    channel_id = int(channel)
+                    target_channel = self._client.get_channel(channel_id)
+                    if not target_channel and interaction.guild:
+                        # Try fetching from guild
+                        try:
+                            target_channel = await interaction.guild.fetch_channel(channel_id)
+                        except Exception:
+                            pass
+                except ValueError:
+                    # Not a valid ID, search by name in the guild
+                    if interaction.guild:
+                        channel_name_lower = channel.lower().strip()
+                        for vc in interaction.guild.voice_channels:
+                            if vc.name.lower() == channel_name_lower:
+                                target_channel = vc
+                                break
+                        # If exact match failed, try partial match
+                        if not target_channel:
+                            for vc in interaction.guild.voice_channels:
+                                if channel_name_lower in vc.name.lower():
+                                    target_channel = vc
+                                    break
+                
+                if not target_channel:
+                    await interaction.response.send_message(
+                        f"Could not find voice channel '{channel}'. Please provide the exact channel name or ID.",
+                        ephemeral=True
+                    )
+                    return
+            else:
+                # No channel specified - use user's current voice channel or default
+                if interaction.user.voice:
+                    target_channel = interaction.user.voice.channel
+                elif self._voice_channel_id:
+                    target_channel = self._client.get_channel(int(self._voice_channel_id))
+                
+                if not target_channel:
+                    await interaction.response.send_message(
+                        "Please provide a voice channel name, join a voice channel first, or set DISCORD_VOICE_CHANNEL_ID~",
+                        ephemeral=True
+                    )
+                    return
             
             await interaction.response.defer(ephemeral=True)
             try:
                 if self._voice_client and self._voice_client.is_connected():
-                    await self._voice_client.move_to(channel)
+                    await self._voice_client.move_to(target_channel)
                 else:
-                    self._voice_client = await channel.connect()
-                await interaction.followup.send(f"Joined {channel.name}~", ephemeral=True)
+                    self._voice_client = await target_channel.connect()
+                await interaction.followup.send(f"Joined **{target_channel.name}**~", ephemeral=True)
             except Exception as e:
                 logger.error("[%s] Failed to join voice: %s", self.name, e)
                 await interaction.followup.send(f"Failed to join voice: {str(e)}", ephemeral=True)
