@@ -14,6 +14,9 @@ import os
 import time
 import io
 import re
+import wave
+import tempfile
+import shutil
 from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
@@ -22,6 +25,12 @@ try:
     import discord
     from discord import Message as DiscordMessage, Intents
     from discord.ext import commands
+    try:
+        import discord.ext.voice_recv as voice_recv
+        VOICE_RECV_AVAILABLE = True
+    except ImportError:
+        voice_recv = None
+        VOICE_RECV_AVAILABLE = False
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
@@ -70,6 +79,10 @@ def sanitize_for_voice(text: str) -> str:
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
     return DISCORD_AVAILABLE
+
+def _has_ffmpeg() -> bool:
+    """Check if FFmpeg is installed and available in the system path."""
+    return shutil.which("ffmpeg") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +382,7 @@ class DiscordAdapter(BasePlatformAdapter):
         
         # Voice state
         self._voice_client: Optional[discord.VoiceClient] = None
+        self._voice_sink: Optional[Any] = None
         self._voice_enabled = os.getenv("ELEVENLABS_API_KEY") is not None
         self._voice_auto_join = os.getenv("DISCORD_VOICE_AUTO_JOIN", "false").lower() == "true"
         self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
@@ -426,12 +440,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 # ── Voice Auto-Join ──
                 if adapter_self._voice_enabled and adapter_self._voice_auto_join and adapter_self._voice_channel_id:
                     try:
-                        channel = adapter_self._client.get_channel(int(adapter_self._voice_channel_id))
-                        if not channel:
-                            channel = await adapter_self._client.fetch_channel(int(adapter_self._voice_channel_id))
-                        if channel:
-                            adapter_self._voice_client = await channel.connect()
-                            logger.info("[%s] Auto-joined voice channel %s", adapter_self.name, channel.name)
+                        if not _has_ffmpeg():
+                            logger.warning("[%s] FFmpeg not found. Voice auto-join skipped.", adapter_self.name)
+                        else:
+                            channel = adapter_self._client.get_channel(int(adapter_self._voice_channel_id))
+                            if not channel:
+                                channel = await adapter_self._client.fetch_channel(int(adapter_self._voice_channel_id))
+                            if channel:
+                                if VOICE_RECV_AVAILABLE:
+                                    from gateway.platforms.voice_sink import VoiceSink
+                                    adapter_self._voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+                                    adapter_self._voice_sink = VoiceSink(adapter_self, str(channel.id))
+                                    adapter_self._voice_client.listen(adapter_self._voice_sink)
+                                    adapter_self._voice_sink.start()
+                                else:
+                                    adapter_self._voice_client = await channel.connect()
+                                logger.info("[%s] Auto-joined voice channel %s", adapter_self.name, channel.name)
                     except Exception as ve:
                         logger.error("[%s] Voice auto-join failed: %s", adapter_self.name, ve)
                 
@@ -749,32 +773,38 @@ class DiscordAdapter(BasePlatformAdapter):
             # ── VOICE STREAMING ──
             # If we are in a voice channel, stream the sanitized content
             if self._voice_client and self._voice_client.is_connected() and self._voice_enabled:
-                try:
-                    sanitized_text = sanitize_for_voice(content)
-                    if sanitized_text:
-                        # Use ElevenLabs to generate speech and stream it
-                        from elevenlabs.client import ElevenLabs
-                        client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-                        
-                        # Generate audio stream
-                        audio_stream = client.text_to_speech.convert(
-                            text=sanitized_text,
-                            voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"), # Default voice
-                            model_id="eleven_multilingual_v2",
-                            output_format="mp3_44100_128",
-                        )
-                        
-                        # Convert generator to bytes
-                        audio_data = b"".join(list(audio_stream))
-                        
-                        # Play in Discord voice channel
-                        # Note: This requires FFmpeg to be installed in the sandbox
-                        source = discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
-                        if self._voice_client.is_playing():
-                            self._voice_client.stop()
-                        self._voice_client.play(source)
-                except Exception as ve:
-                    logger.error("[%s] Voice streaming failed: %s", self.name, ve)
+                if not _has_ffmpeg():
+                    logger.warning("[%s] FFmpeg not found. Voice streaming skipped.", self.name)
+                else:
+                    try:
+                        sanitized_text = sanitize_for_voice(content)
+                        if sanitized_text:
+                            # Use ElevenLabs to generate speech and stream it
+                            from elevenlabs.client import ElevenLabs
+                            api_key = os.getenv("ELEVENLABS_API_KEY")
+                            if not api_key:
+                                logger.error("[%s] ELEVENLABS_API_KEY not found.", self.name)
+                            else:
+                                client = ElevenLabs(api_key=api_key)
+                                
+                                # Generate audio stream
+                                audio_stream = client.text_to_speech.convert(
+                                    text=sanitized_text,
+                                    voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"), # Default voice
+                                    model_id="eleven_multilingual_v2",
+                                    output_format="mp3_44100_128",
+                                )
+                                
+                                # Convert generator to bytes
+                                audio_data = b"".join(list(audio_stream))
+                                
+                                # Play in Discord voice channel
+                                source = discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
+                                if self._voice_client.is_playing():
+                                    self._voice_client.stop()
+                                self._voice_client.play(source)
+                    except Exception as ve:
+                        logger.error("[%s] Voice streaming failed: %s", self.name, ve)
 
             return SendResult(
                 success=True,
