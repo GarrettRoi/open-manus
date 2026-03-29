@@ -537,6 +537,68 @@ async def get_skill_description(key_name: str, request: Request):
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Agent API — Store/Create key endpoint
+# ---------------------------------------------------------------------------
+class KeyStoreRequest(BaseModel):
+    key_name: str
+    key_value: str
+    service: str = ""
+    description: str = ""
+    skill_description: str = ""
+
+
+@app.post("/api/vault/store")
+async def store_key(request: Request, key_data: KeyStoreRequest):
+    """
+    Agent endpoint: store a new key in the vault.
+    Requires Bearer token with admin privileges or special 'key-admin' grant.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = auth[7:]
+    agent_name = verify_agent_token(token)
+    if not agent_name:
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+
+    # Check if agent has permission to store keys
+    # For now, only allow specific agents (valentina, harmony) to store keys
+    if agent_name not in ["valentina", "harmony", "admin"]:
+        audit_log(agent_name, key_data.key_name, "store_denied", "Insufficient privileges")
+        raise HTTPException(status_code=403, detail="Agent does not have permission to store keys")
+
+    key_name = key_data.key_name.strip().upper().replace(" ", "_")
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Store the key
+    r.hset(f"{PFX_KEY}{key_name}", mapping={
+        "service": key_data.service,
+        "description": key_data.description,
+        "encrypted_value": encrypt_value(key_data.key_value),
+        "created_at": now,
+        "updated_at": now,
+    })
+    r.zadd(PFX_KEY_INDEX, {key_name: time.time()})
+
+    # Store skill description if provided
+    if key_data.skill_description.strip():
+        r.hset(f"{PFX_SKILL}{key_name}", mapping={
+            "description": key_data.skill_description,
+            "updated_at": now,
+        })
+        r.zadd(PFX_SKILL_INDEX, {key_name: time.time()})
+
+    audit_log(agent_name, key_name, "key_created_via_api", f"Service: {key_data.service}")
+
+    return {
+        "success": True,
+        "key_name": key_name,
+        "message": f"Key '{key_name}' stored successfully"
+    }
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------

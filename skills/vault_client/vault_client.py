@@ -138,6 +138,62 @@ class VaultClient:
         _cache.clear()
 
 
+
+    def store(self, key_name: str, key_value: str, service: str = "", description: str = "", skill_description: str = "") -> dict:
+        """
+        Store a new key in the vault.
+        
+        Args:
+            key_name: The name of the key (e.g., "GOOGLE_ADMIN_KEY")
+            key_value: The actual key value to store
+            service: Optional service name (e.g., "Google Cloud")
+            description: Optional description
+            skill_description: Optional skill/tool usage guide
+            
+        Returns:
+            Dict with success status and message.
+            
+        Raises:
+            VaultError: If the store operation fails.
+        """
+        if not self.token:
+            raise VaultError("VAULT_TOKEN not set. Cannot authenticate with the vault.")
+            
+        import urllib.request
+        import json
+        
+        payload = json.dumps({
+            "key_name": key_name,
+            "key_value": key_value,
+            "service": service,
+            "description": description,
+            "skill_description": skill_description
+        }).encode()
+        
+        req = urllib.request.Request(
+            f"{self.url}/api/vault/store",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST"
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            try:
+                detail = json.loads(body).get("detail", body)
+            except Exception:
+                detail = body
+            raise VaultError(f"Vault error ({e.code}): {detail}")
+        except urllib.error.URLError as e:
+            raise VaultError(f"Cannot reach vault at {self.url}: {e.reason}")
+
 # Singleton instance for easy import
 vault = VaultClient()
 
@@ -150,6 +206,7 @@ def main():
         print("  vault_client.py list               — List available keys")
         print("  vault_client.py skill <KEY_NAME>    — Get skill description for a key")
         print("  vault_client.py export              — Export all keys as env vars")
+        print("  vault_client.py store <KEY_NAME> <VALUE> [--service SVC] [--desc DESC]")
         sys.exit(1)
 
     command = sys.argv[1].lower()
@@ -206,9 +263,38 @@ def main():
             for name in sorted(exported.keys()):
                 print(f"  {name} = ***")
 
+        elif command == "store":
+            if len(sys.argv) < 4:
+                print("ERROR: Key name and value required.")
+                print("Usage: vault_client.py store KEY_NAME KEY_VALUE [--service SVC] [--desc DESC]")
+                sys.exit(1)
+            key_name = sys.argv[2].upper()
+            key_value = sys.argv[3]
+            
+            # Parse optional args
+            service = ""
+            description = ""
+            skill_desc = ""
+            i = 4
+            while i < len(sys.argv):
+                if sys.argv[i] == "--service" and i + 1 < len(sys.argv):
+                    service = sys.argv[i + 1]
+                    i += 2
+                elif sys.argv[i] == "--desc" and i + 1 < len(sys.argv):
+                    description = sys.argv[i + 1]
+                    i += 2
+                elif sys.argv[i] == "--skill" and i + 1 < len(sys.argv):
+                    skill_desc = sys.argv[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            
+            result = vault.store(key_name, key_value, service, description, skill_desc)
+            print(f"✅ {result['message']}")
+
         else:
             print(f"Unknown command: {command}")
-            print("Available commands: get, list, skill, export")
+            print("Available commands: get, list, skill, export, store")
             sys.exit(1)
 
     except VaultError as e:
