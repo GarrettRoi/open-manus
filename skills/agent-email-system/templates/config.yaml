@@ -1,0 +1,24 @@
+# Agent Email System Configuration
+# Copy this file and fill in your values
+
+# API Settings
+api:
+  port: 8080
+  host: 0.0.0.0
+
+# Rate Limiting
+rate_limits:
+  max_per_hour: 10
+  max_per_day: 50
+
+# File Paths
+paths:
+  allowlist: /app/skills/agent-email-system/data/allowlist.txt
+  rate_limits_db: /app/skills/agent-email-system/data/rate_limits.db
+  approval_queue_db: /app/skills/agent-email-system/data/approval_queue.db
+  keywords_config: /app/skills/agent-email-system/data/keywords.json
+
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
