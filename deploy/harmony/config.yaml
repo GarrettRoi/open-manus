@@ -56,7 +56,7 @@ delegation:
   - file
   - web
 discord:
-  require_mention: true
+  require_mention: false
 display:
   compact: false
   tool_progress: all

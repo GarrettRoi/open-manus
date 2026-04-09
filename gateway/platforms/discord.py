@@ -26,11 +26,13 @@ try:
     from discord import Message as DiscordMessage, Intents
     from discord.ext import commands
     try:
-        import discord.ext.voice_recv as voice_recv
+        from discord.ext import voice_recv
         VOICE_RECV_AVAILABLE = True
+        logger.info("discord-ext-voice-recv is available — voice receiving enabled")
     except ImportError:
         voice_recv = None
         VOICE_RECV_AVAILABLE = False
+        logger.warning("discord-ext-voice-recv not installed — voice receiving disabled. Install with: pip install discord-ext-voice-recv")
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
@@ -386,6 +388,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_enabled = os.getenv("ELEVENLABS_API_KEY") is not None
         self._voice_auto_join = os.getenv("DISCORD_VOICE_AUTO_JOIN", "false").lower() == "true"
         self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
+        self._voice_queue = asyncio.Queue()
+        self._voice_worker_task: Optional[asyncio.Task] = None
+        self._voice_volume = 1.0
+        self._voice_muted = False
 
     
     async def connect(self) -> bool:
@@ -453,8 +459,10 @@ class DiscordAdapter(BasePlatformAdapter):
                                     adapter_self._voice_sink = VoiceSink(adapter_self, str(channel.id))
                                     adapter_self._voice_client.listen(adapter_self._voice_sink)
                                     adapter_self._voice_sink.start()
+                                    logger.info("[%s] Auto-joined voice channel %s with real-time receiving enabled", adapter_self.name, channel.name)
                                 else:
                                     adapter_self._voice_client = await channel.connect()
+                                    logger.info("[%s] Auto-joined voice channel %s (receive not available)", adapter_self.name, channel.name)
                                 logger.info("[%s] Auto-joined voice channel %s", adapter_self.name, channel.name)
                     except Exception as ve:
                         logger.error("[%s] Voice auto-join failed: %s", adapter_self.name, ve)
@@ -706,6 +714,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # Wait for ready
             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
             
+            # Start voice worker
+            self._voice_worker_task = asyncio.create_task(self._voice_worker())
+            
             self._running = True
             return True
             
@@ -718,6 +729,10 @@ class DiscordAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._voice_worker_task:
+            self._voice_worker_task.cancel()
+            self._voice_worker_task = None
+
         if self._client:
             try:
                 await self._client.close()
@@ -787,22 +802,27 @@ class DiscordAdapter(BasePlatformAdapter):
                             else:
                                 client = ElevenLabs(api_key=api_key)
                                 
-                                # Generate audio stream
+                                # Generate audio stream with latency optimization
+                                # We use a lower latency setting for live chat
+                                optimize_latency = os.getenv("ELEVENLABS_LATENCY_LEVEL", "3")
+                                
                                 audio_stream = client.text_to_speech.convert(
                                     text=sanitized_text,
-                                    voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"), # Default voice
-                                    model_id="eleven_multilingual_v2",
+                                    voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"),
+                                    model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
                                     output_format="mp3_44100_128",
+                                    optimize_streaming_latency=int(optimize_latency)
                                 )
                                 
-                                # Convert generator to bytes
+                                # Convert generator to bytes (still need to buffer for FFmpegPCMAudio)
+                                # For true streaming without full buffer, we'd need a custom AudioSource
+                                # but buffering the full response is still much faster with optimize_streaming_latency
                                 audio_data = b"".join(list(audio_stream))
                                 
-                                # Play in Discord voice channel
-                                source = discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
-                                if self._voice_client.is_playing():
-                                    self._voice_client.stop()
-                                self._voice_client.play(source)
+                                if audio_data:
+                                    # Put into the voice queue for sequential playback
+                                    await self._voice_queue.put(audio_data)
+                                    logger.info("[%s] Added %d bytes of audio to voice queue", self.name, len(audio_data))
                     except Exception as ve:
                         logger.error("[%s] Voice streaming failed: %s", self.name, ve)
 
@@ -1026,6 +1046,34 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
     
+    async def _voice_worker(self):
+        """Background worker to process the voice queue and play audio sequentially."""
+        logger.info("[%s] Voice worker started", self.name)
+        while True:
+            try:
+                audio_data = await self._voice_queue.get()
+                if self._voice_client and self._voice_client.is_connected() and not self._voice_muted:
+                    try:
+                        # Wait for current audio to finish
+                        while self._voice_client.is_playing():
+                            await asyncio.sleep(0.1)
+                        
+                        source = discord.PCMVolumeTransformer(
+                            discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True),
+                            volume=self._voice_volume
+                        )
+                        # The 'play' method automatically sets the speaking state
+                        self._voice_client.play(source)
+                        logger.debug("[%s] Playing audio from queue", self.name)
+                    except Exception as e:
+                        logger.error("[%s] Error playing audio from queue: %s", self.name, e)
+                self._voice_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[%s] Voice worker error: %s", self.name, e)
+                await asyncio.sleep(1)
+
     async def _resolve_allowed_usernames(self) -> None:
         """
         Resolve non-numeric entries in DISCORD_ALLOWED_USERS to Discord user IDs.
@@ -1352,10 +1400,27 @@ class DiscordAdapter(BasePlatformAdapter):
             
             await interaction.response.defer(ephemeral=True)
             try:
+                # Stop existing sink if any
+                if self._voice_sink:
+                    self._voice_sink.stop()
+                    self._voice_sink = None
+
                 if self._voice_client and self._voice_client.is_connected():
                     await self._voice_client.move_to(target_channel)
                 else:
-                    self._voice_client = await target_channel.connect()
+                    if VOICE_RECV_AVAILABLE:
+                        self._voice_client = await target_channel.connect(cls=voice_recv.VoiceRecvClient)
+                    else:
+                        self._voice_client = await target_channel.connect()
+                
+                # Start voice sink if available
+                if VOICE_RECV_AVAILABLE:
+                    from gateway.platforms.voice_sink import VoiceSink
+                    self._voice_sink = VoiceSink(self, str(target_channel.id))
+                    self._voice_client.listen(self._voice_sink)
+                    self._voice_sink.start()
+                    logger.info("[%s] Joined voice channel %s with real-time receiving", self.name, target_channel.name)
+                
                 await interaction.followup.send(f"Joined **{target_channel.name}**~", ephemeral=True)
             except Exception as e:
                 logger.error("[%s] Failed to join voice: %s", self.name, e)
@@ -1363,12 +1428,45 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="leave", description="Leave the voice channel")
         async def slash_leave(interaction: discord.Interaction):
+            if self._voice_sink:
+                self._voice_sink.stop()
+                self._voice_sink = None
+                
             if self._voice_client and self._voice_client.is_connected():
                 await self._voice_client.disconnect()
                 self._voice_client = None
                 await interaction.response.send_message("Left voice channel~", ephemeral=True)
             else:
                 await interaction.response.send_message("Not in a voice channel~", ephemeral=True)
+
+        @tree.command(name="volume", description="Set the voice volume (0-200)")
+        @discord.app_commands.describe(level="Volume level (0-200, default 100)")
+        async def slash_volume(interaction: discord.Interaction, level: int):
+            if not self._voice_enabled:
+                await interaction.response.send_message("Voice is not enabled~", ephemeral=True)
+                return
+            
+            # Clamp volume between 0 and 2.0 (200%)
+            self._voice_volume = max(0.0, min(2.0, level / 100.0))
+            
+            # If currently playing, update volume on the fly
+            if self._voice_client and self._voice_client.source:
+                if isinstance(self._voice_client.source, discord.PCMVolumeTransformer):
+                    self._voice_client.source.volume = self._voice_volume
+            
+            await interaction.response.send_message(f"Voice volume set to **{int(self._voice_volume * 100)}%**~", ephemeral=True)
+
+        @tree.command(name="mute", description="Mute the agent's voice output")
+        async def slash_mute(interaction: discord.Interaction):
+            self._voice_muted = True
+            if self._voice_client and self._voice_client.is_playing():
+                self._voice_client.stop()
+            await interaction.response.send_message("Agent voice muted~", ephemeral=True)
+
+        @tree.command(name="unmute", description="Unmute the agent's voice output")
+        async def slash_unmute(interaction: discord.Interaction):
+            self._voice_muted = False
+            await interaction.response.send_message("Agent voice unmuted~", ephemeral=True)
 
         @tree.command(name="help", description="Show available commands")
         async def slash_help(interaction: discord.Interaction):
@@ -1541,7 +1639,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "false").lower() not in ("false", "0", "no")
+            
+            # The agent's home channel is always free-response so the
+            # owner can talk naturally without @mentioning.
+            home_ch = os.getenv("DISCORD_HOME_CHANNEL", "")
+            if home_ch:
+                free_channels.add(home_ch.strip())
+            
             is_free_channel = bool(channel_ids & free_channels)
 
             if require_mention and not is_free_channel:

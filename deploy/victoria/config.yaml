@@ -44,3 +44,6 @@ agent:
     elementor:
       command: "npx"
       args: ["-y", "@bjornfix/mcp-abilities-elementor"]
+
+discord:
+  require_mention: false

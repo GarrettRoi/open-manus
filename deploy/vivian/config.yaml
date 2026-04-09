@@ -41,3 +41,6 @@ agent:
     n8n:
       command: "npx"
       args: ["-y", "@n8n/mcp-server-n8n"]
+
+discord:
+  require_mention: false

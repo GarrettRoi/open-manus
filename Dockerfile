@@ -53,7 +53,9 @@ RUN pip install \
     playwright \
     redis \
     stripe \
-    python-dotenv
+    python-dotenv \
+    discord-ext-voice-recv \
+    PyNaCl
 
 # Install Playwright browsers for web automation
 RUN playwright install chromium --with-deps || true

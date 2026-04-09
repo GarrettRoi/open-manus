@@ -719,3 +719,25 @@ display:
   #   tool_prefix: "╎"                       # Tool output line prefix (default: ┊)
   #
   skin: default
+
+# =============================================================================
+# Text-to-Speech (TTS) Configuration
+# =============================================================================
+tts:
+  # Provider to use: "edge" (free), "elevenlabs" (premium), or "openai"
+  provider: "edge"
+  
+  # Microsoft Edge TTS (Free, no API key needed)
+  edge:
+    voice: "en-US-AriaNeural"  # Use 'edge-tts --list-voices' to see all
+    
+  # ElevenLabs (High quality, requires ELEVENLABS_API_KEY)
+  elevenlabs:
+    voice_id: "pNInz6obpgDQGcFmaJgB"  # Adam
+    model_id: "eleven_multilingual_v2"
+    latency_level: 3                  # 0-4, higher is faster but lower quality
+    
+  # OpenAI TTS (Requires VOICE_TOOLS_OPENAI_KEY)
+  openai:
+    model: "gpt-4o-mini-tts"
+    voice: "alloy"                    # alloy, echo, fable, onyx, nova, shimmer
