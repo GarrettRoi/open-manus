@@ -390,6 +390,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
         self._voice_queue = asyncio.Queue()
         self._voice_worker_task: Optional[asyncio.Task] = None
+        self._voice_keepalive_task: Optional[asyncio.Task] = None
         self._voice_volume = 1.0
         self._voice_muted = False
 
@@ -460,6 +461,8 @@ class DiscordAdapter(BasePlatformAdapter):
                                     adapter_self._voice_sink = VoiceSink(adapter_self, str(channel.id))
                                     adapter_self._voice_client.listen(adapter_self._voice_sink)
                                     adapter_self._voice_sink.start()
+                                    # Start keepalive to prevent Discord from closing the receive socket
+                                    adapter_self._voice_keepalive_task = asyncio.create_task(adapter_self._voice_keepalive())
                                     logger.info("[%s] Auto-joined voice channel %s with real-time receiving enabled", adapter_self.name, channel.name)
                                     # Send visible confirmation to home channel
                                     home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
@@ -1100,6 +1103,32 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.error("[%s] Voice worker error: %s", self.name, e)
                 await asyncio.sleep(1)
 
+    async def _voice_keepalive(self):
+        """Send silent Opus packets to prevent Discord from closing the receive socket.
+        
+        Discord closes the listening socket if no audio is sent for a period.
+        This background task sends a silent Opus frame every 15 seconds to
+        keep the connection alive.  See:
+        https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/8
+        """
+        logger.info("[%s] Voice keepalive task started", self.name)
+        SILENT_OPUS_FRAME = b"\xf8\xff\xfe"
+        while True:
+            try:
+                await asyncio.sleep(15)
+                if self._voice_client and self._voice_client.is_connected():
+                    if not self._voice_client.is_playing():
+                        try:
+                            self._voice_client.send_audio_packet(SILENT_OPUS_FRAME, encode=False)
+                        except Exception as e:
+                            logger.debug("[%s] Keepalive packet failed: %s", self.name, e)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[%s] Voice keepalive error: %s", self.name, e)
+                await asyncio.sleep(5)
+        logger.info("[%s] Voice keepalive task stopped", self.name)
+
     async def _resolve_allowed_usernames(self) -> None:
         """
         Resolve non-numeric entries in DISCORD_ALLOWED_USERS to Discord user IDs.
@@ -1445,6 +1474,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._voice_sink = VoiceSink(self, str(target_channel.id))
                     self._voice_client.listen(self._voice_sink)
                     self._voice_sink.start()
+                    # Start keepalive to prevent Discord from closing the receive socket
+                    if self._voice_keepalive_task:
+                        self._voice_keepalive_task.cancel()
+                    self._voice_keepalive_task = asyncio.create_task(self._voice_keepalive())
                     logger.info("[%s] Joined voice channel %s with real-time receiving", self.name, target_channel.name)
                     await interaction.followup.send(
                         f"🎙️ Joined **{target_channel.name}** with voice receiving **enabled**. I can hear you!",
@@ -1470,6 +1503,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="leave", description="Leave the voice channel")
         async def slash_leave(interaction: discord.Interaction):
+            if self._voice_keepalive_task:
+                self._voice_keepalive_task.cancel()
+                self._voice_keepalive_task = None
             if self._voice_sink:
                 self._voice_sink.stop()
                 self._voice_sink = None
@@ -1509,6 +1545,57 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_unmute(interaction: discord.Interaction):
             self._voice_muted = False
             await interaction.response.send_message("Agent voice unmuted~", ephemeral=True)
+
+        @tree.command(name="voicestatus", description="Show voice pipeline diagnostic status")
+        async def slash_voicestatus(interaction: discord.Interaction):
+            lines = []
+            lines.append("**Voice Pipeline Diagnostic Status**")
+            lines.append(f"")
+            lines.append(f"VOICE_RECV_AVAILABLE: `{VOICE_RECV_AVAILABLE}`")
+            lines.append(f"Voice enabled (ElevenLabs key set): `{self._voice_enabled}`")
+            lines.append(f"Voice auto-join: `{self._voice_auto_join}`")
+            lines.append(f"Voice channel ID: `{self._voice_channel_id}`")
+            lines.append(f"")
+
+            if self._voice_client:
+                lines.append(f"Voice client connected: `{self._voice_client.is_connected()}`")
+                lines.append(f"Voice client is playing: `{self._voice_client.is_playing()}`")
+                vc_channel = getattr(self._voice_client, 'channel', None)
+                lines.append(f"Voice client channel: `{vc_channel}`")
+                # Check if it's a VoiceRecvClient
+                is_recv = hasattr(self._voice_client, 'listen')
+                lines.append(f"Is VoiceRecvClient (has listen): `{is_recv}`")
+                is_listening = False
+                if hasattr(self._voice_client, 'is_listening'):
+                    is_listening = self._voice_client.is_listening()
+                lines.append(f"Is listening: `{is_listening}`")
+            else:
+                lines.append("Voice client: `None` (not connected)")
+
+            lines.append(f"")
+            if self._voice_sink:
+                lines.append(f"Voice sink active: `True`")
+                lines.append(f"Sink packet count: `{self._voice_sink._packet_count}`")
+                lines.append(f"Sink first packet logged: `{self._voice_sink._first_packet_logged}`")
+                lines.append(f"Sink running: `{self._voice_sink._running}`")
+                lines.append(f"Sink audio buffers: `{len(self._voice_sink.audio_data)}` users")
+                for uid, buf in self._voice_sink.audio_data.items():
+                    lines.append(f"  - User `{uid}`: `{len(buf)}` bytes buffered")
+            else:
+                lines.append("Voice sink: `None` (not active)")
+
+            lines.append(f"")
+            lines.append(f"Keepalive task running: `{self._voice_keepalive_task is not None and not self._voice_keepalive_task.done()}`")
+            lines.append(f"Voice worker task running: `{self._voice_worker_task is not None and not self._voice_worker_task.done()}`")
+            lines.append(f"Voice muted: `{self._voice_muted}`")
+            lines.append(f"Voice volume: `{self._voice_volume}`")
+
+            lines.append(f"")
+            lines.append(f"VOICE_TOOLS_OPENAI_KEY set: `{bool(os.getenv('VOICE_TOOLS_OPENAI_KEY'))}`")
+            lines.append(f"ELEVENLABS_API_KEY set: `{bool(os.getenv('ELEVENLABS_API_KEY'))}`")
+            lines.append(f"DISCORD_HOME_CHANNEL: `{os.getenv('DISCORD_HOME_CHANNEL', 'not set')}`")
+
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
         @tree.command(name="help", description="Show available commands")
         async def slash_help(interaction: discord.Interaction):
