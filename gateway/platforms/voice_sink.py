@@ -41,16 +41,7 @@ from gateway.platforms.base import MessageEvent, MessageType
 
 
 class VoiceSink(_AudioSinkBase):
-    """Receives decoded PCM audio from Discord and transcribes it using Whisper.
-
-    Lifecycle:
-        1. Created by the DiscordAdapter when joining a voice channel.
-        2. Passed to ``voice_client.listen(sink)`` which calls ``write()``
-           for every decoded audio packet.
-        3. A background asyncio task (``_monitor_silence``) watches for
-           silence gaps and triggers transcription + agent dispatch.
-        4. ``cleanup()`` is called by the library when listening stops.
-    """
+    """Receives decoded PCM audio from Discord and transcribes it using Whisper."""
 
     def __init__(self, adapter, channel_id: str):
         if _VOICE_RECV_OK:
@@ -73,6 +64,13 @@ class VoiceSink(_AudioSinkBase):
         # Allowed users (empty string = allow everyone who isn't a bot)
         self._allowed_users_raw = os.getenv("DISCORD_ALLOWED_USERS", "").strip()
 
+        # Debug: count packets received so we can confirm write() is being called
+        self._packet_count = 0
+        self._first_packet_logged = False
+
+        logger.info("[VoiceSink] Initialized for channel %s (silence_threshold=%.1fs, allowed_users='%s')",
+                     channel_id, self.silence_threshold, self._allowed_users_raw)
+
     # ------------------------------------------------------------------
     # AudioSink required interface
     # ------------------------------------------------------------------
@@ -82,20 +80,26 @@ class VoiceSink(_AudioSinkBase):
         return False
 
     def write(self, user, data):
-        """Called by discord-ext-voice-recv for every decoded audio packet.
+        """Called by discord-ext-voice-recv for every decoded audio packet."""
+        self._packet_count += 1
 
-        Parameters
-        ----------
-        user : discord.Member | discord.User | None
-            The user who produced this audio.  ``None`` when the speaker
-            cannot be identified (rare).
-        data : voice_recv.VoiceData
-            Container with ``.pcm`` (bytes) for decoded audio.
-        """
+        # Log the very first packet so we know the pipeline is alive
+        if not self._first_packet_logged:
+            self._first_packet_logged = True
+            user_info = f"user={user} (id={getattr(user, 'id', '?')})" if user else "user=None"
+            pcm_len = len(data.pcm) if hasattr(data, 'pcm') else 'NO_PCM_ATTR'
+            logger.info("[VoiceSink] *** FIRST AUDIO PACKET RECEIVED *** %s, pcm_bytes=%s", user_info, pcm_len)
+
+        # Log every 500 packets so we can see ongoing activity
+        if self._packet_count % 500 == 0:
+            logger.info("[VoiceSink] Received %d audio packets so far (buffers: %s)",
+                        self._packet_count,
+                        {uid: len(buf) for uid, buf in self.audio_data.items()})
+
         if user is None:
             return
 
-        # Filter: ignore bots and (optionally) non-allowed users
+        # Filter: ignore bots
         if getattr(user, "bot", False):
             return
         if self.adapter._client and self.adapter._client.user and user.id == self.adapter._client.user.id:
@@ -105,12 +109,16 @@ class VoiceSink(_AudioSinkBase):
         if self._allowed_users_raw:
             allowed_ids = {u.strip() for u in self._allowed_users_raw.split(",") if u.strip()}
             if allowed_ids and str(user.id) not in allowed_ids:
+                if self._packet_count <= 5:
+                    logger.info("[VoiceSink] Dropping packet from user %s (id=%s) — not in DISCORD_ALLOWED_USERS",
+                                user.display_name, user.id)
                 return
 
         user_id = user.id
         if user_id not in self.audio_data:
             self.audio_data[user_id] = bytearray()
             self.is_processing[user_id] = False
+            logger.info("[VoiceSink] New speaker detected: %s (id=%s)", user.display_name, user_id)
 
         # Don't append while we are transcribing the previous chunk
         if not self.is_processing.get(user_id, False):
@@ -120,7 +128,7 @@ class VoiceSink(_AudioSinkBase):
     def cleanup(self):
         """Called by the library when listening stops."""
         self.stop()
-        logger.info("VoiceSink cleanup for channel %s", self.channel_id)
+        logger.info("[VoiceSink] cleanup called — total packets received: %d", self._packet_count)
 
     # ------------------------------------------------------------------
     # Background silence monitor
@@ -132,7 +140,7 @@ class VoiceSink(_AudioSinkBase):
             return
         self._running = True
         self._task = asyncio.create_task(self._monitor_silence())
-        logger.info("VoiceSink started for channel %s", self.channel_id)
+        logger.info("[VoiceSink] Background silence monitor STARTED for channel %s", self.channel_id)
 
     def stop(self):
         """Stop the background task and clear buffers."""
@@ -143,27 +151,55 @@ class VoiceSink(_AudioSinkBase):
         self.audio_data.clear()
         self.last_activity.clear()
         self.is_processing.clear()
-        logger.info("VoiceSink stopped for channel %s", self.channel_id)
+        logger.info("[VoiceSink] STOPPED for channel %s", self.channel_id)
 
     async def _monitor_silence(self):
         """Periodically check for users who have stopped speaking."""
+        logger.info("[VoiceSink] Silence monitor loop running...")
+        loop_count = 0
         while self._running:
             try:
                 await asyncio.sleep(0.5)
+                loop_count += 1
                 now = time.time()
+
+                # Log monitor heartbeat every 60 iterations (~30 seconds)
+                if loop_count % 60 == 0:
+                    logger.info("[VoiceSink] Monitor heartbeat: loop=%d, packets=%d, buffers=%s",
+                                loop_count, self._packet_count,
+                                {uid: len(buf) for uid, buf in self.audio_data.items()})
+
                 for user_id, last_time in list(self.last_activity.items()):
                     buf = self.audio_data.get(user_id, b"")
-                    if now - last_time > self.silence_threshold and len(buf) > 0:
+                    silence_duration = now - last_time
+                    if silence_duration > self.silence_threshold and len(buf) > 0:
                         if not self.is_processing.get(user_id, False):
+                            logger.info("[VoiceSink] Silence detected for user %s (%.1fs silence, %d bytes buffered) — triggering transcription",
+                                        user_id, silence_duration, len(buf))
                             asyncio.create_task(self._process_user_audio(user_id))
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Error in VoiceSink monitor: %s", e, exc_info=True)
+                logger.error("[VoiceSink] Error in silence monitor: %s", e, exc_info=True)
 
     # ------------------------------------------------------------------
     # Transcription + agent dispatch
     # ------------------------------------------------------------------
+
+    async def _send_debug_message(self, text: str):
+        """Send a visible debug message to the home channel so the user can see pipeline activity."""
+        try:
+            home_channel_id = os.getenv("DISCORD_HOME_CHANNEL", "")
+            if not home_channel_id:
+                logger.warning("[VoiceSink] No DISCORD_HOME_CHANNEL set — cannot send debug message")
+                return
+            channel = self.adapter._client.get_channel(int(home_channel_id))
+            if not channel:
+                channel = await self.adapter._client.fetch_channel(int(home_channel_id))
+            if channel:
+                await channel.send(text)
+        except Exception as e:
+            logger.error("[VoiceSink] Failed to send debug message: %s", e)
 
     async def _process_user_audio(self, user_id: int):
         """Save buffered PCM to WAV, transcribe with Whisper, and dispatch."""
@@ -175,11 +211,15 @@ class VoiceSink(_AudioSinkBase):
 
             # Minimum ~0.5 s of audio at 48 kHz / 16-bit / stereo = 96 000 bytes
             if len(data) < 96_000:
-                logger.debug("Skipping short audio from user %s (%d bytes)", user_id, len(data))
+                logger.info("[VoiceSink] Audio too short from user %s (%d bytes < 96000) — skipping", user_id, len(data))
                 self.is_processing[user_id] = False
                 return
 
-            logger.info("Processing %d bytes of audio from user %s", len(data), user_id)
+            logger.info("[VoiceSink] Processing %d bytes of audio from user %s", len(data), user_id)
+
+            # Send a visible confirmation that audio was captured
+            duration_secs = len(data) / (48000 * 2 * 2)  # 48kHz, 16-bit, stereo
+            await self._send_debug_message(f"🎤 **Voice detected** from <@{user_id}> — captured {duration_secs:.1f}s of audio. Transcribing...")
 
             # Write a proper WAV file for Whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -190,19 +230,37 @@ class VoiceSink(_AudioSinkBase):
                     wav.setframerate(48000)   # Discord standard
                     wav.writeframes(data)
 
+            logger.info("[VoiceSink] WAV file written: %s (%d bytes)", tmp_path, os.path.getsize(tmp_path))
+
+            # Check that VOICE_TOOLS_OPENAI_KEY is set
+            if not os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+                error_msg = "⚠️ **VOICE_TOOLS_OPENAI_KEY not set** — cannot transcribe audio. Please set this env var."
+                logger.error("[VoiceSink] %s", error_msg)
+                await self._send_debug_message(error_msg)
+                self.is_processing[user_id] = False
+                return
+
             # Transcribe (synchronous OpenAI call — run in thread)
             result = await asyncio.to_thread(transcribe_audio, tmp_path)
 
             if not result.get("success"):
-                logger.warning("Transcription failed for user %s: %s", user_id, result.get("error", "unknown"))
+                error_detail = result.get("error", "unknown")
+                logger.warning("[VoiceSink] Transcription failed for user %s: %s", user_id, error_detail)
+                await self._send_debug_message(f"⚠️ **Transcription failed**: {error_detail}")
+                self.is_processing[user_id] = False
                 return
 
             text = (result.get("transcript") or "").strip()
             if len(text) <= 1:
-                logger.debug("Transcription too short from user %s: '%s'", user_id, text)
+                logger.info("[VoiceSink] Transcription too short from user %s: '%s'", user_id, text)
+                await self._send_debug_message(f"🔇 Audio from <@{user_id}> was too quiet or unclear to transcribe.")
+                self.is_processing[user_id] = False
                 return
 
-            logger.info("Voice transcription from user %s: %s", user_id, text)
+            logger.info("[VoiceSink] ✅ Transcription from user %s: \"%s\"", user_id, text)
+
+            # Send visible confirmation of what was heard
+            await self._send_debug_message(f"🗣️ **Heard from** <@{user_id}>: \"{text}\"\n_Processing response..._")
 
             # Resolve the Discord user and channel objects
             try:
@@ -259,11 +317,13 @@ class VoiceSink(_AudioSinkBase):
                         await self.adapter.handle_message(event)
                 else:
                     await self.adapter.handle_message(event)
-            except Exception:
-                await self.adapter.handle_message(event)
+            except Exception as dispatch_err:
+                logger.error("[VoiceSink] Error dispatching to agent: %s", dispatch_err, exc_info=True)
+                await self._send_debug_message(f"⚠️ **Error dispatching voice to agent**: {dispatch_err}")
 
         except Exception as e:
-            logger.error("Failed to process user audio: %s", e, exc_info=True)
+            logger.error("[VoiceSink] Failed to process user audio: %s", e, exc_info=True)
+            await self._send_debug_message(f"⚠️ **Voice processing error**: {e}")
         finally:
             # Clean up temp file
             if tmp_path:

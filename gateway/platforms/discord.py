@@ -411,6 +411,7 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.dm_messages = True
             intents.guild_messages = True
             intents.members = True
+            intents.voice_states = True  # Required for voice receiving
             
             # Create bot
             self._client = commands.Bot(
@@ -460,12 +461,37 @@ class DiscordAdapter(BasePlatformAdapter):
                                     adapter_self._voice_client.listen(adapter_self._voice_sink)
                                     adapter_self._voice_sink.start()
                                     logger.info("[%s] Auto-joined voice channel %s with real-time receiving enabled", adapter_self.name, channel.name)
+                                    # Send visible confirmation to home channel
+                                    home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                                    if home_ch_id:
+                                        try:
+                                            home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                                            if home_ch:
+                                                await home_ch.send(f"🎙️ **Voice receiving active** — joined **{channel.name}** with `discord-ext-voice-recv`. I can hear you now! Speak in the voice channel and I'll transcribe + respond.")
+                                        except Exception:
+                                            pass
                                 else:
                                     adapter_self._voice_client = await channel.connect()
-                                    logger.info("[%s] Auto-joined voice channel %s (receive not available)", adapter_self.name, channel.name)
-                                logger.info("[%s] Auto-joined voice channel %s", adapter_self.name, channel.name)
+                                    logger.info("[%s] Auto-joined voice channel %s (receive NOT available — install discord-ext-voice-recv)", adapter_self.name, channel.name)
+                                    # Warn user that receiving is not available
+                                    home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                                    if home_ch_id:
+                                        try:
+                                            home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                                            if home_ch:
+                                                await home_ch.send("⚠️ **Voice joined but receiving DISABLED** — `discord-ext-voice-recv` is not installed. I can speak but cannot hear you.")
+                                        except Exception:
+                                            pass
                     except Exception as ve:
-                        logger.error("[%s] Voice auto-join failed: %s", adapter_self.name, ve)
+                        logger.error("[%s] Voice auto-join failed: %s", adapter_self.name, ve, exc_info=True)
+                        home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                        if home_ch_id:
+                            try:
+                                home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                                if home_ch:
+                                    await home_ch.send(f"⚠️ **Voice auto-join failed**: {ve}")
+                            except Exception:
+                                pass
                 
                 # ── Post-deployment startup notification ──
                 # Send a message to the agent's home channel so the owner
@@ -1420,8 +1446,24 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._voice_client.listen(self._voice_sink)
                     self._voice_sink.start()
                     logger.info("[%s] Joined voice channel %s with real-time receiving", self.name, target_channel.name)
-                
-                await interaction.followup.send(f"Joined **{target_channel.name}**~", ephemeral=True)
+                    await interaction.followup.send(
+                        f"🎙️ Joined **{target_channel.name}** with voice receiving **enabled**. I can hear you!",
+                        ephemeral=True
+                    )
+                    # Also send a visible message to the home channel
+                    home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                    if home_ch_id:
+                        try:
+                            home_ch = self._client.get_channel(int(home_ch_id))
+                            if home_ch:
+                                await home_ch.send(f"🎙️ **Voice receiving active** — joined **{target_channel.name}**. Speak and I'll transcribe + respond.")
+                        except Exception:
+                            pass
+                else:
+                    await interaction.followup.send(
+                        f"⚠️ Joined **{target_channel.name}** but voice receiving is **disabled** (discord-ext-voice-recv not installed). I can speak but cannot hear you.",
+                        ephemeral=True
+                    )
             except Exception as e:
                 logger.error("[%s] Failed to join voice: %s", self.name, e)
                 await interaction.followup.send(f"Failed to join voice: {str(e)}", ephemeral=True)
