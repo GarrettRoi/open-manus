@@ -439,8 +439,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 
                 # Sync slash commands with Discord
                 try:
-                    synced = await adapter_self._client.tree.sync()
-                    logger.info("[%s] Synced %d slash command(s)", adapter_self.name, len(synced))
+                    # If DISCORD_GUILD_ID is set, sync specifically to that guild for instant updates
+                    guild_id = os.getenv("DISCORD_GUILD_ID")
+                    if guild_id:
+                        guild = discord.Object(id=int(guild_id))
+                        adapter_self._client.tree.copy_global_to(guild=guild)
+                        await adapter_self._client.tree.sync(guild=guild)
+                        logger.info("[%s] Synced slash command(s) to guild %s", adapter_self.name, guild_id)
+                    
+                    # Also perform global sync (can take up to an hour)
+                    synced_global = await adapter_self._client.tree.sync()
+                    logger.info("[%s] Synced %d global slash command(s)", adapter_self.name, len(synced_global))
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
                 adapter_self._ready_event.set()
@@ -544,6 +553,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Always ignore our own messages
                 if message.author == self._client.user:
                     return
+
+                # FALLBACK: !sync command to force command tree synchronization
+                if message.content.strip().lower() == "!sync":
+                    # Only allow owner or allowed users to sync
+                    if str(message.author.id) in adapter_self._allowed_user_ids or (message.guild and message.author.id == message.guild.owner_id):
+                        try:
+                            await message.channel.send("🔄 Syncing slash commands...")
+                            # Sync to current guild
+                            guild = discord.Object(id=message.guild.id)
+                            adapter_self._client.tree.copy_global_to(guild=guild)
+                            synced = await adapter_self._client.tree.sync(guild=guild)
+                            # Sync globally
+                            await adapter_self._client.tree.sync()
+                            await message.channel.send(f"✅ Synced {len(synced)} commands to this server. New commands like `/voicestatus` should appear now.")
+                            return
+                        except Exception as e:
+                            await message.channel.send(f"❌ Sync failed: {e}")
+                            return
                 
                 is_bot_message = getattr(message.author, "bot", False)
                 is_owner = str(message.author.id) == OWNER_USER_ID
