@@ -556,20 +556,28 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # FALLBACK: !sync command to force command tree synchronization
                 if message.content.strip().lower() == "!sync":
-                    # Only allow owner or allowed users to sync
-                    if str(message.author.id) in adapter_self._allowed_user_ids or (message.guild and message.author.id == message.guild.owner_id):
+                    # For debugging, we allow any message in the home channel to trigger sync
+                    # or if the user is the guild owner/allowed user.
+                    home_channel_id = os.getenv("DISCORD_HOME_CHANNEL", "")
+                    is_home_channel = (str(message.channel.id) == home_channel_id)
+                    
+                    if is_home_channel or str(message.author.id) in adapter_self._allowed_user_ids or (message.guild and message.author.id == message.guild.owner_id):
                         try:
-                            await message.channel.send("🔄 Syncing slash commands...")
-                            # Sync to current guild
-                            guild = discord.Object(id=message.guild.id)
-                            adapter_self._client.tree.copy_global_to(guild=guild)
-                            synced = await adapter_self._client.tree.sync(guild=guild)
-                            # Sync globally
-                            await adapter_self._client.tree.sync()
-                            await message.channel.send(f"✅ Synced {len(synced)} commands to this server. New commands like `/voicestatus` should appear now.")
+                            await message.channel.send("🔄 **Force-syncing slash commands to this server...**")
+                            # Sync to current guild (instant)
+                            if message.guild:
+                                guild = discord.Object(id=message.guild.id)
+                                adapter_self._client.tree.copy_global_to(guild=guild)
+                                synced = await adapter_self._client.tree.sync(guild=guild)
+                                # Sync globally (takes time)
+                                await adapter_self._client.tree.sync()
+                                await message.channel.send(f"✅ **Success!** Registered {len(synced)} commands (including `/voicekick` and `/voicestatus`) to this server. They should appear in your `/` menu immediately.")
+                            else:
+                                await message.channel.send("⚠️ This command must be used in a server channel to sync guild commands.")
                             return
                         except Exception as e:
-                            await message.channel.send(f"❌ Sync failed: {e}")
+                            await message.channel.send(f"❌ **Sync failed**: {e}")
+                            logger.error("[%s] Manual sync failed: %s", adapter_self.name, e, exc_info=True)
                             return
                 
                 is_bot_message = getattr(message.author, "bot", False)
