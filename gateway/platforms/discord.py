@@ -1148,19 +1148,24 @@ class DiscordAdapter(BasePlatformAdapter):
         """Send silent Opus packets to prevent Discord from closing the receive socket.
         
         Discord closes the listening socket if no audio is sent for a period.
-        This background task sends a silent Opus frame every 15 seconds to
-        keep the connection alive.  See:
-        https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/8
+        This background task sends a silent Opus frame every 10 seconds to
+        keep the connection alive. We also toggle speaking state to ensure
+        the socket stays fully active.
         """
         logger.info("[%s] Voice keepalive task started", self.name)
+        # 20ms of silence (Opus frame)
         SILENT_OPUS_FRAME = b"\xf8\xff\xfe"
         while True:
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
                 if self._voice_client and self._voice_client.is_connected():
                     if not self._voice_client.is_playing():
                         try:
+                            # Briefly signal speaking to "wake up" the Discord socket
+                            await self._voice_client.ws.speak(discord.SpeakingState.voice)
                             self._voice_client.send_audio_packet(SILENT_OPUS_FRAME, encode=False)
+                            await asyncio.sleep(0.1)
+                            await self._voice_client.ws.speak(discord.SpeakingState.none)
                         except Exception as e:
                             logger.debug("[%s] Keepalive packet failed: %s", self.name, e)
             except asyncio.CancelledError:
@@ -1586,6 +1591,41 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_unmute(interaction: discord.Interaction):
             self._voice_muted = False
             await interaction.response.send_message("Agent voice unmuted~", ephemeral=True)
+
+        @tree.command(name="voicekick", description="Force a fresh voice connection to reset the listening socket")
+        async def slash_voicekick(interaction: discord.Interaction):
+            if not self._voice_client or not self._voice_client.is_connected():
+                await interaction.response.send_message("I'm not in a voice channel!", ephemeral=True)
+                return
+            
+            channel = self._voice_client.channel
+            await interaction.response.send_message(f"🔄 Resetting voice connection to **{channel.name}**...", ephemeral=True)
+            
+            try:
+                # Cleanup existing
+                if self._voice_keepalive_task:
+                    self._voice_keepalive_task.cancel()
+                if self._voice_sink:
+                    self._voice_sink.stop()
+                await self._voice_client.disconnect()
+                
+                await asyncio.sleep(1)
+                
+                # Reconnect fresh
+                if VOICE_RECV_AVAILABLE:
+                    self._voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+                    from gateway.platforms.voice_sink import VoiceSink
+                    self._voice_sink = VoiceSink(self, str(channel.id))
+                    self._voice_client.listen(self._voice_sink)
+                    self._voice_sink.start()
+                    self._voice_keepalive_task = asyncio.create_task(self._voice_keepalive())
+                    await interaction.followup.send("✅ Voice connection reset. Try speaking now!", ephemeral=True)
+                else:
+                    self._voice_client = await channel.connect()
+                    await interaction.followup.send("✅ Reconnected (receiving still disabled).", ephemeral=True)
+            except Exception as e:
+                logger.error("[%s] Voice kick failed: %s", self.name, e)
+                await interaction.followup.send(f"❌ Reset failed: {e}", ephemeral=True)
 
         @tree.command(name="voicestatus", description="Show voice pipeline diagnostic status")
         async def slash_voicestatus(interaction: discord.Interaction):
