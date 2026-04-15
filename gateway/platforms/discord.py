@@ -870,15 +870,29 @@ class DiscordAdapter(BasePlatformAdapter):
                                     optimize_streaming_latency=int(optimize_latency)
                                 )
                                 
-                                # Convert generator to bytes (still need to buffer for FFmpegPCMAudio)
-                                # For true streaming without full buffer, we'd need a custom AudioSource
-                                # but buffering the full response is still much faster with optimize_streaming_latency
-                                audio_data = b"".join(list(audio_stream))
+                                # CHUNKED STREAMING: To reduce latency, we process the stream in chunks
+                                # and put each chunk into the voice queue as it arrives.
+                                # This allows the bot to start speaking before the full audio is generated.
+                                chunk_size = 128 * 1024  # ~128KB chunks (~1-2 seconds of audio)
+                                current_chunk = bytearray()
+                                chunks_added = 0
                                 
-                                if audio_data:
-                                    # Put into the voice queue for sequential playback
-                                    await self._voice_queue.put(audio_data)
-                                    logger.info("[%s] Added %d bytes of audio to voice queue", self.name, len(audio_data))
+                                for chunk in audio_stream:
+                                    current_chunk.extend(chunk)
+                                    if len(current_chunk) >= chunk_size:
+                                        await self._voice_queue.put(bytes(current_chunk))
+                                        chunks_added += 1
+                                        current_chunk = bytearray()
+                                        # Log only the first chunk to show we started streaming
+                                        if chunks_added == 1:
+                                            logger.info("[%s] Started streaming first audio chunk to voice queue", self.name)
+                                
+                                # Don't forget the last partial chunk
+                                if current_chunk:
+                                    await self._voice_queue.put(bytes(current_chunk))
+                                    chunks_added += 1
+                                
+                                logger.info("[%s] Added %d audio chunks to voice queue", self.name, chunks_added)
                     except Exception as ve:
                         logger.error("[%s] Voice streaming failed: %s", self.name, ve)
 
@@ -1804,8 +1818,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 free_channels.add(home_ch.strip())
             
             is_free_channel = bool(channel_ids & free_channels)
+            
+            # ── VOICE MESSAGE BYPASS ──
+            # Messages starting with [VOICE] (transcribed by VoiceSink) 
+            # NEVER require a mention.
+            is_voice_msg = message.content.startswith("[VOICE]")
 
-            if require_mention and not is_free_channel:
+            if require_mention and not is_free_channel and not is_voice_msg:
                 if self._client.user not in message.mentions:
                     return
 

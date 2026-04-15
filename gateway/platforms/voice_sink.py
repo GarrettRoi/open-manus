@@ -87,6 +87,7 @@ class VoiceSink(_AudioSinkBase):
         if not self._first_packet_logged:
             self._first_packet_logged = True
             user_info = f"user={user} (id={getattr(user, 'id', '?')})" if user else "user=None"
+            # In voice_recv, data is a VoiceData object, pcm is an attribute
             pcm_len = len(data.pcm) if hasattr(data, 'pcm') else 'NO_PCM_ATTR'
             logger.info("[VoiceSink] *** FIRST AUDIO PACKET RECEIVED *** %s, pcm_bytes=%s", user_info, pcm_len)
 
@@ -109,9 +110,6 @@ class VoiceSink(_AudioSinkBase):
         if self._allowed_users_raw:
             allowed_ids = {u.strip() for u in self._allowed_users_raw.split(",") if u.strip()}
             if allowed_ids and str(user.id) not in allowed_ids:
-                if self._packet_count <= 5:
-                    logger.info("[VoiceSink] Dropping packet from user %s (id=%s) — not in DISCORD_ALLOWED_USERS",
-                                user.display_name, user.id)
                 return
 
         user_id = user.id
@@ -122,8 +120,9 @@ class VoiceSink(_AudioSinkBase):
 
         # Don't append while we are transcribing the previous chunk
         if not self.is_processing.get(user_id, False):
-            self.audio_data[user_id].extend(data.pcm)
-            self.last_activity[user_id] = time.time()
+            if hasattr(data, 'pcm'):
+                self.audio_data[user_id].extend(data.pcm)
+                self.last_activity[user_id] = time.time()
 
     def cleanup(self):
         """Called by the library when listening stops."""
@@ -209,7 +208,8 @@ class VoiceSink(_AudioSinkBase):
             data = bytes(self.audio_data[user_id])
             self.audio_data[user_id] = bytearray()  # clear buffer
 
-            # Minimum ~0.5 s of audio at 48 kHz / 16-bit / stereo = 96 000 bytes
+            # Minimum ~0.5 s of audio at 48 kHz / 16-bit / stereo = 192 000 bytes
+            # Note: 48000 samples/sec * 2 bytes/sample * 2 channels = 192000 bytes per second
             if len(data) < 96_000:
                 logger.info("[VoiceSink] Audio too short from user %s (%d bytes < 96000) — skipping", user_id, len(data))
                 self.is_processing[user_id] = False
@@ -253,13 +253,13 @@ class VoiceSink(_AudioSinkBase):
             text = (result.get("transcript") or "").strip()
             if len(text) <= 1:
                 logger.info("[VoiceSink] Transcription too short from user %s: '%s'", user_id, text)
-                await self._send_debug_message(f"🔇 Audio from <@{user_id}> was too quiet or unclear to transcribe.")
+                # No debug message for empty/too short transcription to avoid spam
                 self.is_processing[user_id] = False
                 return
 
             logger.info("[VoiceSink] ✅ Transcription from user %s: \"%s\"", user_id, text)
 
-            # Send visible confirmation of what was heard
+            # Send visible confirmation
             await self._send_debug_message(f"🗣️ **Heard from** <@{user_id}>: \"{text}\"\n_Processing response..._")
 
             # Resolve the Discord user and channel objects
