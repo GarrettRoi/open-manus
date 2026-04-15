@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libssl-dev \
     libffi-dev \
+    libopus-dev \
     libpq-dev \
     poppler-utils \
     ffmpeg \
