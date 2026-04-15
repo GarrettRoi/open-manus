@@ -67,6 +67,10 @@ class VoiceSink(_AudioSinkBase):
         # Debug: count packets received so we can confirm write() is being called
         self._packet_count = 0
         self._first_packet_logged = False
+        
+        # Trace logging: periodically report packet counts per user to Discord
+        self._last_debug_report = 0
+        self._user_packet_counts: Dict[int, int] = {}
 
         logger.info("[VoiceSink] Initialized for channel %s (silence_threshold=%.1fs, allowed_users='%s')",
                      channel_id, self.silence_threshold, self._allowed_users_raw)
@@ -82,20 +86,17 @@ class VoiceSink(_AudioSinkBase):
     def write(self, user, data):
         """Called by discord-ext-voice-recv for every decoded audio packet."""
         self._packet_count += 1
+        
+        if user:
+            self._user_packet_counts[user.id] = self._user_packet_counts.get(user.id, 0) + 1
 
         # Log the very first packet so we know the pipeline is alive
         if not self._first_packet_logged:
             self._first_packet_logged = True
             user_info = f"user={user} (id={getattr(user, 'id', '?')})" if user else "user=None"
-            # In voice_recv, data is a VoiceData object, pcm is an attribute
             pcm_len = len(data.pcm) if hasattr(data, 'pcm') else 'NO_PCM_ATTR'
             logger.info("[VoiceSink] *** FIRST AUDIO PACKET RECEIVED *** %s, pcm_bytes=%s", user_info, pcm_len)
-
-        # Log every 500 packets so we can see ongoing activity
-        if self._packet_count % 500 == 0:
-            logger.info("[VoiceSink] Received %d audio packets so far (buffers: %s)",
-                        self._packet_count,
-                        {uid: len(buf) for uid, buf in self.audio_data.items()})
+            asyncio.create_task(self._send_debug_message(f"📡 **Audio Stream Active**: Bot is now receiving audio packets from Discord!"))
 
         if user is None:
             return
@@ -117,6 +118,7 @@ class VoiceSink(_AudioSinkBase):
             self.audio_data[user_id] = bytearray()
             self.is_processing[user_id] = False
             logger.info("[VoiceSink] New speaker detected: %s (id=%s)", user.display_name, user_id)
+            asyncio.create_task(self._send_debug_message(f"👤 **Speaker Detected**: Bot sees audio from <@{user_id}>"))
 
         # Don't append while we are transcribing the previous chunk
         if not self.is_processing.get(user_id, False):
@@ -162,11 +164,14 @@ class VoiceSink(_AudioSinkBase):
                 loop_count += 1
                 now = time.time()
 
-                # Log monitor heartbeat every 60 iterations (~30 seconds)
-                if loop_count % 60 == 0:
-                    logger.info("[VoiceSink] Monitor heartbeat: loop=%d, packets=%d, buffers=%s",
-                                loop_count, self._packet_count,
-                                {uid: len(buf) for uid, buf in self.audio_data.items()})
+                # Every 5 seconds, if we have seen packets but no transcription, report status
+                if now - self._last_debug_report > 5.0 and self._packet_count > 0:
+                    self._last_debug_report = now
+                    report = f"📊 **Voice Traffic**: {self._packet_count} total packets."
+                    for uid, count in self._user_packet_counts.items():
+                        buf_len = len(self.audio_data.get(uid, b""))
+                        report += f"\n- <@{uid}>: {count} packets, {buf_len} bytes buffered."
+                    await self._send_debug_message(report)
 
                 for user_id, last_time in list(self.last_activity.items()):
                     buf = self.audio_data.get(user_id, b"")
@@ -210,8 +215,9 @@ class VoiceSink(_AudioSinkBase):
 
             # Minimum ~0.5 s of audio at 48 kHz / 16-bit / stereo = 192 000 bytes
             # Note: 48000 samples/sec * 2 bytes/sample * 2 channels = 192000 bytes per second
-            if len(data) < 96_000:
-                logger.info("[VoiceSink] Audio too short from user %s (%d bytes < 96000) — skipping", user_id, len(data))
+            # Lowering threshold slightly for testing: 0.25s = 48000 bytes
+            if len(data) < 48_000:
+                logger.info("[VoiceSink] Audio too short from user %s (%d bytes < 48000) — skipping", user_id, len(data))
                 self.is_processing[user_id] = False
                 return
 
@@ -253,7 +259,7 @@ class VoiceSink(_AudioSinkBase):
             text = (result.get("transcript") or "").strip()
             if len(text) <= 1:
                 logger.info("[VoiceSink] Transcription too short from user %s: '%s'", user_id, text)
-                # No debug message for empty/too short transcription to avoid spam
+                await self._send_debug_message(f"🔇 Audio from <@{user_id}> was processed but no clear speech was found.")
                 self.is_processing[user_id] = False
                 return
 
