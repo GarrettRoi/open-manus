@@ -31,6 +31,10 @@ platformdirs
 # Text-to-speech (Edge TTS is free, no API key needed)
 edge-tts
 
+# Voice processing dependencies
+webrtcvad-wheels
+numpy
+
 # Optional: For cron expression parsing (cronjob scheduling)
 croniter
 
