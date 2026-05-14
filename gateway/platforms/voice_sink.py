@@ -35,8 +35,43 @@ except ImportError:
     _VOICE_RECV_OK = False
     logger.warning("discord-ext-voice-recv not installed — VoiceSink will be non-functional")
 
-# Internal project imports
-from tools.transcription_tools import transcribe_audio
+# ---------------------------------------------------------------------------
+# Import transcription_tools directly to avoid triggering tools/__init__.py
+# which eagerly imports firecrawl and other heavy dependencies.
+# ---------------------------------------------------------------------------
+_transcribe_audio = None
+
+def _get_transcribe_fn():
+    """Lazy-load the transcribe_audio function to avoid import-time failures."""
+    global _transcribe_audio
+    if _transcribe_audio is not None:
+        return _transcribe_audio
+
+    try:
+        # Try the normal import path first (works when all deps are installed)
+        from tools.transcription_tools import transcribe_audio
+        _transcribe_audio = transcribe_audio
+    except ImportError:
+        # Fallback: import the module directly without going through __init__
+        import importlib.util
+        import pathlib
+        module_path = pathlib.Path(__file__).resolve().parents[2] / "tools" / "transcription_tools.py"
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location("transcription_tools", str(module_path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _transcribe_audio = mod.transcribe_audio
+        else:
+            logger.error("[VoiceSink] Cannot find transcription_tools.py at %s", module_path)
+            # Return a stub that always fails gracefully
+            def _stub(file_path, model=None):
+                return {"success": False, "transcript": "", "error": "transcription_tools not available"}
+            _transcribe_audio = _stub
+
+    return _transcribe_audio
+
+
+# Import base types (these are lightweight and should always work)
 from gateway.platforms.base import MessageEvent, MessageType
 
 
@@ -55,7 +90,7 @@ class VoiceSink(_AudioSinkBase):
         self.is_processing: Dict[int, bool] = {}
 
         # Silence detection: seconds of quiet before we process the buffer
-        self.silence_threshold = float(os.getenv("VOICE_SILENCE_THRESHOLD", "1.2"))
+        self.silence_threshold = float(os.getenv("VOICE_SILENCE_THRESHOLD", "1.5"))
 
         # Background monitor handle
         self._task: Optional[asyncio.Task] = None
@@ -67,10 +102,13 @@ class VoiceSink(_AudioSinkBase):
         # Debug: count packets received so we can confirm write() is being called
         self._packet_count = 0
         self._first_packet_logged = False
-        
+
         # Trace logging: periodically report packet counts per user to Discord
         self._last_debug_report = 0
         self._user_packet_counts: Dict[int, int] = {}
+
+        # Event loop reference (write() is called from a non-async thread)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         logger.info("[VoiceSink] Initialized for channel %s (silence_threshold=%.1fs, allowed_users='%s')",
                      channel_id, self.silence_threshold, self._allowed_users_raw)
@@ -84,11 +122,16 @@ class VoiceSink(_AudioSinkBase):
         return False
 
     def write(self, user, data):
-        """Called by discord-ext-voice-recv for every decoded audio packet."""
+        """Called by discord-ext-voice-recv for every decoded audio packet.
+
+        IMPORTANT: This method is called from a background thread (the sink
+        router thread), NOT from the asyncio event loop.  Any async operations
+        must be scheduled via call_soon_threadsafe / run_coroutine_threadsafe.
+        """
         self._packet_count += 1
-        
-        # Aggressive debug: log every 100 packets to console
-        if self._packet_count % 100 == 0:
+
+        # Aggressive debug: log every 500 packets to console
+        if self._packet_count % 500 == 0:
             logger.debug("[VoiceSink] Received %d total packets", self._packet_count)
 
         if user:
@@ -98,12 +141,14 @@ class VoiceSink(_AudioSinkBase):
         if not self._first_packet_logged:
             self._first_packet_logged = True
             user_info = f"user={user} (id={getattr(user, 'id', '?')})" if user else "user=None"
-            # Access PCM data correctly based on library version
-            pcm_data = getattr(data, 'pcm', data)
+            # Access PCM data from VoiceData object
+            pcm_data = data.pcm if hasattr(data, 'pcm') else data
             pcm_len = len(pcm_data) if isinstance(pcm_data, (bytes, bytearray)) else 'UNKNOWN'
-            
+
             logger.info("[VoiceSink] *** FIRST AUDIO PACKET RECEIVED *** %s, pcm_bytes=%s", user_info, pcm_len)
-            asyncio.create_task(self._send_debug_message(f"📡 **Audio Stream Active**: Bot is now receiving audio packets from Discord!"))
+            self._schedule_async(self._send_debug_message(
+                "📡 **Audio Stream Active**: Bot is now receiving audio packets from Discord!"
+            ))
 
         if user is None:
             return
@@ -125,11 +170,14 @@ class VoiceSink(_AudioSinkBase):
             self.audio_data[user_id] = bytearray()
             self.is_processing[user_id] = False
             logger.info("[VoiceSink] New speaker detected: %s (id=%s)", user.display_name, user_id)
-            asyncio.create_task(self._send_debug_message(f"👤 **Speaker Detected**: Bot sees audio from <@{user_id}>"))
+            self._schedule_async(self._send_debug_message(
+                f"👤 **Speaker Detected**: Bot sees audio from <@{user_id}>"
+            ))
 
         # Don't append while we are transcribing the previous chunk
         if not self.is_processing.get(user_id, False):
-            pcm_data = getattr(data, 'pcm', data)
+            # Extract PCM bytes from VoiceData object
+            pcm_data = data.pcm if hasattr(data, 'pcm') else data
             if isinstance(pcm_data, (bytes, bytearray)):
                 self.audio_data[user_id].extend(pcm_data)
                 self.last_activity[user_id] = time.time()
@@ -140,6 +188,20 @@ class VoiceSink(_AudioSinkBase):
         logger.info("[VoiceSink] cleanup called — total packets received: %d", self._packet_count)
 
     # ------------------------------------------------------------------
+    # Thread-safe async scheduling
+    # ------------------------------------------------------------------
+
+    def _schedule_async(self, coro):
+        """Schedule an async coroutine from a sync/threaded context."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            pass
+
+    # ------------------------------------------------------------------
     # Background silence monitor
     # ------------------------------------------------------------------
 
@@ -148,6 +210,11 @@ class VoiceSink(_AudioSinkBase):
         if self._running:
             return
         self._running = True
+        # Capture the current event loop for thread-safe scheduling
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
         self._task = asyncio.create_task(self._monitor_silence())
         logger.info("[VoiceSink] Background silence monitor STARTED for channel %s", self.channel_id)
 
@@ -167,11 +234,11 @@ class VoiceSink(_AudioSinkBase):
         logger.info("[VoiceSink] Silence monitor loop running...")
         while self._running:
             try:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 now = time.time()
 
-                # Every 5 seconds, if we have seen packets but no transcription, report status
-                if now - self._last_debug_report > 5.0 and self._packet_count > 0:
+                # Every 10 seconds, if we have seen packets but no transcription, report status
+                if now - self._last_debug_report > 10.0 and self._packet_count > 0:
                     self._last_debug_report = now
                     report = f"📊 **Voice Traffic**: {self._packet_count} total packets."
                     has_data = False
@@ -222,17 +289,23 @@ class VoiceSink(_AudioSinkBase):
             data = bytes(self.audio_data[user_id])
             self.audio_data[user_id] = bytearray()  # clear buffer
 
-            # Minimum audio threshold: 0.1s = 19200 bytes
-            if len(data) < 19_200:
-                logger.info("[VoiceSink] Audio too short from user %s (%d bytes) — skipping", user_id, len(data))
+            # Minimum audio threshold: ~0.25s at 48kHz stereo 16-bit = 48000 bytes
+            # (48000 samples/sec * 2 channels * 2 bytes * 0.25s = 48000)
+            MIN_AUDIO_BYTES = 48_000
+            if len(data) < MIN_AUDIO_BYTES:
+                logger.info("[VoiceSink] Audio too short from user %s (%d bytes, need %d) — skipping",
+                            user_id, len(data), MIN_AUDIO_BYTES)
                 self.is_processing[user_id] = False
                 return
 
             logger.info("[VoiceSink] Processing %d bytes of audio from user %s", len(data), user_id)
 
             # Send a visible confirmation that audio was captured
-            duration_secs = len(data) / (48000 * 2 * 2)  # 48kHz, 16-bit, stereo
-            await self._send_debug_message(f"🎤 **Voice detected** from <@{user_id}> — captured {duration_secs:.1f}s of audio. Transcribing...")
+            # PCM format: 48kHz, stereo (2ch), 16-bit (2 bytes) = 192000 bytes/sec
+            duration_secs = len(data) / (48000 * 2 * 2)
+            await self._send_debug_message(
+                f"🎤 **Voice detected** from <@{user_id}> — captured {duration_secs:.1f}s of audio. Transcribing..."
+            )
 
             # Write a proper WAV file for Whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -250,8 +323,11 @@ class VoiceSink(_AudioSinkBase):
                 self.is_processing[user_id] = False
                 return
 
-            # Transcribe
-            result = await asyncio.to_thread(transcribe_audio, tmp_path)
+            # Get the transcription function (lazy-loaded)
+            transcribe_fn = _get_transcribe_fn()
+
+            # Transcribe (run in thread to avoid blocking the event loop)
+            result = await asyncio.to_thread(transcribe_fn, tmp_path)
 
             if not result.get("success"):
                 error_detail = result.get("error", "unknown")
@@ -261,18 +337,25 @@ class VoiceSink(_AudioSinkBase):
 
             text = (result.get("transcript") or "").strip()
             if len(text) <= 1:
-                await self._send_debug_message(f"🔇 Audio from <@{user_id}> was processed but no clear speech was found.")
+                await self._send_debug_message(
+                    f"🔇 Audio from <@{user_id}> was processed but no clear speech was found."
+                )
                 self.is_processing[user_id] = False
                 return
 
             # Send visible confirmation
-            await self._send_debug_message(f"🗣️ **Heard from** <@{user_id}>: \"{text}\"\n_Processing response..._")
+            await self._send_debug_message(
+                f"🗣️ **Heard from** <@{user_id}>: \"{text}\"\n_Processing response..._"
+            )
 
             # Resolve the Discord user and channel objects
             user_obj = self.adapter._client.get_user(user_id)
             if user_obj is None:
-                user_obj = await self.adapter._client.fetch_user(user_id)
-            
+                try:
+                    user_obj = await self.adapter._client.fetch_user(user_id)
+                except Exception:
+                    pass
+
             user_display = user_obj.display_name if user_obj else str(user_id)
             home_channel_id = os.getenv("DISCORD_HOME_CHANNEL", self.channel_id)
 
@@ -299,7 +382,10 @@ class VoiceSink(_AudioSinkBase):
             # Show typing indicator while the agent processes the voice input
             reply_channel = self.adapter._client.get_channel(int(home_channel_id))
             if reply_channel:
-                async with reply_channel.typing():
+                try:
+                    async with reply_channel.typing():
+                        await self.adapter.handle_message(event)
+                except Exception:
                     await self.adapter.handle_message(event)
             else:
                 await self.adapter.handle_message(event)

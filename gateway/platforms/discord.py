@@ -385,7 +385,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice state
         self._voice_client: Optional[discord.VoiceClient] = None
         self._voice_sink: Optional[Any] = None
-        self._voice_enabled = os.getenv("ELEVENLABS_API_KEY") is not None
+        # Voice is enabled if EITHER TTS key (for speaking) OR STT key (for listening) is set.
+        # Previously this was gated only on ELEVENLABS_API_KEY, which blocked voice receive
+        # when only VOICE_TOOLS_OPENAI_KEY was configured.
+        self._voice_tts_enabled = os.getenv("ELEVENLABS_API_KEY") is not None
+        self._voice_stt_enabled = os.getenv("VOICE_TOOLS_OPENAI_KEY") is not None
+        self._voice_enabled = self._voice_tts_enabled or self._voice_stt_enabled
         self._voice_auto_join = os.getenv("DISCORD_VOICE_AUTO_JOIN", "false").lower() == "true"
         self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
         self._voice_queue = asyncio.Queue()
@@ -479,7 +484,17 @@ class DiscordAdapter(BasePlatformAdapter):
                                         try:
                                             home_ch = adapter_self._client.get_channel(int(home_ch_id))
                                             if home_ch:
-                                                await home_ch.send(f"🎙️ **Voice receiving active** — joined **{channel.name}** with `discord-ext-voice-recv`. I can hear you now! Speak in the voice channel and I'll transcribe + respond.")
+                                                status_parts = []
+                                                if adapter_self._voice_stt_enabled:
+                                                    status_parts.append("🎧 Listening (Whisper STT)")
+                                                else:
+                                                    status_parts.append("⚠️ Cannot listen (VOICE_TOOLS_OPENAI_KEY not set)")
+                                                if adapter_self._voice_tts_enabled:
+                                                    status_parts.append("🔊 Speaking (ElevenLabs TTS)")
+                                                else:
+                                                    status_parts.append("⚠️ Cannot speak (ELEVENLABS_API_KEY not set)")
+                                                status_str = " | ".join(status_parts)
+                                                await home_ch.send(f"🎙️ **Voice active** — joined **{channel.name}**\n{status_str}")
                                         except Exception:
                                             pass
                                 else:
@@ -849,9 +864,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 message_ids.append(str(msg.id))
             
-            # ── VOICE STREAMING ──
-            # If we are in a voice channel, stream the sanitized content
-            if self._voice_client and self._voice_client.is_connected() and self._voice_enabled:
+            # ── VOICE STREAMING (TTS) ──
+            # If we are in a voice channel AND TTS is configured, stream the sanitized content
+            if self._voice_client and self._voice_client.is_connected() and self._voice_tts_enabled:
                 if not _has_ffmpeg():
                     logger.warning("[%s] FFmpeg not found. Voice streaming skipped.", self.name)
                 else:
@@ -1455,7 +1470,10 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         async def slash_join(interaction: discord.Interaction, channel: str = None):
             if not self._voice_enabled:
-                await interaction.response.send_message("Voice is not enabled (ELEVENLABS_API_KEY missing)~", ephemeral=True)
+                await interaction.response.send_message(
+                    "Voice is not enabled. Set ELEVENLABS_API_KEY (for TTS) or VOICE_TOOLS_OPENAI_KEY (for STT) to enable voice features.",
+                    ephemeral=True
+                )
                 return
             
             target_channel = None
@@ -1641,7 +1659,9 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.append("**Voice Pipeline Diagnostic Status**")
             lines.append(f"")
             lines.append(f"VOICE_RECV_AVAILABLE: `{VOICE_RECV_AVAILABLE}`")
-            lines.append(f"Voice enabled (ElevenLabs key set): `{self._voice_enabled}`")
+            lines.append(f"Voice enabled (any voice key set): `{self._voice_enabled}`")
+            lines.append(f"Voice TTS enabled (ElevenLabs): `{self._voice_tts_enabled}`")
+            lines.append(f"Voice STT enabled (Whisper): `{self._voice_stt_enabled}`")
             lines.append(f"Voice auto-join: `{self._voice_auto_join}`")
             lines.append(f"Voice channel ID: `{self._voice_channel_id}`")
             lines.append(f"")
