@@ -1687,6 +1687,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 lines.append(f"Sink packet count: `{self._voice_sink._packet_count}`")
                 lines.append(f"Sink first packet logged: `{self._voice_sink._first_packet_logged}`")
                 lines.append(f"Sink running: `{self._voice_sink._running}`")
+                lines.append(f"Sink write errors: `{self._voice_sink._write_errors}`")
+                lines.append(f"Sink last error: `{self._voice_sink._last_error or 'none'}`")
+                lines.append(f"Sink event loop: `{self._voice_sink._loop is not None}`")
                 lines.append(f"Sink audio buffers: `{len(self._voice_sink.audio_data)}` users")
                 for uid, buf in self._voice_sink.audio_data.items():
                     lines.append(f"  - User `{uid}`: `{len(buf)}` bytes buffered")

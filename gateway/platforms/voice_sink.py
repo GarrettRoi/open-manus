@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import time
+import traceback
 import wave
 import tempfile
 from typing import Dict, Optional
@@ -95,6 +96,7 @@ class VoiceSink(_AudioSinkBase):
         # Background monitor handle
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._stopped_intentionally = False  # Track if stop() was called by us vs cleanup
 
         # Allowed users (empty string = allow everyone who isn't a bot)
         self._allowed_users_raw = os.getenv("DISCORD_ALLOWED_USERS", "").strip()
@@ -106,6 +108,10 @@ class VoiceSink(_AudioSinkBase):
         # Trace logging: periodically report packet counts per user to Discord
         self._last_debug_report = 0
         self._user_packet_counts: Dict[int, int] = {}
+
+        # Error tracking
+        self._write_errors = 0
+        self._last_error = ""
 
         # Event loop reference (write() is called from a non-async thread)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -124,30 +130,52 @@ class VoiceSink(_AudioSinkBase):
     def write(self, user, data):
         """Called by discord-ext-voice-recv for every decoded audio packet.
 
-        IMPORTANT: This method is called from a background thread (the sink
-        router thread), NOT from the asyncio event loop.  Any async operations
-        must be scheduled via call_soon_threadsafe / run_coroutine_threadsafe.
+        CRITICAL: This method is called from the PacketRouter thread.
+        If ANY exception propagates out of this method, the PacketRouter
+        thread dies, which triggers stop_listening() -> cleanup() -> stop(),
+        killing the entire voice pipeline. Therefore we MUST catch all
+        exceptions here.
         """
+        try:
+            self._write_impl(user, data)
+        except Exception as e:
+            # NEVER let an exception escape write() — it would kill the router thread
+            self._write_errors += 1
+            self._last_error = f"{type(e).__name__}: {e}"
+            if self._write_errors <= 5:
+                logger.error("[VoiceSink] Exception in write() (error #%d): %s",
+                             self._write_errors, e, exc_info=True)
+            elif self._write_errors == 6:
+                logger.error("[VoiceSink] Suppressing further write() error logs (too many errors)")
+
+    def _write_impl(self, user, data):
+        """Actual write implementation, separated so we can wrap it in try/except."""
         self._packet_count += 1
 
         # Aggressive debug: log every 500 packets to console
         if self._packet_count % 500 == 0:
-            logger.debug("[VoiceSink] Received %d total packets", self._packet_count)
+            logger.info("[VoiceSink] Received %d total packets (%d errors so far)",
+                        self._packet_count, self._write_errors)
 
-        if user:
-            self._user_packet_counts[user.id] = self._user_packet_counts.get(user.id, 0) + 1
+        if user is not None:
+            user_id_val = getattr(user, 'id', None)
+            if user_id_val is not None:
+                self._user_packet_counts[user_id_val] = self._user_packet_counts.get(user_id_val, 0) + 1
 
         # Log the very first packet so we know the pipeline is alive
         if not self._first_packet_logged:
             self._first_packet_logged = True
             user_info = f"user={user} (id={getattr(user, 'id', '?')})" if user else "user=None"
             # Access PCM data from VoiceData object
-            pcm_data = data.pcm if hasattr(data, 'pcm') else data
+            pcm_data = getattr(data, 'pcm', None)
+            if pcm_data is None:
+                pcm_data = data if isinstance(data, (bytes, bytearray)) else b""
             pcm_len = len(pcm_data) if isinstance(pcm_data, (bytes, bytearray)) else 'UNKNOWN'
 
-            logger.info("[VoiceSink] *** FIRST AUDIO PACKET RECEIVED *** %s, pcm_bytes=%s", user_info, pcm_len)
+            logger.info("[VoiceSink] *** FIRST AUDIO PACKET *** %s, pcm_bytes=%s, data_type=%s",
+                        user_info, pcm_len, type(data).__name__)
             self._schedule_async(self._send_debug_message(
-                "📡 **Audio Stream Active**: Bot is now receiving audio packets from Discord!"
+                f"📡 **Audio Stream Active**: Receiving audio packets! First packet: {user_info}, {pcm_len} bytes"
             ))
 
         if user is None:
@@ -156,8 +184,13 @@ class VoiceSink(_AudioSinkBase):
         # Filter: ignore bots
         if getattr(user, "bot", False):
             return
-        if self.adapter._client and self.adapter._client.user and user.id == self.adapter._client.user.id:
-            return
+
+        # Filter: ignore self
+        try:
+            if self.adapter._client and self.adapter._client.user and user.id == self.adapter._client.user.id:
+                return
+        except Exception:
+            pass
 
         # If DISCORD_ALLOWED_USERS is set, enforce the allow-list
         if self._allowed_users_raw:
@@ -169,23 +202,43 @@ class VoiceSink(_AudioSinkBase):
         if user_id not in self.audio_data:
             self.audio_data[user_id] = bytearray()
             self.is_processing[user_id] = False
-            logger.info("[VoiceSink] New speaker detected: %s (id=%s)", user.display_name, user_id)
+            logger.info("[VoiceSink] New speaker detected: %s (id=%s)", getattr(user, 'display_name', user_id), user_id)
             self._schedule_async(self._send_debug_message(
-                f"👤 **Speaker Detected**: Bot sees audio from <@{user_id}>"
+                f"👤 **Speaker Detected**: Receiving audio from <@{user_id}>"
             ))
 
         # Don't append while we are transcribing the previous chunk
         if not self.is_processing.get(user_id, False):
             # Extract PCM bytes from VoiceData object
-            pcm_data = data.pcm if hasattr(data, 'pcm') else data
-            if isinstance(pcm_data, (bytes, bytearray)):
+            pcm_data = getattr(data, 'pcm', None)
+            if pcm_data is None:
+                pcm_data = data if isinstance(data, (bytes, bytearray)) else b""
+            if isinstance(pcm_data, (bytes, bytearray)) and len(pcm_data) > 0:
                 self.audio_data[user_id].extend(pcm_data)
                 self.last_activity[user_id] = time.time()
 
     def cleanup(self):
-        """Called by the library when listening stops."""
-        self.stop()
-        logger.info("[VoiceSink] cleanup called — total packets received: %d", self._packet_count)
+        """Called by the library when listening stops.
+        
+        NOTE: This can be called by the library's __del__ or when the
+        PacketRouter dies. We only want to fully stop if WE initiated it.
+        """
+        logger.info("[VoiceSink] cleanup() called — packets=%d, errors=%d, last_error='%s', intentional=%s",
+                    self._packet_count, self._write_errors, self._last_error, self._stopped_intentionally)
+        if not self._stopped_intentionally:
+            # The library called cleanup on us (router died or GC collected something)
+            # Log this prominently so we can debug
+            logger.warning("[VoiceSink] cleanup() called unexpectedly (not by our stop()). "
+                          "This usually means the PacketRouter thread died.")
+            self._schedule_async(self._send_debug_message(
+                f"⚠️ **Voice sink cleanup triggered unexpectedly!** "
+                f"Packets received: {self._packet_count}, Errors: {self._write_errors}, "
+                f"Last error: `{self._last_error or 'none'}`"
+            ))
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            self._task = None
 
     # ------------------------------------------------------------------
     # Thread-safe async scheduling
@@ -198,7 +251,8 @@ class VoiceSink(_AudioSinkBase):
             return
         try:
             asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError:
+        except Exception:
+            # Catch ALL exceptions, not just RuntimeError
             pass
 
     # ------------------------------------------------------------------
@@ -210,16 +264,19 @@ class VoiceSink(_AudioSinkBase):
         if self._running:
             return
         self._running = True
+        self._stopped_intentionally = False
         # Capture the current event loop for thread-safe scheduling
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = asyncio.get_event_loop()
         self._task = asyncio.create_task(self._monitor_silence())
-        logger.info("[VoiceSink] Background silence monitor STARTED for channel %s", self.channel_id)
+        logger.info("[VoiceSink] Background silence monitor STARTED for channel %s (loop=%s)",
+                    self.channel_id, self._loop)
 
     def stop(self):
         """Stop the background task and clear buffers."""
+        self._stopped_intentionally = True
         self._running = False
         if self._task:
             self._task.cancel()
@@ -232,36 +289,43 @@ class VoiceSink(_AudioSinkBase):
     async def _monitor_silence(self):
         """Periodically check for users who have stopped speaking."""
         logger.info("[VoiceSink] Silence monitor loop running...")
-        while self._running:
-            try:
-                await asyncio.sleep(0.3)
-                now = time.time()
+        try:
+            while self._running:
+                try:
+                    await asyncio.sleep(0.3)
+                    now = time.time()
 
-                # Every 10 seconds, if we have seen packets but no transcription, report status
-                if now - self._last_debug_report > 10.0 and self._packet_count > 0:
-                    self._last_debug_report = now
-                    report = f"📊 **Voice Traffic**: {self._packet_count} total packets."
-                    has_data = False
-                    for uid, count in self._user_packet_counts.items():
-                        buf_len = len(self.audio_data.get(uid, b""))
-                        if count > 0 or buf_len > 0:
-                            report += f"\n- <@{uid}>: {count} packets, {buf_len} bytes buffered."
-                            has_data = True
-                    if has_data:
-                        await self._send_debug_message(report)
+                    # Every 10 seconds, if we have seen packets but no transcription, report status
+                    if now - self._last_debug_report > 10.0 and self._packet_count > 0:
+                        self._last_debug_report = now
+                        report = (f"📊 **Voice Traffic**: {self._packet_count} total packets, "
+                                  f"{self._write_errors} errors.")
+                        has_data = False
+                        for uid, count in list(self._user_packet_counts.items()):
+                            buf_len = len(self.audio_data.get(uid, b""))
+                            if count > 0 or buf_len > 0:
+                                report += f"\n- <@{uid}>: {count} packets, {buf_len} bytes buffered."
+                                has_data = True
+                        if has_data:
+                            await self._send_debug_message(report)
 
-                for user_id, last_time in list(self.last_activity.items()):
-                    buf = self.audio_data.get(user_id, b"")
-                    silence_duration = now - last_time
-                    if silence_duration > self.silence_threshold and len(buf) > 0:
-                        if not self.is_processing.get(user_id, False):
-                            logger.info("[VoiceSink] Silence detected for user %s (%.1fs silence, %d bytes buffered) — triggering transcription",
-                                        user_id, silence_duration, len(buf))
-                            asyncio.create_task(self._process_user_audio(user_id))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("[VoiceSink] Error in silence monitor: %s", e, exc_info=True)
+                    for user_id, last_time in list(self.last_activity.items()):
+                        buf = self.audio_data.get(user_id, b"")
+                        silence_duration = now - last_time
+                        if silence_duration > self.silence_threshold and len(buf) > 0:
+                            if not self.is_processing.get(user_id, False):
+                                logger.info("[VoiceSink] Silence detected for user %s (%.1fs silence, %d bytes buffered) — triggering transcription",
+                                            user_id, silence_duration, len(buf))
+                                asyncio.create_task(self._process_user_audio(user_id))
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("[VoiceSink] Error in silence monitor: %s", e, exc_info=True)
+                    await asyncio.sleep(1)  # Back off on error
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.info("[VoiceSink] Silence monitor loop EXITED (running=%s)", self._running)
 
     # ------------------------------------------------------------------
     # Transcription + agent dispatch
@@ -275,7 +339,10 @@ class VoiceSink(_AudioSinkBase):
                 return
             channel = self.adapter._client.get_channel(int(home_channel_id))
             if not channel:
-                channel = await self.adapter._client.fetch_channel(int(home_channel_id))
+                try:
+                    channel = await self.adapter._client.fetch_channel(int(home_channel_id))
+                except Exception:
+                    return
             if channel:
                 await channel.send(text)
         except Exception as e:
