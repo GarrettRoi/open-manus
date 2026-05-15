@@ -58,6 +58,9 @@ SHARED_VARS = {
     # Discord (for notifications only, not agent-to-agent chat)
     "DISCORD_BOT_API": os.environ.get("DISCORD_BOT_API", ""),
     
+    # Voice: auto-join/leave when users enter/exit the agent's designated channel
+    "DISCORD_VOICE_AUTO_JOIN": "true",
+    
     # Google Drive (shared access)
     "GDRIVE_ACCOUNT": "vowsok@gmail.com",
     
@@ -187,6 +190,8 @@ AGENT_VARS = {
             {"name": "McGarry Homes", "email": "garrett@mcgarryhomes.com", "type": "hostinger"},
         ]),
         "HOSTINGER_EMAIL": "garrett@mcgarryhomes.com",
+        # Voice: Set to the Discord voice channel ID named "Valentina"
+        "DISCORD_VOICE_CHANNEL_ID": "",  # TODO: Set to Valentina's voice channel ID
     },
     
     "addison": {
@@ -205,6 +210,8 @@ AGENT_VARS = {
         "AGENT_CAPABILITIES": "task_routing,agent_coordination,priority_management,escalation",
         "IS_ORCHESTRATOR": "true",
         "ALL_AGENT_IDS": json.dumps(AGENT_SERVICES),
+        # Voice: Set to the Discord voice channel ID named "Harmony"
+        "DISCORD_VOICE_CHANNEL_ID": "",  # TODO: Set to Harmony's voice channel ID
         "RAILWAY_ACCOUNT_API": os.environ.get("RAILWAY_ACCOUNT_API", ""),
     },
 }

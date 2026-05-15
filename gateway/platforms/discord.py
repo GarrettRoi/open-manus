@@ -783,7 +783,145 @@ class DiscordAdapter(BasePlatformAdapter):
                     await message.add_reaction(done_emoji)
                 except Exception:
                     pass
-            
+
+            # ── Voice State Update: Auto-join/leave when users enter/leave the designated channel ──
+            @self._client.event
+            async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+                """Auto-join when a user enters the agent's designated voice channel,
+                and auto-leave when the last non-bot user leaves."""
+                # Gate: only active if auto-join is enabled and a channel is designated
+                if not adapter_self._voice_auto_join:
+                    return
+                if not adapter_self._voice_channel_id:
+                    return
+                # Gate: voice must be enabled (at least STT or TTS key set)
+                if not adapter_self._voice_enabled:
+                    return
+                # Ignore our own voice state changes
+                if adapter_self._client.user and member.id == adapter_self._client.user.id:
+                    return
+                # Ignore other bots
+                if member.bot:
+                    return
+
+                designated_channel_id = int(adapter_self._voice_channel_id)
+                joined_designated = (
+                    after.channel is not None
+                    and after.channel.id == designated_channel_id
+                    and (before.channel is None or before.channel.id != designated_channel_id)
+                )
+                left_designated = (
+                    before.channel is not None
+                    and before.channel.id == designated_channel_id
+                    and (after.channel is None or after.channel.id != designated_channel_id)
+                )
+
+                if joined_designated:
+                    # A user joined our designated channel — auto-join if not already connected
+                    if adapter_self._voice_client and adapter_self._voice_client.is_connected():
+                        # Already in a voice channel
+                        if adapter_self._voice_client.channel and adapter_self._voice_client.channel.id == designated_channel_id:
+                            return  # Already in the right channel
+                        # In a different channel — move to the designated one
+                        try:
+                            await adapter_self._voice_client.move_to(after.channel)
+                            logger.info("[%s] Auto-moved to designated voice channel %s (user %s joined)",
+                                        adapter_self.name, after.channel.name, member.display_name)
+                        except Exception as e:
+                            logger.error("[%s] Failed to auto-move to voice channel: %s", adapter_self.name, e)
+                            return
+                    else:
+                        # Not connected — join the channel
+                        try:
+                            target_channel = after.channel
+                            if VOICE_RECV_AVAILABLE:
+                                adapter_self._voice_client = await target_channel.connect(cls=voice_recv.VoiceRecvClient)
+                            else:
+                                adapter_self._voice_client = await target_channel.connect()
+                            logger.info("[%s] Auto-joined designated voice channel %s (user %s joined)",
+                                        adapter_self.name, target_channel.name, member.display_name)
+                        except Exception as e:
+                            logger.error("[%s] Failed to auto-join voice channel: %s", adapter_self.name, e)
+                            return
+
+                    # Set up voice sink and keepalive
+                    try:
+                        if adapter_self._voice_sink:
+                            adapter_self._voice_sink.stop()
+                            adapter_self._voice_sink = None
+                        if VOICE_RECV_AVAILABLE:
+                            from gateway.platforms.voice_sink import VoiceSink
+                            adapter_self._voice_sink = VoiceSink(adapter_self, str(designated_channel_id))
+                            adapter_self._voice_client.listen(adapter_self._voice_sink)
+                            adapter_self._voice_sink.start()
+                        if adapter_self._voice_keepalive_task:
+                            adapter_self._voice_keepalive_task.cancel()
+                        adapter_self._voice_keepalive_task = asyncio.create_task(adapter_self._voice_keepalive())
+                    except Exception as e:
+                        logger.error("[%s] Failed to set up voice sink after auto-join: %s", adapter_self.name, e)
+
+                    # Send notification to home channel
+                    home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                    if home_ch_id:
+                        try:
+                            home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                            if home_ch:
+                                status_parts = []
+                                if adapter_self._voice_stt_enabled:
+                                    status_parts.append("\U0001f3a7 Listening (Whisper STT)")
+                                if adapter_self._voice_tts_enabled:
+                                    status_parts.append("\U0001f50a Speaking (ElevenLabs TTS)")
+                                status_str = " | ".join(status_parts) if status_parts else "Voice connected"
+                                await home_ch.send(
+                                    f"\U0001f3a4 **Auto-joined voice** — {member.display_name} entered **{after.channel.name}**\n{status_str}"
+                                )
+                        except Exception:
+                            pass
+
+                elif left_designated:
+                    # A user left our designated channel — check if we should leave too
+                    if not adapter_self._voice_client or not adapter_self._voice_client.is_connected():
+                        return
+                    if not adapter_self._voice_client.channel:
+                        return
+                    if adapter_self._voice_client.channel.id != designated_channel_id:
+                        return
+
+                    # Count remaining non-bot members in the channel
+                    channel = before.channel  # The channel they left
+                    non_bot_members = [
+                        m for m in channel.members
+                        if not m.bot and m.id != (adapter_self._client.user.id if adapter_self._client.user else 0)
+                    ]
+
+                    if len(non_bot_members) == 0:
+                        # No non-bot users left — auto-leave
+                        logger.info("[%s] All users left designated voice channel %s — auto-leaving",
+                                    adapter_self.name, channel.name)
+                        try:
+                            if adapter_self._voice_keepalive_task:
+                                adapter_self._voice_keepalive_task.cancel()
+                                adapter_self._voice_keepalive_task = None
+                            if adapter_self._voice_sink:
+                                adapter_self._voice_sink.stop()
+                                adapter_self._voice_sink = None
+                            await adapter_self._voice_client.disconnect()
+                            adapter_self._voice_client = None
+                        except Exception as e:
+                            logger.error("[%s] Failed to auto-leave voice channel: %s", adapter_self.name, e)
+
+                        # Send notification to home channel
+                        home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                        if home_ch_id:
+                            try:
+                                home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                                if home_ch:
+                                    await home_ch.send(
+                                        f"\U0001f44b **Auto-left voice** — all users left **{channel.name}**"
+                                    )
+                            except Exception:
+                                pass
+
             # Register slash commands
             self._register_slash_commands()
             
@@ -1662,8 +1800,8 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.append(f"Voice enabled (any voice key set): `{self._voice_enabled}`")
             lines.append(f"Voice TTS enabled (ElevenLabs): `{self._voice_tts_enabled}`")
             lines.append(f"Voice STT enabled (Whisper): `{self._voice_stt_enabled}`")
-            lines.append(f"Voice auto-join: `{self._voice_auto_join}`")
-            lines.append(f"Voice channel ID: `{self._voice_channel_id}`")
+            lines.append(f"Voice auto-join (follow user): `{self._voice_auto_join}`")
+            lines.append(f"Designated voice channel ID: `{self._voice_channel_id or 'not set'}`")
             lines.append(f"")
 
             if self._voice_client:
