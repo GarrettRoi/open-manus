@@ -564,6 +564,62 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.warning("[%s] Failed to send startup notification: %s", adapter_self.name, e)
             
             @self._client.event
+            async def on_voice_state_update(member, before, after):
+                """Automatically join designated voice channel when an authorized user joins it."""
+                if not adapter_self._voice_enabled or not adapter_self._voice_channel_id:
+                    return
+                
+                # We only care if someone joined a channel
+                if not after.channel or str(after.channel.id) != str(adapter_self._voice_channel_id):
+                    return
+                
+                # Ignore if it's the bot itself
+                if member.id == adapter_self._client.user.id:
+                    return
+                
+                # Check if we are already in the channel
+                if adapter_self._voice_client and adapter_self._voice_client.is_connected():
+                    if adapter_self._voice_client.channel.id == after.channel.id:
+                        return
+                
+                # Check if the user is authorized (owner or allowed users)
+                is_owner = str(member.id) == OWNER_USER_ID
+                is_allowed = str(member.id) in adapter_self._allowed_user_ids
+                
+                if is_owner or is_allowed:
+                    logger.info("[%s] Authorized user %s joined designated voice channel. Auto-joining...", adapter_self.name, member.display_name)
+                    try:
+                        if not _has_ffmpeg():
+                            logger.warning("[%s] FFmpeg not found. Voice auto-join skipped.", adapter_self.name)
+                            return
+                            
+                        if VOICE_RECV_AVAILABLE:
+                            from gateway.platforms.voice_sink import VoiceSink
+                            adapter_self._voice_client = await after.channel.connect(cls=voice_recv.VoiceRecvClient)
+                            adapter_self._voice_sink = VoiceSink(adapter_self, str(after.channel.id))
+                            adapter_self._voice_client.listen(adapter_self._voice_sink)
+                            adapter_self._voice_sink.start()
+                            if adapter_self._voice_keepalive_task:
+                                adapter_self._voice_keepalive_task.cancel()
+                            adapter_self._voice_keepalive_task = asyncio.create_task(adapter_self._voice_keepalive())
+                        else:
+                            adapter_self._voice_client = await after.channel.connect()
+                        
+                        logger.info("[%s] Successfully auto-joined voice channel %s", adapter_self.name, after.channel.name)
+                        
+                        # Send visible confirmation to home channel
+                        home_ch_id = os.getenv('DISCORD_HOME_CHANNEL', '')
+                        if home_ch_id:
+                            try:
+                                home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                                if home_ch:
+                                    await home_ch.send(f"🎙️ **Auto-joined voice** — detected authorized user in **{after.channel.name}**.")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.error("[%s] Voice auto-join on state update failed: %s", adapter_self.name, e)
+
+            @self._client.event
             async def on_message(message: DiscordMessage):
                 # Always ignore our own messages
                 if message.author == self._client.user:
