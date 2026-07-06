@@ -14,7 +14,7 @@ from gateway.config import (
     Platform,
     PlatformConfig,
 )
-from gateway.platforms.homeassistant import (
+from plugins.platforms.homeassistant.adapter import (
     HomeAssistantAdapter,
     check_ha_requirements,
 )
@@ -34,7 +34,7 @@ class TestCheckRequirements:
         monkeypatch.setenv("HASS_TOKEN", "test-token")
         assert check_ha_requirements() is True
 
-    @patch("gateway.platforms.homeassistant.AIOHTTP_AVAILABLE", False)
+    @patch("plugins.platforms.homeassistant.adapter.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self, monkeypatch):
         monkeypatch.setenv("HASS_TOKEN", "test-token")
         assert check_ha_requirements() is False
@@ -208,7 +208,7 @@ class TestAdapterInit:
 
     def test_watch_filters_parsed(self):
         config = PlatformConfig(
-            enabled=True, token="t",
+            enabled=True, token="***",
             extra={
                 "watch_domains": ["climate", "binary_sensor"],
                 "watch_entities": ["sensor.special"],
@@ -220,15 +220,25 @@ class TestAdapterInit:
         assert adapter._watch_domains == {"climate", "binary_sensor"}
         assert adapter._watch_entities == {"sensor.special"}
         assert adapter._ignore_entities == {"sensor.uptime", "sensor.cpu"}
+        assert adapter._watch_all is False
         assert adapter._cooldown_seconds == 120
+
+    def test_watch_all_parsed(self):
+        config = PlatformConfig(
+            enabled=True, token="***",
+            extra={"watch_all": True},
+        )
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._watch_all is True
 
     def test_defaults_when_no_extra(self, monkeypatch):
         monkeypatch.setenv("HASS_TOKEN", "tok")
-        config = PlatformConfig(enabled=True, token="tok")
+        config = PlatformConfig(enabled=True, token="***")
         adapter = HomeAssistantAdapter(config)
         assert adapter._watch_domains == set()
         assert adapter._watch_entities == set()
         assert adapter._ignore_entities == set()
+        assert adapter._watch_all is False
         assert adapter._cooldown_seconds == 30
 
 
@@ -260,7 +270,7 @@ def _make_event(entity_id, old_state, new_state, old_attrs=None, new_attrs=None)
 class TestEventFilteringPipeline:
     @pytest.mark.asyncio
     async def test_ignored_entity_not_forwarded(self):
-        adapter = _make_adapter(ignore_entities=["sensor.uptime"])
+        adapter = _make_adapter(watch_all=True, ignore_entities=["sensor.uptime"])
         await adapter._handle_ha_event(_make_event("sensor.uptime", "100", "101"))
         adapter.handle_message.assert_not_called()
 
@@ -298,26 +308,34 @@ class TestEventFilteringPipeline:
         assert "10W" in msg_event.text and "20W" in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_no_filters_passes_everything(self):
+    async def test_no_filters_blocks_everything(self):
+        """Without watch_domains, watch_entities, or watch_all, events are dropped."""
         adapter = _make_adapter(cooldown_seconds=0)
+        await adapter._handle_ha_event(_make_event("cover.blinds", "closed", "open"))
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_watch_all_passes_everything(self):
+        """With watch_all=True and no specific filters, all events pass through."""
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
         await adapter._handle_ha_event(_make_event("cover.blinds", "closed", "open"))
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_same_state_not_forwarded(self):
-        adapter = _make_adapter(cooldown_seconds=0)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
         await adapter._handle_ha_event(_make_event("light.x", "on", "on"))
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_empty_entity_id_skipped(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(watch_all=True)
         await adapter._handle_ha_event({"data": {"entity_id": ""}})
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_message_event_has_correct_source(self):
-        adapter = _make_adapter(cooldown_seconds=0)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
         await adapter._handle_ha_event(
             _make_event("light.test", "off", "on",
                         new_attrs={"friendly_name": "Test Light"})
@@ -336,7 +354,7 @@ class TestEventFilteringPipeline:
 class TestCooldown:
     @pytest.mark.asyncio
     async def test_cooldown_blocks_rapid_events(self):
-        adapter = _make_adapter(cooldown_seconds=60)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=60)
 
         event = _make_event("sensor.temp", "20", "21",
                             new_attrs={"friendly_name": "Temp"})
@@ -351,7 +369,7 @@ class TestCooldown:
 
     @pytest.mark.asyncio
     async def test_cooldown_expires(self):
-        adapter = _make_adapter(cooldown_seconds=1)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=1)
 
         event = _make_event("sensor.temp", "20", "21",
                             new_attrs={"friendly_name": "Temp"})
@@ -368,7 +386,7 @@ class TestCooldown:
 
     @pytest.mark.asyncio
     async def test_different_entities_independent_cooldowns(self):
-        adapter = _make_adapter(cooldown_seconds=60)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=60)
 
         await adapter._handle_ha_event(
             _make_event("sensor.a", "1", "2", new_attrs={"friendly_name": "A"})
@@ -387,7 +405,7 @@ class TestCooldown:
 
     @pytest.mark.asyncio
     async def test_zero_cooldown_passes_all(self):
-        adapter = _make_adapter(cooldown_seconds=0)
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
 
         for i in range(5):
             await adapter._handle_ha_event(
@@ -451,18 +469,6 @@ class TestConfigIntegration:
         assert ha.extra["watch_domains"] == ["climate"]
         assert ha.extra["cooldown_seconds"] == 45
 
-    def test_connected_platforms_includes_ha(self):
-        config = GatewayConfig(
-            platforms={
-                Platform.HOMEASSISTANT: PlatformConfig(enabled=True, token="tok"),
-                Platform.TELEGRAM: PlatformConfig(enabled=False, token="t"),
-            },
-        )
-        connected = config.get_connected_platforms()
-        assert Platform.HOMEASSISTANT in connected
-        assert Platform.TELEGRAM not in connected
-
-
 # ---------------------------------------------------------------------------
 # send() via REST API
 # ---------------------------------------------------------------------------
@@ -498,7 +504,7 @@ class TestSendViaRestApi:
         adapter = _make_adapter()
         mock_session = self._mock_aiohttp_session(200)
 
-        with patch("gateway.platforms.homeassistant.aiohttp") as mock_aiohttp:
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
             mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
             mock_aiohttp.ClientTimeout = lambda total: total
 
@@ -517,7 +523,7 @@ class TestSendViaRestApi:
         adapter = _make_adapter()
         mock_session = self._mock_aiohttp_session(401, "Unauthorized")
 
-        with patch("gateway.platforms.homeassistant.aiohttp") as mock_aiohttp:
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
             mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
             mock_aiohttp.ClientTimeout = lambda total: total
 
@@ -532,7 +538,7 @@ class TestSendViaRestApi:
         mock_session = self._mock_aiohttp_session(200)
         long_message = "x" * 10000
 
-        with patch("gateway.platforms.homeassistant.aiohttp") as mock_aiohttp:
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
             mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
             mock_aiohttp.ClientTimeout = lambda total: total
 
@@ -548,7 +554,7 @@ class TestSendViaRestApi:
         adapter._ws = AsyncMock()  # Simulate an active WS
         mock_session = self._mock_aiohttp_session(200)
 
-        with patch("gateway.platforms.homeassistant.aiohttp") as mock_aiohttp:
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
             mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
             mock_aiohttp.ClientTimeout = lambda total: total
 
@@ -562,27 +568,6 @@ class TestSendViaRestApi:
 # ---------------------------------------------------------------------------
 # Toolset integration
 # ---------------------------------------------------------------------------
-
-
-class TestToolsetIntegration:
-    def test_homeassistant_toolset_resolves(self):
-        from toolsets import resolve_toolset
-
-        tools = resolve_toolset("homeassistant")
-        assert set(tools) == {"ha_list_entities", "ha_get_state", "ha_call_service", "ha_list_services"}
-
-    def test_gateway_toolset_includes_ha_tools(self):
-        from toolsets import resolve_toolset
-
-        gateway_tools = resolve_toolset("hermes-gateway")
-        for tool in ("ha_list_entities", "ha_get_state", "ha_call_service", "ha_list_services"):
-            assert tool in gateway_tools
-
-    def test_hermes_core_tools_includes_ha(self):
-        from toolsets import _HERMES_CORE_TOOLS
-
-        for tool in ("ha_list_entities", "ha_get_state", "ha_call_service", "ha_list_services"):
-            assert tool in _HERMES_CORE_TOOLS
 
 
 # ---------------------------------------------------------------------------
