@@ -1,5 +1,5 @@
 ---
-sidebar_position: 3
+sidebar_position: 4
 title: "Tutorial: Team Telegram Assistant"
 description: "Step-by-step guide to setting up a Telegram bot that your whole team can use for code help, research, system admin, and more"
 ---
@@ -24,7 +24,7 @@ A Telegram bot that:
 
 Before starting, make sure you have:
 
-- **Hermes Agent installed** on a server or VPS (not your laptop — the bot needs to stay running). Follow the [installation guide](/getting-started/learning-path) if you haven't yet.
+- **Hermes Agent installed** on a server or VPS (not your laptop — the bot needs to stay running). Follow the [installation guide](/getting-started/installation) if you haven't yet.
 - **A Telegram account** for yourself (the bot owner)
 - **An LLM provider configured** — at minimum, an API key for OpenAI, Anthropic, or another supported provider in `~/.hermes/.env`
 
@@ -143,12 +143,13 @@ For a persistent deployment that survives reboots:
 
 ```bash
 hermes gateway install
+sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
 
-This creates a **systemd** service (Linux) or **launchd** service (macOS) that runs automatically.
+This creates a background service: a user-level **systemd** service on Linux by default, a **launchd** service on macOS, or a boot-time Linux system service if you pass `--system`.
 
 ```bash
-# Linux — manage the service
+# Linux — manage the default user service
 hermes gateway start
 hermes gateway stop
 hermes gateway status
@@ -158,14 +159,23 @@ journalctl --user -u hermes-gateway -f
 
 # Keep running after SSH logout
 sudo loginctl enable-linger $USER
+
+# Linux servers — explicit system-service commands
+sudo hermes gateway start --system
+sudo hermes gateway status --system
+journalctl -u hermes-gateway -f
 ```
 
 ```bash
 # macOS — manage the service
-launchctl start ai.hermes.gateway
-launchctl stop ai.hermes.gateway
+hermes gateway start
+hermes gateway stop
 tail -f ~/.hermes/logs/gateway.log
 ```
+
+:::tip macOS PATH
+The launchd plist captures your shell PATH at install time so gateway subprocesses can find tools like Node.js and ffmpeg. If you install new tools later, re-run `hermes gateway install` to update the plist.
+:::
 
 ### Verify It's Running
 
@@ -279,7 +289,9 @@ Users can also change this per-session with the `/verbose` command in chat.
 
 ### Set Up a Personality with SOUL.md
 
-Customize how the bot communicates by creating `~/.hermes/SOUL.md`:
+Customize how the bot communicates by editing `~/.hermes/SOUL.md`:
+
+For a full guide, see [Use SOUL.md with Hermes](/guides/use-soul-with-hermes).
 
 ```markdown
 # Soul

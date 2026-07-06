@@ -10,25 +10,31 @@ Tools are functions that extend the agent's capabilities. They're organized into
 
 ## Available Tools
 
-| Category | Tools | Description |
-|----------|-------|-------------|
-| **Web** | `web_search`, `web_extract` | Search the web, extract page content |
-| **Terminal** | `terminal`, `process` | Execute commands (local/docker/singularity/modal/daytona/ssh backends), manage background processes |
-| **File** | `read_file`, `write_file`, `patch`, `search_files` | Read, write, edit, and search files |
-| **Browser** | `browser_navigate`, `browser_click`, `browser_type`, `browser_console`, etc. | Full browser automation via Browserbase |
-| **Vision** | `vision_analyze` | Image analysis via multimodal models |
-| **Image Gen** | `image_generate` | Generate images (FLUX via FAL) |
-| **TTS** | `text_to_speech` | Text-to-speech (Edge TTS / ElevenLabs / OpenAI) |
-| **Reasoning** | `mixture_of_agents` | Multi-model reasoning |
-| **Skills** | `skills_list`, `skill_view`, `skill_manage` | Find, view, create, and manage skills |
-| **Todo** | `todo` | Read/write task list for multi-step planning |
-| **Memory** | `memory` | Persistent notes + user profile across sessions |
-| **Session Search** | `session_search` | Search + summarize past conversations (FTS5) |
-| **Cronjob** | `schedule_cronjob`, `list_cronjobs`, `remove_cronjob` | Scheduled task management |
-| **Code Execution** | `execute_code` | Run Python scripts that call tools via RPC sandbox |
-| **Delegation** | `delegate_task` | Spawn subagents with isolated context |
-| **Clarify** | `clarify` | Ask the user multiple-choice or open-ended questions |
-| **MCP** | Auto-discovered | External tools from MCP servers |
+Hermes ships with a broad built-in tool registry covering web search, browser automation, terminal execution, file editing, memory, delegation, scheduled tasks, Home Assistant, and more.
+
+:::note
+**Honcho cross-session memory** is available as a memory provider plugin (`plugins/memory/honcho/`), not as a built-in toolset. See [Plugins](./plugins.md) for installation.
+:::
+
+High-level categories:
+
+| Category | Examples | Description |
+|----------|----------|-------------|
+| **Web** | `web_search`, `web_extract` | Search the web and extract page content. |
+| **X Search** | `x_search` | Search X (Twitter) posts and threads via xAI's built-in `x_search` Responses tool — gated on xAI credentials (SuperGrok OAuth or `XAI_API_KEY`); off by default, opt in via `hermes tools` → 🐦 X (Twitter) Search. |
+| **Terminal & Files** | `terminal`, `process`, `read_file`, `patch` | Execute commands and manipulate files. |
+| **Browser** | `browser_navigate`, `browser_snapshot`, `browser_vision` | Interactive browser automation with text and vision support. |
+| **Media** | `vision_analyze`, `image_generate`, `text_to_speech` | Multimodal analysis and generation. |
+| **Agent orchestration** | `todo`, `clarify`, `execute_code`, `delegate_task` | Planning, clarification, code execution, and subagent delegation. |
+| **Memory & recall** | `memory`, `session_search` | Persistent memory and session search. |
+| **Automation** | `cronjob` | Scheduled tasks with create/list/update/pause/resume/run/remove actions. Outbound delivery is handled by cron's own delivery, the `hermes send` CLI, and the gateway notifier — not by an agent-callable tool. |
+| **Integrations** | `ha_*`, MCP server tools | Home Assistant, MCP, and other integrations. |
+
+For the authoritative code-derived registry, see [Built-in Tools Reference](/reference/tools-reference) and [Toolsets Reference](/reference/toolsets-reference).
+
+:::tip Nous Tool Gateway
+Paid [Nous Portal](https://portal.nousresearch.com) subscribers can use web search, image generation, TTS, and browser automation through the **[Tool Gateway](tool-gateway.md)** — no separate API keys needed. Run `hermes model` to enable it, or configure individual tools with `hermes tools`.
+:::
 
 ## Using Toolsets
 
@@ -43,7 +49,9 @@ hermes tools
 hermes tools
 ```
 
-**Available toolsets:** `web`, `terminal`, `file`, `browser`, `vision`, `image_gen`, `moa`, `skills`, `tts`, `todo`, `memory`, `session_search`, `cronjob`, `code_execution`, `delegation`, `clarify`, and more.
+Common toolsets include `web`, `search`, `terminal`, `file`, `browser`, `vision`, `image_gen`, `skills`, `tts`, `todo`, `memory`, `session_search`, `cronjob`, `code_execution`, `delegation`, `clarify`, `homeassistant`, `messaging`, `spotify`, `discord`, `discord_admin`, `debugging`, and `safe`.
+
+See [Toolsets Reference](/reference/toolsets-reference) for the full set, including platform presets such as `hermes-cli`, `hermes-telegram`, and dynamic MCP toolsets like `mcp-<server>`.
 
 ## Terminal Backends
 
@@ -56,6 +64,7 @@ The terminal tool can execute commands in different environments:
 | `ssh` | Remote server | Sandboxing, keep agent away from its own code |
 | `singularity` | HPC containers | Cluster computing, rootless |
 | `modal` | Cloud execution | Serverless, scale |
+| `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 
 ### Configuration
 
@@ -74,6 +83,10 @@ terminal:
   backend: docker
   docker_image: python:3.11-slim
 ```
+
+**One persistent container, shared across the whole process.** Hermes starts a single long-lived container on first use (`docker run -d ... sleep 2h`) and routes every terminal, file, and `execute_code` call through `docker exec` into that same container. Working-directory changes, installed packages, environment tweaks, and files written to `/workspace` all carry over from one tool call to the next, across `/new`, `/reset`, and `delegate_task` subagents, for the lifetime of the Hermes process. The container is stopped and removed on shutdown.
+
+This means the Docker backend behaves like a persistent sandbox VM, not a fresh container per command. If you `pip install foo` once, it's there for the rest of the session. If you `cd /workspace/project`, subsequent `ls` calls see that directory. See [Configuration → Docker Backend](../configuration.md#docker-backend) for the full lifecycle details and the `container_persistent` flag that controls whether `/workspace` and `/root` survive across Hermes restarts.
 
 ### SSH Backend
 
@@ -104,7 +117,7 @@ hermes config set terminal.singularity_image ~/python.sif
 ### Modal (Serverless Cloud)
 
 ```bash
-uv pip install "swe-rex[modal]"
+uv pip install modal
 modal setup
 hermes config set terminal.backend modal
 ```
@@ -134,6 +147,8 @@ All container backends run with security hardening:
 - PID limits (256 processes)
 - Full namespace isolation
 - Persistent workspace via volumes, not writable root layer
+
+Docker can optionally receive an explicit env allowlist via `terminal.docker_forward_env`, but forwarded variables are visible to commands inside the container and should be treated as exposed to that session.
 
 ## Background Process Management
 
