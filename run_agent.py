@@ -78,6 +78,10 @@ from hermes_constants import OPENROUTER_BASE_URL, OPENROUTER_MODELS_URL
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE, TASK_COMPLETION_GUIDANCE,
+    PARALLEL_TOOL_CALL_GUIDANCE, TOOL_USE_ENFORCEMENT_GUIDANCE,
+    TOOL_USE_ENFORCEMENT_MODELS, OPENAI_MODEL_EXECUTION_GUIDANCE,
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
 )
 from agent.model_metadata import (
     fetch_model_metadata, get_model_context_length,
@@ -595,7 +599,26 @@ class AIAgent:
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
-        
+
+        # Model-family / universal behavioral guidance toggles.
+        # Read from the `agent` config section; all default to sensible values
+        # so existing deployments keep working without config changes.
+        #   agent.tool_use_enforcement   : "auto" | true | false | [substrings]
+        #   agent.task_completion_guidance : bool (default True)
+        #   agent.parallel_tool_call_guidance : bool (default True)
+        self._tool_use_enforcement = "auto"
+        self._task_completion_guidance = True
+        self._parallel_tool_call_guidance = True
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            _agent_cfg = _load_agent_config().get("agent", {})
+            if isinstance(_agent_cfg, dict):
+                self._tool_use_enforcement = _agent_cfg.get("tool_use_enforcement", "auto")
+                self._task_completion_guidance = bool(_agent_cfg.get("task_completion_guidance", True))
+                self._parallel_tool_call_guidance = bool(_agent_cfg.get("parallel_tool_call_guidance", True))
+        except Exception:
+            pass  # Guidance toggles are optional -- keep defaults on any error
+
         # Honcho AI-native memory (cross-session user modeling)
         # Reads ~/.honcho/config.json as the single source of truth.
         self._honcho = None  # HonchoSessionManager | None
@@ -1423,6 +1446,25 @@ class AIAgent:
         #   7. Platform-specific formatting hint
         prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
+        # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+        prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
+        # Universal task-completion / no-fabrication guidance. Applied to ALL
+        # models regardless of model family — the failure modes it targets
+        # (stopping after a stub; fabricating output when a real path is
+        # blocked) are not model-family specific. Only injected when tools are
+        # actually loaded; gated by config.yaml agent.task_completion_guidance
+        # (default True).
+        if getattr(self, "_task_completion_guidance", True) and self.valid_tool_names:
+            prompt_parts.append(TASK_COMPLETION_GUIDANCE)
+
+        # Universal parallel-tool-call guidance. Tells the model to batch
+        # independent tool calls into one assistant turn. Gated by config.yaml
+        # agent.parallel_tool_call_guidance (default True) and only injected
+        # when tools are actually loaded.
+        if getattr(self, "_parallel_tool_call_guidance", True) and self.valid_tool_names:
+            prompt_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
@@ -1433,6 +1475,39 @@ class AIAgent:
             tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
+
+        # Tool-use enforcement: tells the model to actually call tools instead
+        # of describing intended actions. Controlled by config.yaml
+        # agent.tool_use_enforcement:
+        #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
+        #   true  — always inject (all models)
+        #   false — never inject
+        #   list  — custom model-name substrings to match
+        if self.valid_tool_names:
+            _enforce = getattr(self, "_tool_use_enforcement", "auto")
+            _inject = False
+            if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
+                _inject = True
+            elif _enforce is False or (isinstance(_enforce, str) and _enforce.lower() in {"false", "never", "no", "off"}):
+                _inject = False
+            elif isinstance(_enforce, list):
+                model_lower = (self.model or "").lower()
+                _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
+            else:
+                # "auto" or any unrecognised value — use hardcoded defaults
+                model_lower = (self.model or "").lower()
+                _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+            if _inject:
+                prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _model_lower = (self.model or "").lower()
+                # Google model operational guidance (conciseness, absolute
+                # paths, verify-before-edit, etc.)
+                if "gemini" in _model_lower or "gemma" in _model_lower:
+                    prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
+                # OpenAI GPT/Codex execution discipline. Also applied to xAI
+                # Grok — same failure modes in practice.
+                if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+                    prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
         # API-call time only so it stays out of the cached/stored system prompt.
