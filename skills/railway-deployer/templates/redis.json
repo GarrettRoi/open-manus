@@ -1,0 +1,18 @@
+{
+  "name": "Redis Cache",
+  "description": "Redis cache with persistent storage",
+  "services": [
+    {
+      "name": "redis",
+      "source": {
+        "type": "docker",
+        "image": "redis:7-alpine"
+      },
+      "volumes": [
+        {
+          "mountPath": "/data"
+        }
+      ]
+    }
+  ]
+}

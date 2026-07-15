@@ -1,0 +1,13 @@
+# Agent Email System - Recipient Allowlist
+# Only emails matching entries in this file can receive messages
+# One entry per line
+# Lines starting with # are comments
+
+# Domain wildcards (all emails at this domain)
+# *@example.com
+# *.example.com (includes subdomains)
+
+# Specific email addresses
+# user@example.com
+
+# Add your allowed recipients below:
