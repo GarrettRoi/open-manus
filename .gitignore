@@ -47,3 +47,10 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# open-manus (Python system, kept separate from the pnpm workspace)
+open-manus/.venv/
+open-manus/__pycache__/
+open-manus/**/__pycache__/
+open-manus/.env
+open-manus/*.pyc
