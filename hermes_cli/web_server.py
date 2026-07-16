@@ -1951,6 +1951,367 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     return {"ok": True, "path": display_path, **_managed_response_meta(policy)}
 
 
+# ============================================================================
+# Agent files API — per-agent view of each agent's real folders:
+#   * "deploy" area: deploy/<agent>/{config.yaml,SOUL.md,USER.md} on local
+#     disk; edits are also pushed to Redis (agent:<name>:deployfile:<file>)
+#     so running agents pick them up via workspace_sync without a redeploy.
+#   * "workspace" area: the Redis mirror of the agent's live working
+#     directory (/root/.hermes/workspace), synced both ways by
+#     skills/hive_mind/workspace_sync.py.
+# Note: deploy config.yaml is deliberately exempt from the managed-files
+# sensitive-basename denylist — the per-agent deploy configs are persona
+# definitions (model, prompts) and contain no credentials.
+# ============================================================================
+
+_AGENT_DEPLOY_ROOT = PROJECT_ROOT / "deploy"
+_AGENT_DEPLOY_FILES = ("config.yaml", "SOUL.md", "USER.md")
+_AGENT_WS_MAX_BYTES = 5 * 1024 * 1024
+# Aggregate per-agent cap on the Redis workspace mirror. Mirrors the
+# MAX_TOTAL_SIZE budget in skills/hive_mind/workspace_sync.py so dashboard
+# writes can't grow Redis beyond what the sync worker would push anyway.
+_AGENT_WS_TOTAL_MAX_BYTES = 100 * 1024 * 1024
+
+_agent_redis_client = None
+
+
+class AgentFileWrite(BaseModel):
+    agent: str
+    area: str  # "deploy" | "workspace"
+    path: str
+    content: str
+
+
+class AgentFileUpload(BaseModel):
+    agent: str
+    path: str
+    data_url: str
+
+
+class AgentFileDelete(BaseModel):
+    agent: str
+    path: str
+
+
+def _agent_names() -> List[str]:
+    try:
+        return sorted(
+            p.name
+            for p in _AGENT_DEPLOY_ROOT.iterdir()
+            if p.is_dir() and (p / "config.yaml").exists()
+        )
+    except OSError:
+        return []
+
+
+def _require_agent(agent: str) -> str:
+    name = (agent or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", name) or name not in _agent_names():
+        raise HTTPException(status_code=404, detail="Unknown agent")
+    return name
+
+
+def _agent_redis():
+    global _agent_redis_client
+    url = os.getenv("REDIS_URL", "").strip()
+    if not url:
+        raise HTTPException(status_code=503, detail="REDIS_URL is not configured")
+    if _agent_redis_client is None:
+        try:
+            import redis as _redis
+        except ImportError:
+            raise HTTPException(status_code=503, detail="redis package is not installed")
+        _agent_redis_client = _redis.from_url(
+            url, decode_responses=True, socket_connect_timeout=5, socket_timeout=10
+        )
+    try:
+        _agent_redis_client.ping()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {exc}")
+    return _agent_redis_client
+
+
+def _ws_norm_rel(path: str) -> str:
+    rel = (path or "").strip().strip("/")
+    if not rel:
+        raise HTTPException(status_code=400, detail="Path is required")
+    parts = []
+    for part in rel.split("/"):
+        part = part.strip()
+        if not part or part == ".":
+            continue
+        if part == ".." or "\\" in part or "\x00" in part or part.startswith("agent:"):
+            raise HTTPException(status_code=400, detail="Invalid path")
+        parts.append(part)
+    if not parts:
+        raise HTTPException(status_code=400, detail="Path is required")
+    rel = "/".join(parts)
+    if _is_sensitive_path(Path(rel)):
+        raise HTTPException(status_code=403, detail="This file is not accessible")
+    return rel
+
+
+def _ws_file_key(agent: str, rel: str) -> str:
+    return f"agent:{agent}:wsync:file:{rel}"
+
+
+def _ws_index(r, agent: str) -> Dict[str, dict]:
+    """relpath -> {size, mtime, updated_at, source} (content not loaded)."""
+    prefix = _ws_file_key(agent, "")
+    out: Dict[str, dict] = {}
+    for key in r.scan_iter(f"{prefix}*", count=500):
+        rel = key[len(prefix):]
+        out[rel] = {"key": key}
+    return out
+
+
+def _ws_enforce_quota(r, agent: str, rel: str, new_bytes: int) -> None:
+    """Reject a dashboard write that would push the agent's Redis workspace
+    mirror past the aggregate budget. Uses STRLEN so no values are loaded."""
+    prefix = _ws_file_key(agent, "")
+    total = 0
+    for key in r.scan_iter(f"{prefix}*", count=500):
+        if key[len(prefix):] == rel:
+            continue  # being replaced
+        try:
+            total += int(r.strlen(key))
+        except Exception:
+            continue
+    # stored JSON inflates content ~4/3 via base64; compare in stored bytes
+    if total + (new_bytes * 4 // 3) > _AGENT_WS_TOTAL_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Agent workspace quota exceeded (100 MB); delete files first",
+        )
+
+
+def _ws_load(r, key: str) -> dict:
+    raw = r.get(key)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Corrupt sync entry")
+
+
+@app.get("/api/agent-files/agents")
+async def agent_files_agents():
+    agents = []
+    last_sync: Dict[str, Optional[str]] = {}
+    try:
+        r = _agent_redis()
+        for name in _agent_names():
+            last_sync[name] = r.get(f"agent:{name}:wsync:last_sync")
+        redis_ok = True
+    except HTTPException:
+        redis_ok = False
+    for name in _agent_names():
+        agents.append({"name": name, "last_sync": last_sync.get(name)})
+    return {"agents": agents, "redis_connected": redis_ok}
+
+
+@app.get("/api/agent-files/list")
+async def agent_files_list(agent: str, path: str = ""):
+    name = _require_agent(agent)
+    rel_dir = ""
+    if path.strip().strip("/"):
+        rel_dir = _ws_norm_rel(path)
+
+    entries = []
+    if not rel_dir:
+        agent_dir = _AGENT_DEPLOY_ROOT / name
+        for fname in _AGENT_DEPLOY_FILES:
+            fpath = agent_dir / fname
+            if fpath.exists():
+                st = fpath.stat()
+                entries.append({
+                    "name": fname,
+                    "path": fname,
+                    "area": "deploy",
+                    "is_directory": False,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+
+    last_sync = None
+    redis_error = None
+    try:
+        r = _agent_redis()
+        last_sync = r.get(f"agent:{name}:wsync:last_sync")
+        index = _ws_index(r, name)
+        prefix = f"{rel_dir}/" if rel_dir else ""
+        seen_dirs = set()
+        for rel in sorted(index):
+            if prefix and not rel.startswith(prefix):
+                continue
+            remainder = rel[len(prefix):]
+            if "/" in remainder:
+                dirname = remainder.split("/", 1)[0]
+                if dirname not in seen_dirs:
+                    seen_dirs.add(dirname)
+                    entries.append({
+                        "name": dirname,
+                        "path": f"{prefix}{dirname}",
+                        "area": "workspace",
+                        "is_directory": True,
+                        "size": None,
+                        "mtime": None,
+                    })
+            else:
+                meta = _ws_load(r, index[rel]["key"])
+                entries.append({
+                    "name": remainder,
+                    "path": rel,
+                    "area": "workspace",
+                    "is_directory": False,
+                    "size": len(meta.get("b64", "")) * 3 // 4,
+                    "mtime": meta.get("mtime"),
+                    "updated_at": meta.get("updated_at"),
+                    "source": meta.get("source"),
+                })
+    except HTTPException as exc:
+        redis_error = exc.detail
+
+    entries.sort(key=lambda e: (e["area"] != "deploy", not e["is_directory"], e["name"].lower()))
+    return {
+        "agent": name,
+        "path": rel_dir,
+        "entries": entries,
+        "last_sync": last_sync,
+        "redis_error": redis_error,
+    }
+
+
+@app.get("/api/agent-files/read")
+async def agent_files_read(agent: str, area: str, path: str):
+    name = _require_agent(agent)
+    if area == "deploy":
+        fname = Path(path).name
+        if fname not in _AGENT_DEPLOY_FILES:
+            raise HTTPException(status_code=403, detail="Only config.yaml, SOUL.md and USER.md are accessible")
+        target = _AGENT_DEPLOY_ROOT / name / fname
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        data = target.read_bytes()
+        mime = mimetypes.guess_type(fname)[0] or "text/plain"
+        return {
+            "name": fname,
+            "path": fname,
+            "area": "deploy",
+            "size": len(data),
+            "mime_type": mime,
+            "data_url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+        }
+    if area == "workspace":
+        rel = _ws_norm_rel(path)
+        r = _agent_redis()
+        meta = _ws_load(r, _ws_file_key(name, rel))
+        b64 = meta.get("b64", "")
+        mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        return {
+            "name": rel.rsplit("/", 1)[-1],
+            "path": rel,
+            "area": "workspace",
+            "size": len(b64) * 3 // 4,
+            "mime_type": mime,
+            "data_url": f"data:{mime};base64,{b64}",
+            "updated_at": meta.get("updated_at"),
+            "source": meta.get("source"),
+        }
+    raise HTTPException(status_code=400, detail="area must be 'deploy' or 'workspace'")
+
+
+@app.post("/api/agent-files/write")
+async def agent_files_write(payload: AgentFileWrite):
+    name = _require_agent(payload.agent)
+    content = payload.content
+    if len(content.encode("utf-8")) > _AGENT_WS_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large")
+
+    if payload.area == "deploy":
+        fname = Path(payload.path).name
+        if fname not in _AGENT_DEPLOY_FILES:
+            raise HTTPException(status_code=403, detail="Only config.yaml, SOUL.md and USER.md are editable")
+        if fname == "config.yaml":
+            try:
+                yaml.safe_load(content)
+            except yaml.YAMLError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}")
+        target = _AGENT_DEPLOY_ROOT / name / fname
+        try:
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+        # Propagate to the running agent via Redis (best-effort; the local
+        # file is the durable source of truth and ships on next deploy).
+        pushed = False
+        try:
+            r = _agent_redis()
+            r.set(f"agent:{name}:deployfile:{fname}", json.dumps({
+                "content": content,
+                "hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }))
+            pushed = True
+        except HTTPException:
+            pass
+        return {"ok": True, "path": fname, "area": "deploy", "pushed_to_agent": pushed}
+
+    if payload.area == "workspace":
+        rel = _ws_norm_rel(payload.path)
+        r = _agent_redis()
+        data = content.encode("utf-8")
+        _ws_enforce_quota(r, name, rel, len(data))
+        r.set(_ws_file_key(name, rel), json.dumps({
+            "b64": base64.b64encode(data).decode("ascii"),
+            "hash": hashlib.sha256(data).hexdigest(),
+            "mtime": time.time(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "dashboard",
+        }))
+        r.delete(f"agent:{name}:wsync:deleted:{rel}")
+        return {"ok": True, "path": rel, "area": "workspace", "pushed_to_agent": True}
+
+    raise HTTPException(status_code=400, detail="area must be 'deploy' or 'workspace'")
+
+
+@app.post("/api/agent-files/upload")
+async def agent_files_upload(payload: AgentFileUpload):
+    name = _require_agent(payload.agent)
+    rel = _ws_norm_rel(payload.path)
+    data, _mime = _decode_data_url(payload.data_url)
+    if len(data) > _AGENT_WS_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File is too large (5 MB max)")
+    r = _agent_redis()
+    _ws_enforce_quota(r, name, rel, len(data))
+    r.set(_ws_file_key(name, rel), json.dumps({
+        "b64": base64.b64encode(data).decode("ascii"),
+        "hash": hashlib.sha256(data).hexdigest(),
+        "mtime": time.time(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard",
+    }))
+    r.delete(f"agent:{name}:wsync:deleted:{rel}")
+    return {"ok": True, "path": rel, "area": "workspace"}
+
+
+@app.delete("/api/agent-files")
+async def agent_files_delete(payload: AgentFileDelete):
+    name = _require_agent(payload.agent)
+    rel = _ws_norm_rel(payload.path)
+    r = _agent_redis()
+    key = _ws_file_key(name, rel)
+    if r.get(key) is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    r.delete(key)
+    r.set(
+        f"agent:{name}:wsync:deleted:{rel}",
+        datetime.now(timezone.utc).isoformat(),
+    )
+    return {"ok": True, "path": rel}
+
+
 @app.get("/api/fs/list")
 async def fs_list(path: str):
     target = _fs_path(path)

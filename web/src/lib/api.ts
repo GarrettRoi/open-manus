@@ -455,6 +455,34 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, recursive }),
     }),
+  listAgentFileAgents: () =>
+    fetchJSON<AgentFilesAgentsResponse>("/api/agent-files/agents"),
+  listAgentFiles: (agent: string, path = "") =>
+    fetchJSON<AgentFilesListResponse>(
+      `/api/agent-files/list?agent=${encodeURIComponent(agent)}&path=${encodeURIComponent(path)}`,
+    ),
+  readAgentFile: (agent: string, area: AgentFileArea, path: string) =>
+    fetchJSON<AgentFileReadResponse>(
+      `/api/agent-files/read?agent=${encodeURIComponent(agent)}&area=${encodeURIComponent(area)}&path=${encodeURIComponent(path)}`,
+    ),
+  writeAgentFile: (agent: string, area: AgentFileArea, path: string, content: string) =>
+    fetchJSON<AgentFileWriteResponse>("/api/agent-files/write", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent, area, path, content }),
+    }),
+  uploadAgentFile: (agent: string, path: string, dataUrl: string) =>
+    fetchJSON<{ ok: boolean; path: string }>("/api/agent-files/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent, path, data_url: dataUrl }),
+    }),
+  deleteAgentFile: (agent: string, path: string) =>
+    fetchJSON<{ ok: boolean; path: string }>("/api/agent-files", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent, path }),
+    }),
   getLogs: (params: { file?: string; lines?: number; level?: string; component?: string }) => {
     const qs = new URLSearchParams();
     if (params.file) qs.set("file", params.file);
@@ -1790,6 +1818,55 @@ export interface ManagedFileWriteResponse {
   root: string | null;
   locked_root: string | null;
   can_change_path: boolean;
+}
+
+export type AgentFileArea = "deploy" | "workspace";
+
+export interface AgentFilesAgent {
+  name: string;
+  last_sync: string | null;
+}
+
+export interface AgentFilesAgentsResponse {
+  agents: AgentFilesAgent[];
+  redis_connected: boolean;
+}
+
+export interface AgentFileEntry {
+  name: string;
+  path: string;
+  area: AgentFileArea;
+  is_directory: boolean;
+  size: number | null;
+  mtime: number | null;
+  updated_at?: string | null;
+  source?: string | null;
+}
+
+export interface AgentFilesListResponse {
+  agent: string;
+  path: string;
+  entries: AgentFileEntry[];
+  last_sync: string | null;
+  redis_error: string | null;
+}
+
+export interface AgentFileReadResponse {
+  name: string;
+  path: string;
+  area: AgentFileArea;
+  size: number;
+  mime_type: string;
+  data_url: string;
+  updated_at?: string | null;
+  source?: string | null;
+}
+
+export interface AgentFileWriteResponse {
+  ok: boolean;
+  path: string;
+  area: AgentFileArea;
+  pushed_to_agent: boolean;
 }
 
 export interface AnalyticsDailyEntry {

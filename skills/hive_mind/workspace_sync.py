@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+Workspace Sync — Bidirectional sync of an agent's real working directory
+(/root/.hermes/workspace, i.e. terminal.cwd) with Redis, so the dashboard can
+browse/edit each agent's working folder and the folder survives container
+restarts even without a Railway volume.
+
+Also pulls dashboard-edited deploy files (config.yaml / SOUL.md / USER.md)
+from Redis down into /root/.hermes/ so running agents pick them up on next
+reload without a redeploy.
+
+Redis keys (per agent):
+    agent:{name}:wsync:file:{relpath}   JSON {b64, hash, mtime, updated_at, source}
+    agent:{name}:wsync:deleted:{relpath}  ISO timestamp tombstone
+    agent:{name}:wsync:last_sync        ISO timestamp of last agent-side sync
+    agent:{name}:deployfile:{filename}  JSON {content, hash, updated_at}
+
+Usage:
+    python3 workspace_sync.py --action restore --agent lexi   # on boot
+    python3 workspace_sync.py --action sync    --agent lexi   # one push+pull round
+    python3 workspace_sync.py --action watch   --agent lexi --interval 300
+"""
+import argparse
+import base64
+import fnmatch
+import hashlib
+import json
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import redis
+except ImportError:
+    os.system("pip install redis -q")
+    import redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+WORKSPACE_DIR = Path(os.getenv("HERMES_WORKSPACE_DIR", "/root/.hermes/workspace"))
+HERMES_HOME = Path(os.getenv("HERMES_HOME", "/root/.hermes"))
+STATE_FILE = HERMES_HOME / ".wsync_state.json"
+
+MAX_FILE_SIZE = 5 * 1024 * 1024          # 5 MB per file
+MAX_TOTAL_SIZE = 100 * 1024 * 1024       # 100 MB per agent
+
+DEPLOY_FILES = ("config.yaml", "SOUL.md", "USER.md")
+
+# Files redis_memory_sync.py already persists at the workspace root — leave
+# them to that script so the two syncs never fight over the same file.
+MEMORY_SYNC_OWNED = {"MEMORY.md", "cron_jobs.json", "tasks.json", "notes.md"}
+
+# Never sync: credentials, transient/tool dirs, sync state.
+EXCLUDE_BASENAME_GLOBS = (
+    ".env", ".env.*", ".envrc", "*.pyc", ".DS_Store",
+    "auth.json", "auth.lock", "credentials", ".git-credentials",
+    ".anthropic_oauth.json", "google_token.json", "google_oauth.json",
+    "google_oauth_pending.json", "webhook_subscriptions.json", "bws_cache.json",
+    ".sync_state.json", ".wsync_state.json", "*.upload",
+)
+EXCLUDE_DIR_NAMES = {
+    ".git", ".hg", ".svn", ".cache", "__pycache__", "node_modules",
+    ".venv", "venv", "mcp-tokens", "pairing", ".npm", ".local",
+}
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_redis():
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+
+def is_excluded(rel: str) -> bool:
+    parts = rel.split("/")
+    if any(p in EXCLUDE_DIR_NAMES for p in parts[:-1]):
+        return True
+    base = parts[-1]
+    if len(parts) == 1 and base in MEMORY_SYNC_OWNED:
+        return True
+    return any(fnmatch.fnmatch(base.lower(), pat) for pat in EXCLUDE_BASENAME_GLOBS)
+
+
+def file_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"files": {}, "deploy": {}}
+
+
+def save_state(state: dict):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
+
+
+def walk_workspace() -> dict:
+    """Return {relpath: Path} of syncable local files."""
+    out = {}
+    if not WORKSPACE_DIR.exists():
+        return out
+    for root, dirs, files in os.walk(WORKSPACE_DIR):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIR_NAMES]
+        for name in files:
+            p = Path(root) / name
+            try:
+                rel = str(p.relative_to(WORKSPACE_DIR)).replace(os.sep, "/")
+            except ValueError:
+                continue
+            if is_excluded(rel):
+                continue
+            try:
+                if p.is_symlink() or not p.is_file() or p.stat().st_size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+            out[rel] = p
+    return out
+
+
+def _key(agent: str, rel: str) -> str:
+    return f"agent:{agent}:wsync:file:{rel}"
+
+
+def _tomb(agent: str, rel: str) -> str:
+    return f"agent:{agent}:wsync:deleted:{rel}"
+
+
+def push_file(r, agent: str, rel: str, path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    h = file_hash(data)
+    r.set(_key(agent, rel), json.dumps({
+        "b64": base64.b64encode(data).decode("ascii"),
+        "hash": h,
+        "mtime": path.stat().st_mtime,
+        "updated_at": utcnow(),
+        "source": "agent",
+    }))
+    r.delete(_tomb(agent, rel))
+    return h
+
+
+def pull_file(agent: str, rel: str, remote: dict) -> bool:
+    target = WORKSPACE_DIR / rel
+    if is_excluded(rel):
+        return False
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(remote["b64"]))
+        return True
+    except (OSError, KeyError, ValueError) as e:
+        print(f"[wsync] pull failed for {rel}: {e}")
+        return False
+
+
+def remote_index(r, agent: str) -> dict:
+    """{relpath: raw_json_key_value_not_loaded} — hashes loaded lazily."""
+    prefix = _key(agent, "")
+    out = {}
+    for key in r.scan_iter(f"{prefix}*"):
+        out[key[len(prefix):]] = key
+    return out
+
+
+def sync(agent: str, verbose: bool = True):
+    r = get_redis()
+    state = load_state()
+    fstate = state.setdefault("files", {})
+    local = walk_workspace()
+    remote_keys = remote_index(r, agent)
+
+    pushed = pulled = deleted = 0
+    total_budget = MAX_TOTAL_SIZE
+
+    # ---- local scan: pushes and local deletions ----
+    for rel, path in local.items():
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        total_budget -= len(data)
+        if total_budget < 0:
+            print(f"[wsync] total size cap reached; skipping {rel} and beyond")
+            break
+        lh = file_hash(data)
+        if fstate.get(rel) != lh:
+            # local changed (or new) since last sync
+            remote_raw = r.get(remote_keys[rel]) if rel in remote_keys else None
+            remote = json.loads(remote_raw) if remote_raw else None
+            if remote and remote.get("hash") != fstate.get(rel) and remote.get("source") == "dashboard":
+                # both changed; dashboard edit wins
+                if pull_file(agent, rel, remote):
+                    fstate[rel] = remote["hash"]
+                    pulled += 1
+                continue
+            h = push_file(r, agent, rel, path)
+            if h:
+                fstate[rel] = h
+                pushed += 1
+
+    # files we knew about that vanished locally -> agent deleted them
+    for rel in [x for x in list(fstate) if x not in local]:
+        if rel.startswith("__"):
+            continue
+        if rel in remote_keys:
+            r.delete(remote_keys[rel])
+        r.set(_tomb(agent, rel), utcnow())
+        del fstate[rel]
+        deleted += 1
+
+    # ---- remote scan: pulls and dashboard deletions ----
+    for rel, key in remote_keys.items():
+        if rel in local and fstate.get(rel):
+            # compare remote hash to state; pull if dashboard changed it
+            raw = r.get(key)
+            if not raw:
+                continue
+            remote = json.loads(raw)
+            if remote.get("hash") != fstate.get(rel):
+                lh = None
+                try:
+                    lh = file_hash((WORKSPACE_DIR / rel).read_bytes())
+                except OSError:
+                    pass
+                if lh == fstate.get(rel):  # local unchanged -> safe pull
+                    if pull_file(agent, rel, remote):
+                        fstate[rel] = remote["hash"]
+                        pulled += 1
+        elif rel not in local:
+            raw = r.get(key)
+            if not raw:
+                continue
+            remote = json.loads(raw)
+            if rel in fstate:
+                continue  # handled above as local deletion
+            if pull_file(agent, rel, remote):
+                fstate[rel] = remote["hash"]
+                pulled += 1
+
+    # dashboard-side deletions (tombstones for files we still have)
+    tomb_prefix = _tomb(agent, "")
+    for key in r.scan_iter(f"{tomb_prefix}*"):
+        rel = key[len(tomb_prefix):]
+        target = WORKSPACE_DIR / rel
+        if target.exists() and fstate.get(rel):
+            try:
+                lh = file_hash(target.read_bytes())
+            except OSError:
+                continue
+            if lh == fstate.get(rel):  # unchanged since sync -> honor deletion
+                try:
+                    target.unlink()
+                except OSError:
+                    continue
+                fstate.pop(rel, None)
+                deleted += 1
+
+    # ---- deploy-file overrides from dashboard ----
+    dstate = state.setdefault("deploy", {})
+    for fname in DEPLOY_FILES:
+        raw = r.get(f"agent:{agent}:deployfile:{fname}")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if payload.get("hash") and payload["hash"] != dstate.get(fname):
+            try:
+                (HERMES_HOME / fname).write_text(payload.get("content", ""), encoding="utf-8")
+                dstate[fname] = payload["hash"]
+                print(f"[wsync] applied dashboard {fname} update")
+            except OSError as e:
+                print(f"[wsync] could not apply {fname}: {e}")
+
+    r.set(f"agent:{agent}:wsync:last_sync", utcnow())
+    save_state(state)
+    if verbose:
+        print(f"[wsync:{agent}] pushed={pushed} pulled={pulled} deleted={deleted}")
+
+
+def restore(agent: str):
+    """Boot-time restore: pull the whole workspace mirror from Redis."""
+    r = get_redis()
+    state = load_state()
+    fstate = state.setdefault("files", {})
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    restored = 0
+    for rel, key in remote_index(r, agent).items():
+        target = WORKSPACE_DIR / rel
+        if target.exists():
+            continue  # volume-backed agents keep their local copy
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            remote = json.loads(raw)
+        except ValueError:
+            continue
+        if pull_file(agent, rel, remote):
+            fstate[rel] = remote.get("hash")
+            restored += 1
+    save_state(state)
+    print(f"[wsync:{agent}] restored {restored} workspace files from Redis.")
+    # apply any pending dashboard deploy-file edits too
+    sync(agent, verbose=False)
+
+
+def watch(agent: str, interval: int):
+    print(f"[wsync:{agent}] watching (sync every {interval}s)...")
+    while True:
+        try:
+            sync(agent)
+        except Exception as e:
+            print(f"[wsync:{agent}] sync error: {e}")
+        time.sleep(interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Agent workspace <-> Redis sync")
+    ap.add_argument("--action", choices=["restore", "sync", "watch"], required=True)
+    ap.add_argument("--agent", required=True)
+    ap.add_argument("--interval", type=int, default=300)
+    args = ap.parse_args()
+    if args.action == "restore":
+        restore(args.agent)
+    elif args.action == "sync":
+        sync(args.agent)
+    else:
+        watch(args.agent, args.interval)
+
+
+if __name__ == "__main__":
+    main()

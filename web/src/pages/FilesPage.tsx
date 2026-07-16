@@ -31,6 +31,7 @@ import { Input } from "@nous-research/ui/ui/components/input";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
+import { AgentFilesView } from "@/components/AgentFilesView";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { api } from "@/lib/api";
@@ -92,6 +93,7 @@ export default function FilesPage() {
   const [folderName, setFolderName] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ManagedFileEntry | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<"browse" | "agents">("browse");
 
   const activePath = listing?.path ?? currentPath ?? "";
   const canChangePath = listing?.can_change_path ?? false;
@@ -264,6 +266,30 @@ export default function FilesPage() {
     <div className="flex min-w-0 max-w-full flex-col gap-4">
       <Toast toast={toast} />
       <PluginSlot name="files:top" />
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          outlined={view !== "browse"}
+          className="uppercase"
+          onClick={() => setView("browse")}
+        >
+          Browse
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          outlined={view !== "agents"}
+          className="uppercase"
+          onClick={() => setView("agents")}
+        >
+          Agents
+        </Button>
+      </div>
+      {view === "agents" ? (
+        <AgentFilesView />
+      ) : (
+      <>
       <input
         ref={fileInputRef}
         type="file"
@@ -520,6 +546,8 @@ export default function FilesPage() {
             : "This removes the file."
         }
       />
+      </>
+      )}
     </div>
   );
 }

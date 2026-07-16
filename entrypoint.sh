@@ -57,12 +57,28 @@ if [ -n "$REDIS_URL" ]; then
     python3 /app/skills/hive_mind/redis_memory_sync.py --action restore --agent "${AGENT_NAME}" || true
 fi
 
+# ============================================================
+# WORKSPACE RESTORE + SYNC
+# Mirrors the agent's real working directory (/root/.hermes/workspace)
+# to Redis so it's browsable/editable from the dashboard and survives
+# restarts. Also pulls dashboard-edited deploy files (config.yaml,
+# SOUL.md, USER.md) down without needing a redeploy.
+# ============================================================
+if [ -n "$REDIS_URL" ]; then
+    echo "[entrypoint] Restoring workspace for ${AGENT_NAME}..."
+    python3 /app/skills/hive_mind/workspace_sync.py --action restore --agent "${AGENT_NAME}" || true
+fi
+
 # Start background memory auto-save (every 5 minutes)
 if [ -n "$REDIS_URL" ]; then
     echo "[entrypoint] Starting background memory auto-save..."
     python3 /app/skills/hive_mind/redis_memory_sync.py --action watch --agent "${AGENT_NAME}" --interval 300 &
     MEMORY_SYNC_PID=$!
     echo "[entrypoint] Memory sync PID: ${MEMORY_SYNC_PID}"
+    echo "[entrypoint] Starting background workspace sync..."
+    python3 /app/skills/hive_mind/workspace_sync.py --action watch --agent "${AGENT_NAME}" --interval 300 &
+    WORKSPACE_SYNC_PID=$!
+    echo "[entrypoint] Workspace sync PID: ${WORKSPACE_SYNC_PID}"
 fi
 
 # Graceful shutdown handler — save memory before exit
@@ -71,9 +87,14 @@ cleanup() {
     if [ -n "$REDIS_URL" ]; then
         echo "[entrypoint] Saving memory to Redis before shutdown..."
         python3 /app/skills/hive_mind/redis_memory_sync.py --action save --agent "${AGENT_NAME}" || true
+        echo "[entrypoint] Saving workspace to Redis before shutdown..."
+        python3 /app/skills/hive_mind/workspace_sync.py --action sync --agent "${AGENT_NAME}" || true
     fi
     if [ -n "$MEMORY_SYNC_PID" ]; then
         kill "$MEMORY_SYNC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$WORKSPACE_SYNC_PID" ]; then
+        kill "$WORKSPACE_SYNC_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT SIGTERM SIGINT
@@ -95,6 +116,18 @@ echo "[entrypoint] Wrote $(wc -l < /root/.hermes/.env) variables to .env"
 
 echo "[entrypoint] Environment configured. Starting Hermes gateway..."
 
-# Start the Hermes gateway in foreground mode
+# Start the Hermes gateway as a child (NOT exec) so the EXIT/SIGTERM trap
+# still runs and can flush memory + workspace state to Redis on shutdown.
 cd /app
-exec hermes gateway
+hermes gateway &
+GATEWAY_PID=$!
+
+# Forward termination signals to the gateway, then let the trap do cleanup.
+forward_signal() {
+    kill -TERM "$GATEWAY_PID" 2>/dev/null || true
+}
+trap forward_signal SIGTERM SIGINT
+
+wait "$GATEWAY_PID"
+GATEWAY_EXIT=$?
+exit "$GATEWAY_EXIT"
