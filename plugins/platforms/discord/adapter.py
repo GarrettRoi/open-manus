@@ -4067,6 +4067,28 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord interaction cleanup failed: %s", e)
 
+        @tree.command(name="soul", description="Temporarily override the personality system prompt")
+        @discord.app_commands.describe(
+            prompt="New system prompt text, or 'reset' to restore the saved personality. Leave empty to view status."
+        )
+        async def slash_soul(interaction: discord.Interaction, prompt: str = ""):
+            if not await self._check_slash_authorization(interaction, "/soul"):
+                return
+            await interaction.response.defer(ephemeral=True)
+            ok, response = await self._run_gateway_slash_command(
+                interaction, f"/soul {prompt}".strip()
+            )
+            if ok and prompt.strip() and not (response or "").lstrip().startswith(("✓", "No temporary", "Temporary soul")):
+                ok = False
+            msg = (response or "Done~")[:1900]
+            if not ok:
+                msg = f"\u26a0\ufe0f Soul override failed: {response or 'no response'}"[:1900]
+                logger.warning("[%s] /soul failed: %s", self.name, response)
+            try:
+                await interaction.edit_original_response(content=msg)
+            except Exception as e:
+                logger.debug("Discord interaction cleanup failed: %s", e)
+
         @tree.command(name="nsfw", description="Toggle NSFW/unfiltered mode on or off")
         @discord.app_commands.describe(toggle="on or off. Leave empty for usage help.")
         async def slash_nsfw(interaction: discord.Interaction, toggle: str = ""):

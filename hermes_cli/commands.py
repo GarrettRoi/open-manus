@@ -139,6 +139,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
+    CommandDef("soul", "Temporarily override the personality system prompt (until restart or /soul reset)",
+               "Configuration", args_hint="[prompt|reset|show]",
+               subcommands=("reset", "show")),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",

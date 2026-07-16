@@ -1575,6 +1575,28 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        @tree.command(name="soul", description="Temporarily override the personality system prompt")
+        @discord.app_commands.describe(
+            prompt="New system prompt text, or 'reset' to restore the saved personality. Leave empty to view status."
+        )
+        async def slash_soul(interaction: discord.Interaction, prompt: str = ""):
+            await interaction.response.defer(ephemeral=True)
+            ok, response = await self._run_gateway_slash_command(
+                interaction, f"/soul {prompt}".strip()
+            )
+            if ok and prompt.strip() and not (response or "").lstrip().startswith(("✓", "No temporary", "Temporary soul")):
+                ok = False
+            try:
+                if ok:
+                    await interaction.followup.send((response or "Done~")[:1900], ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"\u26a0\ufe0f Soul override failed: {response or 'no response'}"[:1900],
+                        ephemeral=True,
+                    )
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
         @tree.command(name="nsfw", description="Toggle NSFW/unfiltered mode on or off")
         @discord.app_commands.describe(toggle="on or off. Leave empty to check current state.")
         async def slash_nsfw(interaction: discord.Interaction, toggle: str = ""):
