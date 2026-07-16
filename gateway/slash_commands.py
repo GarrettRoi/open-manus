@@ -2096,6 +2096,7 @@ class GatewaySlashCommandsMixin:
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
             self._ephemeral_system_prompt = ""
+            self._soul_override_active = False
             return t("gateway.personality.cleared")
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
@@ -2111,11 +2112,58 @@ class GatewaySlashCommandsMixin:
 
             # Update in-memory so it takes effect on the very next message.
             self._ephemeral_system_prompt = new_prompt
+            self._soul_override_active = False
 
             return t("gateway.personality.set_to", name=args)
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return t("gateway.personality.unknown", name=args, available=available)
+
+    async def _handle_soul_command(self, event: MessageEvent) -> str:
+        """Handle /soul command - temporary system-prompt override.
+
+        Sets an in-memory personality/system prompt that takes effect on the
+        next reply, WITHOUT persisting to config.yaml. ``/soul reset`` restores
+        the saved personality; a gateway restart also restores it.
+        """
+        raw = (event.get_command_args() or "").strip()
+        lowered = raw.lower()
+
+        if not raw or lowered in {"show", "status"}:
+            active = bool(getattr(self, "_soul_override_active", False))
+            current = getattr(self, "_ephemeral_system_prompt", "") or ""
+            if active and current:
+                preview = current[:200] + ("..." if len(current) > 200 else "")
+                return (
+                    "Temporary soul override is ACTIVE:\n"
+                    f"> {preview}\n"
+                    "Use `/soul reset` to restore the saved personality."
+                )
+            return (
+                "No temporary soul override is active.\n"
+                "Usage: `/soul <prompt text>` to set one, `/soul reset` to clear, `/soul show` to view."
+            )
+
+        if lowered in {"reset", "clear", "off", "none"}:
+            try:
+                restored = self._load_ephemeral_system_prompt()
+            except Exception as e:
+                logger.error("Failed to restore saved personality after /soul reset: %s", e,
+                             exc_info=True)
+                return f"✗ Failed to restore the saved personality: {e}"
+            self._ephemeral_system_prompt = restored
+            self._soul_override_active = False
+            return "✓ Temporary soul override cleared — saved personality restored."
+
+        # Set the override in-memory only (no config write, so a restart
+        # or /soul reset restores the persisted personality).
+        self._ephemeral_system_prompt = raw
+        self._soul_override_active = True
+        preview = raw[:200] + ("..." if len(raw) > 200 else "")
+        return (
+            "✓ Temporary soul override set (until restart or `/soul reset`):\n"
+            f"> {preview}"
+        )
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""

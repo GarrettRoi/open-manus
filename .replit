@@ -1,12 +1,21 @@
+<<<<<<< HEAD
 modules = ["python-base-3.13", "nodejs-20"]
 
 [agent]
 expertMode = true
+=======
+modules = ["python-base-3.13"]
+>>>>>>> 295e585400b58c7766f884321151492f3ff6fcbb
 
 [[ports]]
 localPort = 8080
 externalPort = 80
 
+<<<<<<< HEAD
 [nix]
 channel = "stable-25_05"
 packages = ["gitFull", "libxcrypt", "libyaml", "playwright-driver"]
+=======
+[agent]
+expertMode = true
+>>>>>>> 295e585400b58c7766f884321151492f3ff6fcbb

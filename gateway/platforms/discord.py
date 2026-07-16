@@ -442,21 +442,64 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 
-                # Sync slash commands with Discord
-                try:
-                    # If DISCORD_GUILD_ID is set, sync specifically to that guild for instant updates
-                    guild_id = os.getenv("DISCORD_GUILD_ID")
-                    if guild_id:
-                        guild = discord.Object(id=int(guild_id))
+                # Sync slash commands with Discord.
+                # Guild-scoped syncs are instant; global sync can take up to
+                # an hour, so we sync to EVERY guild the bot is in on ready
+                # (not only when DISCORD_GUILD_ID is set) and keep the global
+                # sync as a fallback for guilds joined later.
+                sync_errors = []
+                target_guilds = list(adapter_self._client.guilds)
+                explicit_guild_id = os.getenv("DISCORD_GUILD_ID")
+                if explicit_guild_id:
+                    try:
+                        if int(explicit_guild_id) not in {g.id for g in target_guilds}:
+                            target_guilds.append(discord.Object(id=int(explicit_guild_id)))
+                    except ValueError:
+                        sync_errors.append(f"DISCORD_GUILD_ID is not a valid ID: {explicit_guild_id!r}")
+
+                for guild in target_guilds:
+                    try:
                         adapter_self._client.tree.copy_global_to(guild=guild)
                         await adapter_self._client.tree.sync(guild=guild)
-                        logger.info("[%s] Synced slash command(s) to guild %s", adapter_self.name, guild_id)
-                    
-                    # Also perform global sync (can take up to an hour)
+                        logger.info(
+                            "[%s] Synced slash commands to guild %s (%s)",
+                            adapter_self.name, guild.id, getattr(guild, "name", "?"),
+                        )
+                    except Exception as ge:
+                        logger.warning(
+                            "[%s] Guild slash command sync failed for %s: %s",
+                            adapter_self.name, guild.id, ge, exc_info=True,
+                        )
+                        sync_errors.append(f"guild {guild.id}: {ge}")
+
+                # Global sync fallback (can take up to an hour to propagate)
+                try:
                     synced_global = await adapter_self._client.tree.sync()
                     logger.info("[%s] Synced %d global slash command(s)", adapter_self.name, len(synced_global))
                 except Exception as e:  # pragma: no cover - defensive logging
-                    logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
+                    logger.warning("[%s] Global slash command sync failed: %s", adapter_self.name, e, exc_info=True)
+                    sync_errors.append(f"global: {e}")
+
+                # Surface sync failures to the home channel instead of
+                # failing silently in the logs.
+                if sync_errors:
+                    home_ch_id = os.getenv("DISCORD_HOME_CHANNEL", "")
+                    if home_ch_id:
+                        try:
+                            home_ch = adapter_self._client.get_channel(int(home_ch_id))
+                            if not home_ch:
+                                home_ch = await adapter_self._client.fetch_channel(int(home_ch_id))
+                            if home_ch:
+                                detail = "\n".join(f"• {err}"[:300] for err in sync_errors[:5])
+                                await home_ch.send(
+                                    "⚠️ **Slash command sync failed** — some commands "
+                                    "(e.g. `/nsfw`) may be missing or stale.\n" + detail
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[%s] Could not report sync errors to home channel",
+                                adapter_self.name, exc_info=True,
+                            )
                 adapter_self._ready_event.set()
 
                 # ── Voice Auto-Join ──
@@ -1518,10 +1561,39 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
         async def slash_personality(interaction: discord.Interaction, name: str = ""):
             await interaction.response.defer(ephemeral=True)
-            event = self._build_slash_event(interaction, f"/personality {name}".strip())
-            await self.handle_message(event)
+            ok, response = await self._run_gateway_slash_command(
+                interaction, f"/personality {name}".strip()
+            )
             try:
-                await interaction.followup.send("Done~", ephemeral=True)
+                if ok:
+                    await interaction.followup.send(response or "Done~", ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"\u26a0\ufe0f Personality command failed: {response}"[:1900],
+                        ephemeral=True,
+                    )
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
+        @tree.command(name="soul", description="Temporarily override the personality system prompt")
+        @discord.app_commands.describe(
+            prompt="New system prompt text, or 'reset' to restore the saved personality. Leave empty to view status."
+        )
+        async def slash_soul(interaction: discord.Interaction, prompt: str = ""):
+            await interaction.response.defer(ephemeral=True)
+            ok, response = await self._run_gateway_slash_command(
+                interaction, f"/soul {prompt}".strip()
+            )
+            if ok and prompt.strip() and not (response or "").lstrip().startswith(("✓", "No temporary", "Temporary soul")):
+                ok = False
+            try:
+                if ok:
+                    await interaction.followup.send((response or "Done~")[:1900], ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"\u26a0\ufe0f Soul override failed: {response or 'no response'}"[:1900],
+                        ephemeral=True,
+                    )
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
@@ -1530,20 +1602,47 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_nsfw(interaction: discord.Interaction, toggle: str = ""):
             await interaction.response.defer(ephemeral=True)
             toggle = toggle.strip().lower()
+
+            async def _switch(personality: str, success_msg: str):
+                ok, response = await self._run_gateway_slash_command(
+                    interaction, f"/personality {personality}"
+                )
+                if ok:
+                    # Verify the switch actually happened instead of blindly
+                    # reporting success — the gateway returns a distinct
+                    # message when the personality was applied.
+                    try:
+                        from agent.i18n import t as _t
+                        expected = _t("gateway.personality.set_to", name=personality).strip()
+                    except Exception:
+                        expected = None
+                    if expected is not None and (response or "").strip() != expected:
+                        ok = False
+                if ok:
+                    msg = success_msg
+                else:
+                    msg = (
+                        f"\u26a0\ufe0f NSFW toggle failed — personality was **not** switched.\n"
+                        f"Gateway said: {response or 'no response'}"
+                    )[:1900]
+                    logger.warning(
+                        "[%s] /nsfw toggle to %r failed: %s", self.name, personality, response
+                    )
+                try:
+                    await interaction.followup.send(msg, ephemeral=True)
+                except Exception as e:
+                    logger.debug("Discord followup failed: %s", e)
+
             if toggle in ("on", "yes", "true", "enable", "1"):
-                event = self._build_slash_event(interaction, "/personality unfiltered")
-                await self.handle_message(event)
-                try:
-                    await interaction.followup.send("\U0001f525 NSFW mode **enabled** — unfiltered personality active.\n_Use `/nsfw off` to return to normal._", ephemeral=True)
-                except Exception as e:
-                    logger.debug("Discord followup failed: %s", e)
+                await _switch(
+                    "unfiltered",
+                    "\U0001f525 NSFW mode **enabled** — unfiltered personality active.\n_Use `/nsfw off` to return to normal._",
+                )
             elif toggle in ("off", "no", "false", "disable", "0"):
-                event = self._build_slash_event(interaction, "/personality normal")
-                await self.handle_message(event)
-                try:
-                    await interaction.followup.send("\u2705 NSFW mode **disabled** — normal personality restored.\n_Use `/nsfw on` to re-enable._", ephemeral=True)
-                except Exception as e:
-                    logger.debug("Discord followup failed: %s", e)
+                await _switch(
+                    "normal",
+                    "\u2705 NSFW mode **disabled** — normal personality restored.\n_Use `/nsfw on` to re-enable._",
+                )
             else:
                 try:
                     await interaction.followup.send(
@@ -1943,6 +2042,32 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.followup.send("Update initiated~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
+
+    async def _run_gateway_slash_command(
+        self, interaction: "discord.Interaction", text: str
+    ) -> tuple:
+        """Run a gateway command inline and return (ok, response_text).
+
+        Unlike ``handle_message`` (fire-and-forget background dispatch), this
+        awaits the gateway handler directly so slash commands like ``/nsfw``
+        can report the real outcome — including failures — to the invoking
+        user instead of a generic success message.
+        """
+        event = self._build_slash_event(interaction, text)
+        if not self._message_handler:
+            return False, "Gateway message handler is not available."
+        try:
+            response = await self._message_handler(event)
+        except Exception as e:
+            logger.error(
+                "[%s] Slash command %r failed: %s", self.name, text, e, exc_info=True
+            )
+            return False, str(e)
+        try:
+            resp_text, _ttl = self._unwrap_ephemeral(response)
+        except Exception:
+            resp_text = response if isinstance(response, str) else ""
+        return True, (resp_text or "").strip()
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
