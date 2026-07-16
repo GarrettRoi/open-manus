@@ -1635,6 +1635,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name,
                     retry_after,
                 )
+                self._schedule_command_sync_retry(retry_after + 5)
                 return
             finally:
                 if has_ratelimit_timeout:
@@ -1662,6 +1663,33 @@ class DiscordAdapter(BasePlatformAdapter):
             raise
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+
+    def _schedule_command_sync_retry(self, delay_seconds: float) -> None:
+        """Schedule a one-shot retry of command sync after a rate limit.
+
+        Without this the recorded ``retry_after_until`` only takes effect on
+        the next reconnect, so a rate-limited startup sync could leave
+        commands stale indefinitely.
+        """
+        existing = getattr(self, "_command_sync_retry_task", None)
+        if existing is not None and not existing.done():
+            return
+
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(max(1.0, float(delay_seconds)))
+                logger.info(
+                    "[%s] Retrying slash command sync after rate-limit wait", self.name
+                )
+                await self._run_post_connect_initialization()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[%s] Scheduled command sync retry failed", self.name, exc_info=True
+                )
+
+        self._command_sync_retry_task = asyncio.create_task(_retry())
 
     async def _sync_commands_to_guilds(self) -> None:
         """Copy global slash commands to every guild the bot is in and sync.
