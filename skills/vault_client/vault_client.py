@@ -121,6 +121,42 @@ class VaultClient:
             payload, timeout=int(timeout) + 15,
         )
 
+    def resolve(self, service: str) -> Dict[str, Any]:
+        """STEP-ONE CHECK: does the vault have this service, and can I use it?
+
+        Call this as soon as a plan needs an external API. Returns
+        {"found": bool, "granted": bool, "ready": bool, "next_step": str, ...}.
+        Cheap and safe to call often.
+        """
+        from urllib.parse import quote
+        return self._http("GET", f"/api/vault/resolve?service={quote(service)}")
+
+    def request_access(self, service: str, name: str = "", reason: str = "") -> Dict[str, Any]:
+        """File a setup/access request the owner resolves in the vault dashboard.
+
+        Use when resolve() says the service is missing or you have no grant.
+        Returns a "message" you should relay to the user so they know to open
+        the dashboard (add a key, or complete an OAuth login).
+        """
+        return self._http("POST", "/api/vault/request", {
+            "service": service, "name": name, "reason": reason,
+        })
+
+    def ensure(self, service: str, reason: str = "") -> Dict[str, Any]:
+        """resolve() and, if not usable, automatically request_access().
+
+        Returns {"usable": bool, "connection": str|None, "message": str}.
+        If usable, call vault.request(connection, ...) right away.
+        If not, relay the message to the user and continue with other work.
+        """
+        info = self.resolve(service)
+        if info.get("found") and info.get("granted") and info.get("ready"):
+            return {"usable": True, "connection": info["connection"],
+                    "message": f"'{info['connection']}' is ready — use vault.request()."}
+        req = self.request_access(service, reason=reason)
+        return {"usable": False, "connection": info.get("connection"),
+                "status": req.get("status"), "message": req.get("message", "")}
+
     def list_connections(self) -> List[dict]:
         """List services this agent can call through the proxy."""
         data = self._http("GET", "/api/vault/list")
@@ -194,6 +230,8 @@ def main():
         print("      opts: --json '{...}'   request body")
         print("            --param k=v      query param (repeatable)")
         print("            --header k=v     extra header (repeatable)")
+        print("  vault_client.py resolve SERVICE               — Step-one check: is it in the vault?")
+        print("  vault_client.py ensure SERVICE [REASON]       — Check + auto-file a setup request")
         print("  vault_client.py skill CONN                    — Usage notes for a connection")
         print("  vault_client.py store NAME VALUE [--service SVC] [--desc D] [--base-url URL]")
         sys.exit(1)
@@ -242,6 +280,22 @@ def main():
             resp = vault.request(conn, method, path, params=params or None,
                                  headers=headers or None, json=body)
             _print_response(resp)
+
+        elif command == "resolve":
+            if len(sys.argv) < 3:
+                print("Usage: vault_client.py resolve SERVICE")
+                sys.exit(1)
+            print(json.dumps(vault.resolve(sys.argv[2]), indent=2))
+
+        elif command == "ensure":
+            if len(sys.argv) < 3:
+                print("Usage: vault_client.py ensure SERVICE [REASON]")
+                sys.exit(1)
+            reason = " ".join(sys.argv[3:])
+            out = vault.ensure(sys.argv[2], reason=reason)
+            print(json.dumps(out, indent=2))
+            if not out["usable"]:
+                sys.exit(2)  # distinct exit code: not usable yet, request filed
 
         elif command == "skill":
             if len(sys.argv) < 3:

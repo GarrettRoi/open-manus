@@ -287,11 +287,38 @@ async def services_page(request: Request, error: str = "", notice: str = ""):
     return templates.TemplateResponse(request, "services.html", {
         "connections": conns,
         "catalog": CATALOG,
+        "requests": store.list_requests(),
         "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL) if PUBLIC_URL else "",
         "public_url_missing": not PUBLIC_URL,
         "error": error,
         "notice": notice,
     })
+
+
+@app.post("/requests/dismiss")
+async def dismiss_request(request: Request, request_id: str = Form(...)):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    store.delete_request(request_id)
+    return RedirectResponse("/services?notice=Request+dismissed", status_code=303)
+
+
+@app.post("/requests/approve-grant")
+async def approve_grant_request(request: Request, request_id: str = Form(...)):
+    """One-click approve for a pending grant request."""
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    parts = request_id.split(":", 2)
+    # Grant only through a real pending request — keeps audit trail consistent.
+    if len(parts) == 3 and parts[0] == "grant" and store.get_request(request_id):
+        _, agent, cid = parts
+        if agent in AGENT_NAMES and store.get(cid):
+            store.set_grant(agent, cid, True)
+            audit_log("admin", cid, "grant_added", f"Approved request from {agent}")
+            store.delete_request(request_id)
+            return RedirectResponse(
+                f"/services?notice=Granted+{cid}+to+{agent}", status_code=303)
+    return RedirectResponse("/services?error=Invalid+grant+request", status_code=303)
 
 
 @app.post("/services/add")
@@ -584,6 +611,117 @@ async def get_skill_description(conn_id: str, request: Request):
         "base_url": view["base_url"],
         "example_call": view["example_call"],
     }
+
+
+@app.get("/api/vault/resolve")
+async def resolve_service(request: Request, service: str):
+    """Lightweight 'does this exist?' check — agents call this FIRST when a
+    task needs an external API. Returns whether a connection exists, whether
+    this agent can use it, and how to get it set up if not."""
+    agent_name = require_agent(request)
+    q = service.strip()
+    conn = store.find_connection(q)
+    audit_log(agent_name, q, "resolve", f"found={bool(conn)}")
+
+    if conn:
+        cid = conn["id"]
+        granted = store.has_grant(agent_name, cid)
+        view = _conn_view(conn, include_secret_state=False)
+        ready = conn.get("status") == "ready" and (
+            (conn.get("auth") or {}).get("kind") != "oauth2"
+            or bool(store.get_secrets(cid).get("access_token"))
+        )
+        return {
+            "found": True,
+            "connection": cid,
+            "service": view["service"],
+            "label": view["label"],
+            "granted": granted,
+            "ready": ready,
+            "example_call": view["example_call"] if granted else None,
+            "next_step": (
+                "Use POST /api/vault/proxy/" + cid if granted and ready else
+                "POST /api/vault/request to ask for access — the owner will see it in the vault dashboard"
+            ),
+        }
+
+    # No connection — do we at least have a template for it?
+    tpl_id = q.lower()
+    tpl = get_template(tpl_id)
+    return {
+        "found": False,
+        "template": tpl_id if tpl else None,
+        "template_label": tpl["label"] if tpl else None,
+        "oauth": bool(tpl and tpl["auth"]["kind"] == "oauth2") if tpl else None,
+        "known_templates": sorted(CATALOG.keys()),
+        "next_step": (
+            "POST /api/vault/request with {service, name, reason} to file a setup "
+            "request — the owner will finish it in the vault dashboard"
+        ),
+    }
+
+
+class AccessRequest(BaseModel):
+    service: str
+    name: str = ""
+    reason: str = ""
+
+
+@app.post("/api/vault/request")
+async def request_access(request: Request, body: AccessRequest):
+    """Agent-initiated setup: file a pending request the owner resolves in the
+    dashboard (add the key / complete the OAuth login / flip the grant)."""
+    agent_name = require_agent(request)
+    q = body.service.strip()[:64]
+    if not q:
+        raise HTTPException(status_code=400, detail="'service' is required")
+    if not store.check_request_rate(agent_name):
+        audit_log(agent_name, q, "request_rate_limited")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many vault requests this hour — a request is probably "
+                   "already pending. Ask the owner to check the dashboard.")
+    conn = store.find_connection(q)
+
+    if conn:
+        cid = conn["id"]
+        if store.has_grant(agent_name, cid):
+            ready = conn.get("status") == "ready"
+            return {"status": "already_available" if ready else "pending_setup",
+                    "connection": cid,
+                    "message": (
+                        f"You already have access to '{cid}' — call it via the proxy."
+                        if ready else
+                        f"'{cid}' exists and you have access, but the owner still needs "
+                        f"to finish its setup (status: {conn.get('status')})."
+                    )}
+        req = store.create_request(agent_name, "grant", cid,
+                                   service=conn.get("service", ""), reason=body.reason)
+        audit_log(agent_name, cid, "access_requested", body.reason[:200])
+        return {"status": "grant_requested", "connection": cid,
+                "already_pending": req["already_pending"],
+                "message": (
+                    f"'{cid}' is already set up in the vault — I've filed a request for you "
+                    f"to be granted access. Tell the user: approve it at {PUBLIC_URL or 'the vault dashboard'}/services."
+                )}
+
+    tpl_id = q.lower()
+    tpl = get_template(tpl_id)
+    target = (body.name.strip()[:64] or (tpl_id if tpl else q))
+    req = store.create_request(agent_name, "connection", target,
+                               service=tpl_id if tpl else "custom", reason=body.reason)
+    audit_log(agent_name, target, "connection_requested",
+              f"service={tpl_id if tpl else 'custom'} {body.reason[:150]}")
+    is_oauth = bool(tpl and tpl["auth"]["kind"] == "oauth2")
+    return {"status": "connection_requested",
+            "service": tpl_id if tpl else "custom",
+            "oauth": is_oauth,
+            "already_pending": req["already_pending"],
+            "message": (
+                f"No '{q}' connection exists yet — I've filed a setup request. "
+                f"Tell the user: open {PUBLIC_URL or 'the vault dashboard'}/services to "
+                + ("log in with their account (OAuth)." if is_oauth else "add the API key.")
+            )}
 
 
 class KeyStoreRequest(BaseModel):

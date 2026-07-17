@@ -18,6 +18,29 @@ The vault holds every credential (API keys AND OAuth logins for Google, GitHub, 
 
 ---
 
+## STEP ONE for any task that touches an external API
+
+Before planning around an API or service, check the vault first — another agent may already have set it up for the user:
+
+```bash
+python3 /app/skills/vault_client/vault_client.py ensure openai "need chat completions for a writing task"
+```
+
+or in Python:
+
+```python
+result = vault.ensure("quo", reason="user asked me to text a customer")
+if result["usable"]:
+    resp = vault.request(result["connection"], "GET", "/phone-numbers")
+else:
+    # A setup/access request was auto-filed. Relay result["message"] to the
+    # user (it tells them to open the vault dashboard) and continue with the
+    # parts of the task that don't need this service.
+    say(result["message"])
+```
+
+`ensure()` = `resolve()` (lightweight existence + grant check) plus an automatic `request_access()` when the service is missing or you lack access. Requests appear on the vault dashboard's Services page where the owner can add the key, complete the OAuth login, or approve your grant with one click. Requests are idempotent — calling twice doesn't spam.
+
 ## Quick Start
 
 ### List services you can call

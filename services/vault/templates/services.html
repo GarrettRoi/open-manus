@@ -19,6 +19,50 @@
 </div>
 {% endif %}
 
+{% if requests %}
+<!-- Pending agent requests -->
+<div class="card" style="border-color: var(--warning);">
+    <h3>&#128276; Agent Requests ({{ requests|length }})</h3>
+    <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 12px;">Agents asked for these while working on tasks. Approve access, or add the service below and the request will make sense.</p>
+    <div class="table-responsive">
+        <table>
+            <thead><tr><th>Agent</th><th>Wants</th><th>Reason</th><th>When</th><th>Actions</th></tr></thead>
+            <tbody>
+                {% for r in requests %}
+                <tr>
+                    <td><strong>{{ r.agent|capitalize }}</strong></td>
+                    <td>
+                        {% if r.kind == 'grant' %}
+                            <span class="badge badge-warning">access to</span> <strong>{{ r.target }}</strong>
+                        {% else %}
+                            <span class="badge badge-warning">new service</span> <strong>{{ r.target }}</strong>
+                            {% if r.service and r.service != 'custom' %}<span style="font-size: 12px; color: var(--text-muted);">({{ r.service }})</span>{% endif %}
+                        {% endif %}
+                    </td>
+                    <td style="font-size: 13px; color: var(--text-muted); max-width: 320px;">{{ r.reason or '&#8212;' }}</td>
+                    <td style="font-size: 12px; color: var(--text-muted);">{{ (r.updated_at or r.created_at or '')[:16] }}</td>
+                    <td>
+                        {% if r.kind == 'grant' %}
+                        <form method="post" action="/requests/approve-grant" style="display:inline;">
+                            <input type="hidden" name="request_id" value="{{ r.id }}">
+                            <button type="submit" class="btn btn-sm btn-primary">Grant</button>
+                        </form>
+                        {% else %}
+                        <button type="button" class="btn btn-sm btn-primary" onclick="prefillAdd('{{ r.service }}', '{{ r.target }}')">Set Up</button>
+                        {% endif %}
+                        <form method="post" action="/requests/dismiss" style="display:inline;">
+                            <input type="hidden" name="request_id" value="{{ r.id }}">
+                            <button type="submit" class="btn btn-sm btn-outline">Dismiss</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
 <!-- Add a service -->
 <div class="card">
     <h3>&#10133; Add a Service</h3>
@@ -210,6 +254,15 @@ function onServiceChange() {
     }
     // custom header controls only for the custom template
     document.getElementById('grp_header').style.display = (sid === 'custom') ? '' : 'none';
+}
+
+function prefillAdd(service, name) {
+    const sel = document.getElementById('svc_select');
+    if ([...sel.options].some(o => o.value === service)) sel.value = service;
+    else sel.value = 'custom';
+    onServiceChange();
+    document.querySelector('input[name="name"]').value = name;
+    document.querySelector('input[name="name"]').scrollIntoView({behavior: 'smooth', block: 'center'});
 }
 
 function openEdit(c) {

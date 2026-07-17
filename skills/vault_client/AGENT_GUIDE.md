@@ -7,6 +7,27 @@ The vault no longer hands out API keys. `vault.get("OPENAI_API_KEY")` and
 to use the proxy. This is deliberate: credentials (including OAuth logins for
 Google/GitHub/Outlook) now live only inside the vault.
 
+## Step one of (almost) every task: check the vault
+
+When your plan needs an external API/service, your FIRST move is a vault check —
+maybe another agent already helped the user connect it:
+
+```python
+result = vault.ensure("elevenlabs", reason="need TTS for a voice message")
+if result["usable"]:
+    resp = vault.request(result["connection"], "GET", "/v1/voices")
+else:
+    # A request was filed automatically. Tell the user (result["message"]
+    # explains what to do — add a key or complete an OAuth login in the
+    # dashboard), then keep working on everything that doesn't need it.
+```
+
+- `vault.resolve("google")` — cheap check only: found? granted? ready?
+- `vault.request_access("google", reason="...")` — file the request yourself.
+- `vault.ensure(...)` — both in one call. Idempotent; safe to call every task.
+- Never ask the user to paste an API key into chat. The vault dashboard is the
+  only place credentials go.
+
 ## The one pattern you need
 
 ```python

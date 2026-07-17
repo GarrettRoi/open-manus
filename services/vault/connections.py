@@ -35,6 +35,13 @@ PFX_CONN = "vault:conn:"
 CONN_INDEX = "vault:conns"
 PFX_GRANT = "vault:grant:"
 PFX_OAUTH_STATE = "vault:oauth_state:"
+PFX_REQUEST = "vault:request:"
+REQUEST_INDEX = "vault:requests"
+PFX_REQUEST_RATE = "vault:reqrate:"
+REQUEST_MAX_PER_AGENT = 10
+REQUEST_MAX_TOTAL = 200
+REQUEST_TTL_SECONDS = 7 * 24 * 3600  # stale requests age out after a week
+REQUEST_RATE_MAX = 20  # per agent per hour
 
 # Legacy prefixes (migrated on startup)
 PFX_LEGACY_KEY = "vault:key:"
@@ -206,6 +213,104 @@ class ConnectionStore:
             migrated += 1
             logger.info("Migrated legacy key %s -> connection %s (%s)", name, conn_id, service)
         return migrated
+
+    # -- Connection lookup (agent "does this exist?" check) ---------------------
+
+    def find_connection(self, query: str) -> Optional[Dict[str, Any]]:
+        """Fuzzy-match a connection by id, service, or label."""
+        q = (query or "").strip().lower()
+        if not q:
+            return None
+        qid = normalize_id(query)
+        conn = self.get(qid) if qid else None
+        if conn:
+            return conn
+        for cid in self.list_ids():
+            conn = self.get(cid)
+            if not conn:
+                continue
+            if q == (conn.get("service") or "").lower():
+                return conn
+            if q in cid.lower() or q in (conn.get("label") or "").lower():
+                return conn
+        return None
+
+    # -- Agent-initiated setup requests -----------------------------------------
+
+    def check_request_rate(self, agent: str) -> bool:
+        """Sliding per-agent budget: max REQUEST_RATE_MAX new/updated requests
+        per hour. Returns False when the budget is exhausted."""
+        key = f"{PFX_REQUEST_RATE}{agent}"
+        count = self.r.incr(key)
+        if count == 1:
+            self.r.expire(key, 3600)
+        return int(count) <= REQUEST_RATE_MAX
+
+    def create_request(self, agent: str, kind: str, target: str,
+                       service: str = "", reason: str = "") -> Dict[str, Any]:
+        """Record a pending request (kind: 'connection' or 'grant').
+
+        Idempotent per (agent, kind, target): repeated calls refresh the
+        timestamp/reason instead of duplicating. Bounded: per-agent and global
+        caps (oldest evicted), plus a TTL so stale requests age out.
+        """
+        target_id = (normalize_id(target) or "UNKNOWN")[:64]
+        rid = f"{kind}:{agent}:{target_id}"
+        key = f"{PFX_REQUEST}{rid}"
+        existing = bool(self.r.exists(key))
+        mapping = {
+            "agent": agent,
+            "kind": kind,
+            "target": target_id,
+            "service": (service or "")[:64],
+            "reason": (reason or "")[:500],
+            "updated_at": now_iso(),
+        }
+        if not existing:
+            mapping["created_at"] = now_iso()
+        self.r.hset(key, mapping=mapping)
+        self.r.expire(key, REQUEST_TTL_SECONDS)
+        self.r.zadd(REQUEST_INDEX, {rid: time.time()})
+
+        # Enforce caps: evict oldest for this agent, then oldest overall.
+        agent_rids = [r for r in self.r.zrange(REQUEST_INDEX, 0, -1)
+                      if r.split(":", 2)[1:2] == [agent]]
+        for old in agent_rids[:max(0, len(agent_rids) - REQUEST_MAX_PER_AGENT)]:
+            self.delete_request(old)
+        total = self.r.zcard(REQUEST_INDEX)
+        if total > REQUEST_MAX_TOTAL:
+            for old in self.r.zrange(REQUEST_INDEX, 0, total - REQUEST_MAX_TOTAL - 1):
+                self.delete_request(old)
+
+        out = self.r.hgetall(key)
+        out["id"] = rid
+        out["already_pending"] = existing
+        return out
+
+    def get_request(self, rid: str) -> Optional[Dict[str, Any]]:
+        data = self.r.hgetall(f"{PFX_REQUEST}{rid}")
+        if not data:
+            return None
+        data["id"] = rid
+        return data
+
+    def list_requests(self) -> List[Dict[str, Any]]:
+        result = []
+        for rid in self.r.zrange(REQUEST_INDEX, 0, -1, desc=True):
+            data = self.r.hgetall(f"{PFX_REQUEST}{rid}")
+            if data:
+                data["id"] = rid
+                result.append(data)
+            else:
+                self.r.zrem(REQUEST_INDEX, rid)  # TTL-expired: prune index
+        return result
+
+    def delete_request(self, rid: str) -> None:
+        self.r.delete(f"{PFX_REQUEST}{rid}")
+        self.r.zrem(REQUEST_INDEX, rid)
+
+    def pending_request_count(self) -> int:
+        return int(self.r.zcard(REQUEST_INDEX) or 0)
 
     # -- OAuth state -----------------------------------------------------------
 

@@ -3,6 +3,10 @@
 Keys never leave the vault. Call APIs *through* it.
 
 ```bash
+# STEP ONE when a task needs an external API: check + auto-request if missing
+python3 /app/skills/vault_client/vault_client.py ensure SERVICE "why I need it"
+#   exit 0 = usable now · exit 2 = request filed, relay the message to the user
+
 # What can I use?
 python3 /app/skills/vault_client/vault_client.py list
 
