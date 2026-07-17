@@ -794,6 +794,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._designated_voice_channel_id = int(_dvc)
             except ValueError:
                 logger.warning("[%s] Invalid DISCORD_VOICE_CHANNEL_ID: %r", self.name, _dvc)
+        # A /voicehome slash-command setting persists to disk and overrides
+        # the env var (None means "no persisted override").
+        _persisted = self._load_persisted_home_voice()
+        if _persisted is not None:
+            # {"channel_id": int} sets, {"channel_id": null} clears
+            self._designated_voice_channel_id = _persisted.get("channel_id")
         self._voice_auto_join: bool = (
             self._designated_voice_channel_id is not None
             and os.getenv("DISCORD_VOICE_AUTO_JOIN", "true").lower() in {"true", "1", "yes"}
@@ -2901,6 +2907,50 @@ class DiscordAdapter(BasePlatformAdapter):
 
     # ── Designated "home" voice channel (auto-join/leave) ────────────────
 
+    def _home_voice_state_path(self):
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "discord_home_voice.json"
+
+    def _load_persisted_home_voice(self) -> Optional[Dict[str, Any]]:
+        """Load the /voicehome override. Returns None when never set."""
+        try:
+            path = self._home_voice_state_path()
+            if not path.is_file():
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            cid = data.get("channel_id")
+            if cid is not None:
+                cid = int(cid)
+            return {"channel_id": cid}
+        except Exception as e:
+            logger.warning("[%s] Failed to load home voice state: %s", self.name, e)
+            return None
+
+    def _persist_home_voice(self, channel_id: Optional[int]) -> None:
+        """Persist the /voicehome override (survives restarts via ~/.hermes sync)."""
+        try:
+            path = self._home_voice_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"channel_id": channel_id}, f)
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning("[%s] Failed to persist home voice state: %s", self.name, e)
+
+    def _set_home_voice_channel(self, channel_id: Optional[int]) -> None:
+        """Apply + persist a new home voice channel (None clears it)."""
+        self._designated_voice_channel_id = channel_id
+        self._voice_auto_join = (
+            channel_id is not None
+            and os.getenv("DISCORD_VOICE_AUTO_JOIN", "true").lower() in {"true", "1", "yes"}
+        )
+        self._persist_home_voice(channel_id)
+
     @staticmethod
     def _channel_has_humans(channel) -> bool:
         """True when at least one non-bot member is in the voice channel."""
@@ -2984,6 +3034,57 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._on_voice_disconnect(str(text_ch_id))
                 except Exception:
                     pass
+
+    async def _handle_voicehome_slash(self, interaction, channel, action: str) -> None:
+        """Handle /voicehome — set/clear/show the home voice channel."""
+        if not await self._check_slash_authorization(interaction, f"/voicehome {action}"):
+            return
+
+        async def _reply(msg: str) -> None:
+            try:
+                await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                try:
+                    await interaction.followup.send(msg, ephemeral=True)
+                except Exception:
+                    pass
+
+        if action == "status":
+            dvc = self._designated_voice_channel_id
+            if dvc is None:
+                await _reply("No home voice channel is set. Use `/voicehome` while in a voice channel, or pass one with the `channel` option.")
+            else:
+                await _reply(f"Home voice channel: <#{dvc}> (auto-join {'on' if self._voice_auto_join else 'OFF via DISCORD_VOICE_AUTO_JOIN'}).")
+            return
+
+        if action == "clear":
+            had = self._designated_voice_channel_id
+            self._set_home_voice_channel(None)
+            await _reply(
+                f"Home voice channel cleared{f' (was <#{had}>)' if had else ''}. "
+                "I'll no longer auto-join; `/voice join` still works anywhere."
+            )
+            return
+
+        # action == "set"
+        target = channel
+        if target is None:
+            voice_state = getattr(getattr(interaction, "user", None), "voice", None)
+            target = getattr(voice_state, "channel", None)
+        if target is None:
+            await _reply("Join a voice channel first, or pass one with the `channel` option.")
+            return
+        if getattr(interaction, "guild_id", None) and getattr(getattr(target, "guild", None), "id", None) != interaction.guild_id:
+            await _reply("That voice channel is in a different server.")
+            return
+
+        self._set_home_voice_channel(target.id)
+        await _reply(
+            f"**{target.name}** is now my home voice channel. "
+            "I'll join whenever someone's there and leave when it empties."
+        )
+        # If humans are already in it (e.g. the invoker), join right away.
+        asyncio.create_task(self.check_designated_voice_channel())
 
     async def check_designated_voice_channel(self) -> None:
         """Startup check: if humans are already in the home voice channel, join."""
@@ -4401,6 +4502,26 @@ class DiscordAdapter(BasePlatformAdapter):
         ])
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
+
+        @tree.command(
+            name="voicehome",
+            description="Set this agent's home voice channel (she auto-joins when you're there)",
+        )
+        @discord.app_commands.describe(
+            channel="Voice channel to make home (default: the one you're in)",
+            action="set, clear, or status",
+        )
+        @discord.app_commands.choices(action=[
+            discord.app_commands.Choice(name="set — make it the home channel", value="set"),
+            discord.app_commands.Choice(name="clear — remove the home channel", value="clear"),
+            discord.app_commands.Choice(name="status — show the current home channel", value="status"),
+        ])
+        async def slash_voicehome(
+            interaction: discord.Interaction,
+            channel: Optional[discord.VoiceChannel] = None,
+            action: str = "set",
+        ):
+            await self._handle_voicehome_slash(interaction, channel, action)
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
