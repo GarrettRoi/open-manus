@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% set active_page = "services" %}
+
+{% block title %}Services{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Services</h2>
+    <p>Connect the APIs your agents can use. Keys and logins stay in the vault — agents call through the proxy and never see credentials.</p>
+</div>
+
+{% if error %}<div class="card" style="border-color: var(--danger);"><strong style="color: var(--danger);">&#9888; {{ error }}</strong></div>{% endif %}
+{% if notice %}<div class="card" style="border-color: var(--success);"><strong style="color: var(--success);">&#10003; {{ notice }}</strong></div>{% endif %}
+
+{% if public_url_missing %}
+<div class="card" style="border-color: var(--warning);">
+    <strong style="color: var(--warning);">&#9888; OAuth logins disabled:</strong>
+    <span style="color: var(--text-muted);">set the <code>VAULT_PUBLIC_URL</code> environment variable to this vault's public URL (its Railway domain) to enable "Connect with login" services.</span>
+</div>
+{% endif %}
+
+<!-- Add a service -->
+<div class="card">
+    <h3>&#10133; Add a Service</h3>
+    <div class="form-group">
+        <label>Service</label>
+        <select id="svc_select" onchange="onServiceChange()" style="width: 100%; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius);">
+            {% for sid, tpl in catalog.items() %}
+            <option value="{{ sid }}">{{ tpl.label }}{% if tpl.auth.kind == 'oauth2' %} — login with account{% endif %}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <p id="svc_help" style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;"></p>
+    <p id="svc_redirect" style="display:none; font-size: 13px; margin-bottom: 16px;">
+        Redirect URL for the OAuth app:
+        <code id="svc_redirect_url">{{ redirect_uri }}</code>
+        <button type="button" class="btn btn-sm btn-outline" onclick="copyToClipboard('{{ redirect_uri }}', this)">Copy</button>
+    </p>
+
+    <form method="post" action="/services/add">
+        <input type="hidden" name="service" id="svc_field" value="openai">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Connection name (what agents call it)</label>
+                <input type="text" name="name" required placeholder="OPENAI" style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+                <label>Description (optional)</label>
+                <input type="text" name="description" placeholder="What is this connection for?">
+            </div>
+        </div>
+
+        <div id="grp_base_url" class="form-group" style="display:none;">
+            <label id="lbl_base_url">API base URL</label>
+            <input type="url" name="base_url" id="inp_base_url" placeholder="https://api.example.com/v1">
+        </div>
+        <div id="grp_header" class="form-row" style="display:none;">
+            <div class="form-group">
+                <label>Auth header name</label>
+                <input type="text" name="header_name" placeholder="Authorization">
+            </div>
+            <div class="form-group">
+                <label>Value prefix (e.g. "Bearer ")</label>
+                <input type="text" name="prefix" placeholder="Bearer ">
+            </div>
+        </div>
+
+        <div id="grp_api_key" class="form-group">
+            <label>API key</label>
+            <input type="password" name="api_key" placeholder="paste the key — agents will never see it">
+        </div>
+
+        <div id="grp_oauth" style="display:none;">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>OAuth client ID</label>
+                    <input type="text" name="client_id" placeholder="from the provider's developer console">
+                </div>
+                <div class="form-group">
+                    <label>OAuth client secret</label>
+                    <input type="password" name="client_secret">
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Skill / usage notes for agents (optional)</label>
+            <textarea name="skill_description" placeholder="How should agents use this service?"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary" id="btn_add">Add Service</button>
+    </form>
+</div>
+
+<!-- Existing connections -->
+<div class="card">
+    <h3>&#128268; Connections</h3>
+    {% if connections %}
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr><th>Name</th><th>Service</th><th>Auth</th><th>Status</th><th>Actions</th></tr>
+            </thead>
+            <tbody>
+                {% for c in connections %}
+                <tr>
+                    <td><strong>{{ c.id }}</strong><br><span style="font-size: 12px; color: var(--text-muted);">{{ c.base_url }}</span></td>
+                    <td>{{ c.label }}</td>
+                    <td><span class="badge badge-muted">{{ 'login' if c.auth_kind == 'oauth2' else 'API key' }}</span></td>
+                    <td>
+                        {% if c.auth_kind == 'oauth2' %}
+                            {% if c.connected %}
+                                <span class="badge badge-success">connected</span>
+                                {% if c.token_expires_at %}<br><span style="font-size: 11px; color: var(--text-muted);">token exp: {{ c.token_expires_at[:16] }}</span>{% endif %}
+                            {% else %}
+                                <span class="badge badge-warning">login needed</span>
+                            {% endif %}
+                        {% elif c.status == 'needs_base_url' %}
+                            <span class="badge badge-warning">needs base URL</span>
+                        {% elif c.connected %}
+                            <span class="badge badge-success">ready</span>
+                        {% else %}
+                            <span class="badge badge-warning">no key</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if c.auth_kind == 'oauth2' %}
+                        <a href="/services/{{ c.id }}/connect" class="btn btn-sm btn-primary">{{ 'Reconnect' if c.connected else 'Connect' }}</a>
+                        {% endif %}
+                        <button class="btn btn-sm btn-outline" onclick='openEdit({{ c | tojson }})'>Edit</button>
+                        <form method="post" action="/services/delete" style="display:inline;" onsubmit="return confirm('Delete {{ c.id }}?')">
+                            <input type="hidden" name="conn_id" value="{{ c.id }}">
+                            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p style="color: var(--text-muted); padding: 20px 0;">No services connected yet. Add one above.</p>
+    {% endif %}
+</div>
+
+<!-- Edit Modal -->
+<div class="modal-overlay" id="editModal">
+    <div class="modal">
+        <h3>Edit Connection</h3>
+        <form method="post" action="/services/update">
+            <input type="hidden" name="conn_id" id="e_conn_id">
+            <div class="form-group">
+                <label>Base URL</label>
+                <input type="url" name="base_url" id="e_base_url">
+            </div>
+            <div class="form-group" id="e_grp_key">
+                <label>New API key (leave blank to keep current)</label>
+                <input type="password" name="api_key">
+            </div>
+            <div id="e_grp_oauth" style="display:none;">
+                <div class="form-group">
+                    <label>OAuth client ID (leave blank to keep)</label>
+                    <input type="text" name="client_id">
+                </div>
+                <div class="form-group">
+                    <label>OAuth client secret (leave blank to keep)</label>
+                    <input type="password" name="client_secret">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <input type="text" name="description" id="e_description">
+            </div>
+            <div class="form-group">
+                <label>Skill / usage notes for agents</label>
+                <textarea name="skill_description" id="e_skill"></textarea>
+            </div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeEdit()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const CATALOG = {{ catalog | tojson }};
+
+function onServiceChange() {
+    const sid = document.getElementById('svc_select').value;
+    const tpl = CATALOG[sid];
+    document.getElementById('svc_field').value = sid;
+    document.getElementById('svc_help').textContent = tpl.setup_help || '';
+
+    const isOAuth = tpl.auth.kind === 'oauth2';
+    document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
+    document.getElementById('grp_api_key').style.display = isOAuth ? 'none' : '';
+    document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
+    document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
+
+    // base URL field: needed when template has no default
+    const needsBase = !tpl.base_url && !isOAuth;
+    document.getElementById('grp_base_url').style.display = needsBase ? '' : 'none';
+    const fields = tpl.fields || [];
+    const baseField = fields.find(f => f.name === 'base_url');
+    if (baseField) {
+        document.getElementById('lbl_base_url').textContent = baseField.label;
+        document.getElementById('inp_base_url').placeholder = baseField.placeholder || '';
+    }
+    // custom header controls only for the custom template
+    document.getElementById('grp_header').style.display = (sid === 'custom') ? '' : 'none';
+}
+
+function openEdit(c) {
+    document.getElementById('e_conn_id').value = c.id;
+    document.getElementById('e_base_url').value = c.base_url || '';
+    document.getElementById('e_description').value = c.description || '';
+    document.getElementById('e_skill').value = c.skill_description || '';
+    const isOAuth = c.auth_kind === 'oauth2';
+    document.getElementById('e_grp_key').style.display = isOAuth ? 'none' : '';
+    document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
+    document.getElementById('editModal').classList.add('active');
+}
+function closeEdit() { document.getElementById('editModal').classList.remove('active'); }
+document.getElementById('editModal').addEventListener('click', function(e) {
+    if (e.target === this) closeEdit();
+});
+onServiceChange();
+</script>
+{% endblock %}

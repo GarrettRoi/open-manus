@@ -1,11 +1,15 @@
 """
-Open Manus API Key Vault — Centralized key management for the agent team.
+Open Manus API Key Vault — Zero-exposure credential management for the agent team.
 
 Architecture:
-  - Admin GUI: Password-protected web dashboard for Garrett
-  - Agent API: Token-authenticated endpoint for agents to fetch keys
-  - Storage: Redis with Fernet encryption at rest
-  - Audit: Every key access is logged
+  - Admin GUI: password-protected dashboard for managing service connections,
+    grants, and OAuth logins.
+  - Agent API: token-authenticated. Agents can LIST connections and PROXY
+    requests through them — they can never fetch raw credentials.
+  - Proxy: the vault injects the credential (API key or auto-refreshed OAuth
+    access token) server-side and returns only the upstream response.
+  - Storage: Redis with Fernet encryption at rest.
+  - Audit: every proxy call, grant change, and admin action is logged.
 """
 
 import hashlib
@@ -15,16 +19,27 @@ import os
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Request, Depends, Form, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+import httpx
 import redis
 import uvicorn
+from cryptography.fernet import Fernet
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
+from catalog import CATALOG, get_template
+from connections import (
+    PFX_GRANT,
+    AuthInjectionError,
+    ConnectionStore,
+    build_auth,
+    normalize_id,
+)
+import oauth as oauth_mod
+from oauth import OAuthError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vault")
@@ -35,23 +50,32 @@ logger = logging.getLogger("vault")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ADMIN_PASSWORD = os.getenv("VAULT_ADMIN_PASSWORD", "changeme")
 VAULT_PORT = int(os.getenv("PORT", "8080"))
+# Public URL of this vault (Railway domain) — required for OAuth callbacks.
+PUBLIC_URL = (os.getenv("VAULT_PUBLIC_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+if PUBLIC_URL and not PUBLIC_URL.startswith("http"):
+    PUBLIC_URL = f"https://{PUBLIC_URL}"
 
-# Redis key prefixes
-PFX_KEY = "vault:key:"
-PFX_KEY_INDEX = "vault:keys"          # sorted set of key names
 PFX_AGENT = "vault:agent:"
-PFX_AGENT_INDEX = "vault:agents"      # sorted set of agent names
-PFX_GRANT = "vault:grant:"            # vault:grant:{agent}:{key_name}
-PFX_AUDIT = "vault:audit"             # list of audit entries
+PFX_AGENT_INDEX = "vault:agents"
+PFX_AUDIT = "vault:audit"
 PFX_MASTER = "vault:master_key"
-PFX_SKILL = "vault:skill:"            # vault:skill:{key_name} → skill/tool description
-PFX_SKILL_INDEX = "vault:skills"      # sorted set
 
-# Agent list (pre-populated)
 AGENT_NAMES = [
     "harmony", "samantha", "addison", "bianca", "cora", "jade",
-    "raven", "sabrina", "sasha", "scarlett", "tatiana", "valentina", "lexi"
+    "raven", "sabrina", "sasha", "scarlett", "tatiana", "valentina", "lexi",
+    "victoria", "vivian",
 ]
+
+# Agents allowed to create new API-key connections via the API.
+STORE_ALLOWED_AGENTS = {"valentina", "harmony", "admin"}
+
+# Proxy limits
+PROXY_TIMEOUT_MAX = 120
+PROXY_BODY_MAX = 10 * 1024 * 1024  # 10MB response cap
+_BLOCKED_REQUEST_HEADERS = {
+    "authorization", "cookie", "host", "content-length", "transfer-encoding",
+    "x-n8n-api-key", "xi-api-key", "x-api-key",
+}
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -66,7 +90,6 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 # Encryption helpers
 # ---------------------------------------------------------------------------
 def get_master_key() -> bytes:
-    """Get or create the master encryption key."""
     stored = r.get(PFX_MASTER)
     if stored:
         return stored.encode()
@@ -76,46 +99,39 @@ def get_master_key() -> bytes:
 
 
 def encrypt_value(plaintext: str) -> str:
-    f = Fernet(get_master_key())
-    return f.encrypt(plaintext.encode()).decode()
+    return Fernet(get_master_key()).encrypt(plaintext.encode()).decode()
 
 
 def decrypt_value(ciphertext: str) -> str:
-    f = Fernet(get_master_key())
-    return f.decrypt(ciphertext.encode()).decode()
+    return Fernet(get_master_key()).decrypt(ciphertext.encode()).decode()
 
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def mask_value(value: str) -> str:
-    """Show first 4 and last 4 chars, mask the rest."""
-    if len(value) <= 12:
-        return value[:2] + "*" * (len(value) - 4) + value[-2:]
-    return value[:4] + "*" * (len(value) - 8) + value[-4:]
+store = ConnectionStore(r, encrypt_value, decrypt_value)
 
 
 # ---------------------------------------------------------------------------
 # Audit logging
 # ---------------------------------------------------------------------------
-def audit_log(agent: str, key_name: str, action: str, detail: str = ""):
+def audit_log(agent: str, target: str, action: str, detail: str = ""):
     entry = {
         "agent": agent,
-        "key_name": key_name,
+        "key_name": target,  # field name kept for audit template compat
         "action": action,
         "detail": detail,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     r.lpush(PFX_AUDIT, json.dumps(entry))
-    r.ltrim(PFX_AUDIT, 0, 999)  # Keep last 1000 entries
+    r.ltrim(PFX_AUDIT, 0, 1999)
 
 
 # ---------------------------------------------------------------------------
-# Initialization — create agent tokens if not exist
+# Agents / auth
 # ---------------------------------------------------------------------------
 def init_agents():
-    """Ensure all agents have tokens."""
     for name in AGENT_NAMES:
         key = f"{PFX_AGENT}{name}"
         if not r.exists(key):
@@ -123,44 +139,72 @@ def init_agents():
             r.hset(key, mapping={
                 "name": name,
                 "token_hash": hash_token(token),
-                "token_plain": token,  # Stored only for admin display, encrypted at rest
+                "token_plain": token,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
             r.zadd(PFX_AGENT_INDEX, {name: time.time()})
-            logger.info(f"Created agent token for {name}")
+            logger.info("Created agent token for %s", name)
 
 
-# ---------------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------------
-SESSION_TOKENS = {}  # In-memory session store (simple for single-instance)
+SESSION_TOKENS: Dict[str, float] = {}
 
 
 def verify_admin_session(request: Request) -> bool:
     session_id = request.cookies.get("vault_session")
-    if not session_id:
-        return False
-    return SESSION_TOKENS.get(session_id, 0) > time.time()
-
-
-def require_admin(request: Request):
-    if not verify_admin_session(request):
-        raise HTTPException(status_code=303, headers={"Location": "/login"})
+    return bool(session_id) and SESSION_TOKENS.get(session_id, 0) > time.time()
 
 
 def verify_agent_token(token: str) -> Optional[str]:
-    """Verify an agent token and return the agent name."""
     token_h = hash_token(token)
-    agents = r.zrange(PFX_AGENT_INDEX, 0, -1)
-    for agent_name in agents:
+    for agent_name in r.zrange(PFX_AGENT_INDEX, 0, -1):
         data = r.hgetall(f"{PFX_AGENT}{agent_name}")
         if data and data.get("token_hash") == token_h:
             return agent_name
     return None
 
 
+def require_agent(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    agent_name = verify_agent_token(auth[7:])
+    if not agent_name:
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+    return agent_name
+
+
+def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[str, Any]:
+    """Public (secret-free) view of a connection."""
+    tpl = get_template(conn.get("service", "")) or {}
+    view = {
+        "id": conn["id"],
+        "service": conn.get("service", ""),
+        "label": conn.get("label", ""),
+        "base_url": conn.get("base_url", ""),
+        "auth_kind": (conn.get("auth") or {}).get("kind", ""),
+        "status": conn.get("status", ""),
+        "description": conn.get("description", ""),
+        "skill_description": conn.get("skill_description", ""),
+        "example_call": tpl.get("example_call", ""),
+        "created_at": conn.get("created_at", ""),
+        "updated_at": conn.get("updated_at", ""),
+    }
+    if include_secret_state:
+        secrets_d = store.get_secrets(conn["id"])
+        if view["auth_kind"] == "oauth2":
+            view["connected"] = bool(secrets_d.get("access_token"))
+            exp = secrets_d.get("expires_at")
+            view["token_expires_at"] = (
+                datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat() if exp else ""
+            )
+            view["has_client"] = bool(secrets_d.get("client_id"))
+        else:
+            view["connected"] = bool(secrets_d.get("api_key"))
+    return view
+
+
 # ---------------------------------------------------------------------------
-# Admin GUI Routes
+# Admin GUI — login/logout
 # ---------------------------------------------------------------------------
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
@@ -169,9 +213,9 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def login_submit(request: Request, password: str = Form(...)):
-    if password == ADMIN_PASSWORD:
+    if secrets.compare_digest(password, ADMIN_PASSWORD):
         session_id = secrets.token_urlsafe(32)
-        SESSION_TOKENS[session_id] = time.time() + 86400  # 24h session
+        SESSION_TOKENS[session_id] = time.time() + 86400
         response = RedirectResponse(url="/", status_code=303)
         response.set_cookie("vault_session", session_id, httponly=True, max_age=86400)
         return response
@@ -188,238 +232,274 @@ async def logout(request: Request):
     return response
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+def _admin_or_redirect(request: Request):
     if not verify_admin_session(request):
         return RedirectResponse(url="/login", status_code=303)
+    return None
 
-    # Get all keys
-    key_names = r.zrange(PFX_KEY_INDEX, 0, -1)
-    keys = []
-    for kn in key_names:
-        data = r.hgetall(f"{PFX_KEY}{kn}")
-        if data:
-            try:
-                masked = mask_value(decrypt_value(data.get("encrypted_value", "")))
-            except Exception:
-                masked = "***error***"
-            data["masked_value"] = masked
-            data["name"] = kn
-            # Get which agents have access
-            granted_agents = []
-            for agent in AGENT_NAMES:
-                if r.exists(f"{PFX_GRANT}{agent}:{kn}"):
-                    granted_agents.append(agent)
-            data["granted_agents"] = granted_agents
-            data["grant_count"] = len(granted_agents)
-            # Get skill description
-            skill = r.hgetall(f"{PFX_SKILL}{kn}")
-            data["skill_description"] = skill.get("description", "") if skill else ""
-            keys.append(data)
 
-    # Get all agents
+# ---------------------------------------------------------------------------
+# Admin GUI — dashboard & services
+# ---------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+
+    conn_ids = store.list_ids()
+    conns = []
+    for cid in conn_ids:
+        conn = store.get(cid)
+        if not conn:
+            continue
+        view = _conn_view(conn)
+        view["granted_agents"] = [a for a in AGENT_NAMES if store.has_grant(a, cid)]
+        view["grant_count"] = len(view["granted_agents"])
+        conns.append(view)
+
     agents = []
     for name in AGENT_NAMES:
         data = r.hgetall(f"{PFX_AGENT}{name}")
         if data:
-            # Count granted keys
-            granted_keys = []
-            for kn in key_names:
-                if r.exists(f"{PFX_GRANT}{name}:{kn}"):
-                    granted_keys.append(kn)
-            data["granted_keys"] = granted_keys
-            data["key_count"] = len(granted_keys)
+            granted = [cid for cid in conn_ids if store.has_grant(name, cid)]
+            data["granted_keys"] = granted
+            data["key_count"] = len(granted)
             agents.append(data)
 
     return templates.TemplateResponse(request, "dashboard.html", {
-        "keys": keys,
+        "connections": conns,
         "agents": agents,
         "agent_names": AGENT_NAMES,
-        "key_names": key_names,
     })
 
 
-@app.get("/keys", response_class=HTMLResponse)
-async def keys_page(request: Request):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
+@app.get("/services", response_class=HTMLResponse)
+async def services_page(request: Request, error: str = "", notice: str = ""):
+    if (resp := _admin_or_redirect(request)):
+        return resp
 
-    key_names = r.zrange(PFX_KEY_INDEX, 0, -1)
-    keys = []
-    for kn in key_names:
-        data = r.hgetall(f"{PFX_KEY}{kn}")
-        if data:
-            try:
-                masked = mask_value(decrypt_value(data.get("encrypted_value", "")))
-            except Exception:
-                masked = "***error***"
-            data["masked_value"] = masked
-            data["name"] = kn
-            skill = r.hgetall(f"{PFX_SKILL}{kn}")
-            data["skill_description"] = skill.get("description", "") if skill else ""
-            keys.append(data)
+    conns = []
+    for cid in store.list_ids():
+        conn = store.get(cid)
+        if conn:
+            conns.append(_conn_view(conn))
 
-    return templates.TemplateResponse(request, "keys.html", {"keys": keys})
-
-
-@app.post("/keys/add")
-async def add_key(
-    request: Request,
-    key_name: str = Form(...),
-    key_value: str = Form(...),
-    service: str = Form(""),
-    description: str = Form(""),
-    skill_description: str = Form(""),
-):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    key_name = key_name.strip().upper().replace(" ", "_")
-    now = datetime.now(timezone.utc).isoformat()
-
-    r.hset(f"{PFX_KEY}{key_name}", mapping={
-        "service": service,
-        "description": description,
-        "encrypted_value": encrypt_value(key_value),
-        "created_at": now,
-        "updated_at": now,
+    return templates.TemplateResponse(request, "services.html", {
+        "connections": conns,
+        "catalog": CATALOG,
+        "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL) if PUBLIC_URL else "",
+        "public_url_missing": not PUBLIC_URL,
+        "error": error,
+        "notice": notice,
     })
-    r.zadd(PFX_KEY_INDEX, {key_name: time.time()})
-
-    if skill_description.strip():
-        r.hset(f"{PFX_SKILL}{key_name}", mapping={
-            "description": skill_description,
-            "updated_at": now,
-        })
-        r.zadd(PFX_SKILL_INDEX, {key_name: time.time()})
-
-    audit_log("admin", key_name, "key_created", f"Service: {service}")
-    return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/keys/update")
-async def update_key(
-    request: Request,
-    key_name: str = Form(...),
-    key_value: str = Form(""),
-    service: str = Form(""),
-    description: str = Form(""),
-    skill_description: str = Form(""),
-):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
+@app.post("/services/add")
+async def add_service(request: Request):
+    if (resp := _admin_or_redirect(request)):
+        return resp
 
-    now = datetime.now(timezone.utc).isoformat()
-    updates = {"updated_at": now}
-    if key_value.strip():
-        updates["encrypted_value"] = encrypt_value(key_value)
-    if service is not None:
-        updates["service"] = service
-    if description is not None:
-        updates["description"] = description
+    form = await request.form()
+    service = (form.get("service") or "custom").strip().lower()
+    tpl = get_template(service)
+    if not tpl:
+        return RedirectResponse(url="/services?error=Unknown+service", status_code=303)
 
-    r.hset(f"{PFX_KEY}{key_name}", mapping=updates)
+    name = form.get("name") or service
+    conn_id = normalize_id(name)
+    if not conn_id:
+        return RedirectResponse(url="/services?error=Name+required", status_code=303)
 
-    if skill_description is not None:
-        r.hset(f"{PFX_SKILL}{key_name}", mapping={
-            "description": skill_description,
-            "updated_at": now,
-        })
-        r.zadd(PFX_SKILL_INDEX, {key_name: time.time()})
+    auth = dict(tpl["auth"])
+    base_url = (form.get("base_url") or tpl.get("base_url") or "").strip()
+    if auth["kind"] == "header":
+        # allow custom-template header overrides
+        if form.get("header_name"):
+            auth["header_name"] = form.get("header_name").strip()
+        if form.get("prefix") is not None and service == "custom":
+            auth["prefix"] = form.get("prefix")
 
-    audit_log("admin", key_name, "key_updated")
-    return RedirectResponse(url="/", status_code=303)
+    secrets_d: Dict[str, Any] = {}
+    status = "ready"
+    if auth["kind"] == "oauth2":
+        client_id = (form.get("client_id") or "").strip()
+        client_secret = (form.get("client_secret") or "").strip()
+        if not client_id or not client_secret:
+            return RedirectResponse(
+                url="/services?error=Client+ID+and+secret+are+required+for+OAuth+services",
+                status_code=303)
+        secrets_d = {"client_id": client_id, "client_secret": client_secret}
+        status = "needs_login"
+    else:
+        api_key = (form.get("api_key") or "").strip()
+        if not api_key:
+            return RedirectResponse(url="/services?error=API+key+required", status_code=303)
+        secrets_d = {"api_key": api_key}
+        if not base_url:
+            return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
+
+    store.save(
+        conn_id, service=service, label=form.get("label") or tpl["label"],
+        base_url=base_url, auth=auth, secrets=secrets_d,
+        description=form.get("description") or "",
+        skill_description=form.get("skill_description") or "",
+        status=status,
+    )
+    audit_log("admin", conn_id, "connection_created", f"Service: {service}")
+
+    if status == "needs_login":
+        return RedirectResponse(url=f"/services/{conn_id}/connect", status_code=303)
+    return RedirectResponse(url="/services?notice=Connection+added", status_code=303)
 
 
-@app.post("/keys/delete")
-async def delete_key(request: Request, key_name: str = Form(...)):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
+@app.post("/services/update")
+async def update_service(request: Request):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    form = await request.form()
+    conn_id = normalize_id(form.get("conn_id") or "")
+    conn = store.get(conn_id)
+    if not conn:
+        return RedirectResponse(url="/services?error=Not+found", status_code=303)
 
-    r.delete(f"{PFX_KEY}{key_name}")
-    r.zrem(PFX_KEY_INDEX, key_name)
-    r.delete(f"{PFX_SKILL}{key_name}")
-    r.zrem(PFX_SKILL_INDEX, key_name)
+    secrets_d = store.get_secrets(conn_id)
+    api_key = (form.get("api_key") or "").strip()
+    if api_key:
+        secrets_d["api_key"] = api_key
+    client_id = (form.get("client_id") or "").strip()
+    client_secret = (form.get("client_secret") or "").strip()
+    if client_id:
+        secrets_d["client_id"] = client_id
+    if client_secret:
+        secrets_d["client_secret"] = client_secret
 
-    # Remove all grants for this key
-    for agent in AGENT_NAMES:
-        r.delete(f"{PFX_GRANT}{agent}:{key_name}")
+    store.save(
+        conn_id, service=conn["service"],
+        label=form.get("label") or conn.get("label", ""),
+        base_url=(form.get("base_url") or conn.get("base_url", "")).strip(),
+        auth=conn.get("auth"),
+        secrets=secrets_d,
+        description=form.get("description", conn.get("description", "")),
+        skill_description=form.get("skill_description", conn.get("skill_description", "")),
+        status=conn.get("status", "ready"),
+    )
+    audit_log("admin", conn_id, "connection_updated")
+    return RedirectResponse(url="/services?notice=Connection+updated", status_code=303)
 
-    audit_log("admin", key_name, "key_deleted")
-    return RedirectResponse(url="/", status_code=303)
+
+@app.post("/services/delete")
+async def delete_service(request: Request, conn_id: str = Form(...)):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    store.delete(normalize_id(conn_id), AGENT_NAMES)
+    audit_log("admin", conn_id, "connection_deleted")
+    return RedirectResponse(url="/services?notice=Connection+deleted", status_code=303)
 
 
 # ---------------------------------------------------------------------------
-# Grant management
+# Admin GUI — OAuth connect flow
+# ---------------------------------------------------------------------------
+@app.get("/services/{conn_id}/connect")
+async def oauth_connect(request: Request, conn_id: str):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    conn = store.get(normalize_id(conn_id))
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if (conn.get("auth") or {}).get("kind") != "oauth2":
+        return RedirectResponse(url="/services?error=Not+an+OAuth+service", status_code=303)
+    if not PUBLIC_URL:
+        return RedirectResponse(
+            url="/services?error=Set+VAULT_PUBLIC_URL+env+var+to+enable+OAuth+logins",
+            status_code=303)
+    secrets_d = store.get_secrets(conn["id"])
+    if not secrets_d.get("client_id"):
+        return RedirectResponse(url="/services?error=Add+the+OAuth+client+ID+first", status_code=303)
+    try:
+        url = oauth_mod.build_authorize_url(
+            conn["service"], conn["id"], secrets_d["client_id"], PUBLIC_URL, store)
+    except OAuthError as exc:
+        return RedirectResponse(url=f"/services?error={str(exc).replace(' ', '+')}", status_code=303)
+    return RedirectResponse(url=url, status_code=303)
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if not verify_admin_session(request):
+        return RedirectResponse(url="/login", status_code=303)
+    if error:
+        return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
+    pending = store.pop_oauth_state(state) if state else None
+    if not pending or not code:
+        return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
+
+    conn_id = pending["conn_id"]
+    conn = store.get(conn_id)
+    if not conn:
+        return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
+    secrets_d = store.get_secrets(conn_id)
+    try:
+        tokens = await oauth_mod.exchange_code(
+            pending["service"], code, secrets_d.get("client_id", ""),
+            secrets_d.get("client_secret", ""), PUBLIC_URL)
+    except OAuthError as exc:
+        audit_log("admin", conn_id, "oauth_failed", str(exc)[:200])
+        return RedirectResponse(url=f"/services?error={str(exc)[:120].replace(' ', '+')}", status_code=303)
+
+    secrets_d.update(tokens)
+    store.set_secrets(conn_id, secrets_d)
+    r.hset(f"vault:conn:{conn_id}", "status", "ready")
+    audit_log("admin", conn_id, "oauth_connected", f"Service: {pending['service']}")
+    return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Admin GUI — grants / agents / audit
 # ---------------------------------------------------------------------------
 @app.get("/grants", response_class=HTMLResponse)
 async def grants_page(request: Request):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    key_names = r.zrange(PFX_KEY_INDEX, 0, -1)
-
-    # Build grant matrix
-    matrix = {}
-    for agent in AGENT_NAMES:
-        matrix[agent] = {}
-        for kn in key_names:
-            matrix[agent][kn] = r.exists(f"{PFX_GRANT}{agent}:{kn}")
-
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    conn_ids = store.list_ids()
+    matrix = {
+        agent: {cid: store.has_grant(agent, cid) for cid in conn_ids}
+        for agent in AGENT_NAMES
+    }
     return templates.TemplateResponse(request, "grants.html", {
         "agents": AGENT_NAMES,
-        "key_names": key_names,
+        "key_names": conn_ids,
         "matrix": matrix,
     })
 
 
 @app.post("/grants/update")
 async def update_grants(request: Request):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
+    if (resp := _admin_or_redirect(request)):
+        return resp
     form = await request.form()
-    key_names = r.zrange(PFX_KEY_INDEX, 0, -1)
-    now = datetime.now(timezone.utc).isoformat()
-
+    conn_ids = store.list_ids()
     for agent in AGENT_NAMES:
-        for kn in key_names:
-            field_name = f"grant_{agent}_{kn}"
-            grant_key = f"{PFX_GRANT}{agent}:{kn}"
-            if field_name in form:
-                if not r.exists(grant_key):
-                    r.hset(grant_key, mapping={"granted_at": now, "granted_by": "admin"})
-                    audit_log("admin", kn, "grant_added", f"Granted to {agent}")
-            else:
-                if r.exists(grant_key):
-                    r.delete(grant_key)
-                    audit_log("admin", kn, "grant_removed", f"Revoked from {agent}")
-
+        for cid in conn_ids:
+            granted = f"grant_{agent}_{cid}" in form
+            if store.set_grant(agent, cid, granted):
+                audit_log("admin", cid,
+                          "grant_added" if granted else "grant_removed",
+                          f"{'Granted to' if granted else 'Revoked from'} {agent}")
     return RedirectResponse(url="/grants", status_code=303)
 
 
-# ---------------------------------------------------------------------------
-# Agent tokens page
-# ---------------------------------------------------------------------------
 @app.get("/agents", response_class=HTMLResponse)
 async def agents_page(request: Request):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    agents = []
-    for name in AGENT_NAMES:
-        data = r.hgetall(f"{PFX_AGENT}{name}")
-        if data:
-            agents.append(data)
-
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    agents = [d for name in AGENT_NAMES if (d := r.hgetall(f"{PFX_AGENT}{name}"))]
     return templates.TemplateResponse(request, "agents.html", {"agents": agents})
 
 
 @app.post("/agents/regenerate")
 async def regenerate_token(request: Request, agent_name: str = Form(...)):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
+    if (resp := _admin_or_redirect(request)):
+        return resp
     token = secrets.token_urlsafe(32)
     r.hset(f"{PFX_AGENT}{agent_name}", mapping={
         "token_hash": hash_token(token),
@@ -429,178 +509,240 @@ async def regenerate_token(request: Request, agent_name: str = Form(...)):
     return RedirectResponse(url="/agents", status_code=303)
 
 
-# ---------------------------------------------------------------------------
-# Audit log page
-# ---------------------------------------------------------------------------
 @app.get("/audit", response_class=HTMLResponse)
 async def audit_page(request: Request):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    raw_entries = r.lrange(PFX_AUDIT, 0, 99)
-    entries = [json.loads(e) for e in raw_entries]
-
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    entries = [json.loads(e) for e in r.lrange(PFX_AUDIT, 0, 199)]
     return templates.TemplateResponse(request, "audit.html", {"entries": entries})
 
 
 # ---------------------------------------------------------------------------
-# Agent API — Secure key fetch endpoint
+# Agent API
 # ---------------------------------------------------------------------------
-class KeyFetchRequest(BaseModel):
-    key_name: str
-
-
 @app.get("/api/vault/fetch/{key_name}")
-async def fetch_key(key_name: str, request: Request):
-    """Agent endpoint: fetch a key value by name. Requires Bearer token."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = auth[7:]
-    agent_name = verify_agent_token(token)
-    if not agent_name:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-
-    # Check grant
-    if not r.exists(f"{PFX_GRANT}{agent_name}:{key_name}"):
-        audit_log(agent_name, key_name, "fetch_denied", "No grant")
-        raise HTTPException(status_code=403, detail=f"Agent '{agent_name}' does not have access to '{key_name}'")
-
-    # Fetch and decrypt
-    data = r.hgetall(f"{PFX_KEY}{key_name}")
-    if not data:
-        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found")
-
+async def fetch_key_removed(key_name: str, request: Request):
+    """Raw key fetch is gone — the vault is proxy-only now."""
+    agent = None
     try:
-        value = decrypt_value(data["encrypted_value"])
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to decrypt key")
-
-    audit_log(agent_name, key_name, "fetch_success")
-
-    return {"key_name": key_name, "value": value}
+        agent = require_agent(request)
+    except HTTPException:
+        pass
+    audit_log(agent or "unknown", key_name, "fetch_blocked", "Raw fetch removed")
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Raw key fetch has been removed. Use the proxy instead: "
+            "POST /api/vault/proxy/{connection} with "
+            '{"method": "GET", "path": "/..."} — the vault attaches the '
+            "credential for you. See /api/vault/list for your connections."
+        ),
+    )
 
 
 @app.get("/api/vault/list")
-async def list_available_keys(request: Request):
-    """Agent endpoint: list keys this agent has access to, with skill descriptions."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = auth[7:]
-    agent_name = verify_agent_token(token)
-    if not agent_name:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-
-    key_names = r.zrange(PFX_KEY_INDEX, 0, -1)
+async def list_connections(request: Request):
+    agent_name = require_agent(request)
     available = []
-    for kn in key_names:
-        if r.exists(f"{PFX_GRANT}{agent_name}:{kn}"):
-            key_data = r.hgetall(f"{PFX_KEY}{kn}")
-            skill_data = r.hgetall(f"{PFX_SKILL}{kn}")
-            available.append({
-                "key_name": kn,
-                "service": key_data.get("service", ""),
-                "description": key_data.get("description", ""),
-                "skill_description": skill_data.get("description", "") if skill_data else "",
-            })
-
+    for cid in store.list_ids():
+        if not store.has_grant(agent_name, cid):
+            continue
+        conn = store.get(cid)
+        if not conn:
+            continue
+        view = _conn_view(conn, include_secret_state=False)
+        view.pop("created_at", None)
+        view.pop("updated_at", None)
+        view["how_to_call"] = (
+            f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
+            '{"method": "GET|POST|...", "path": "/...", "params": {...}, '
+            '"json": {...}, "headers": {...}}'
+        )
+        available.append(view)
     audit_log(agent_name, "*", "list_keys")
-    return {"agent": agent_name, "available_keys": available}
+    return {"agent": agent_name, "available_connections": available,
+            # legacy field name so old client code degrades readably
+            "available_keys": available}
 
 
-@app.get("/api/vault/skill/{key_name}")
-async def get_skill_description(key_name: str, request: Request):
-    """Agent endpoint: get the skill/tool usage description for a key."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = auth[7:]
-    agent_name = verify_agent_token(token)
-    if not agent_name:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-
-    if not r.exists(f"{PFX_GRANT}{agent_name}:{key_name}"):
-        raise HTTPException(status_code=403, detail=f"No access to '{key_name}'")
-
-    skill_data = r.hgetall(f"{PFX_SKILL}{key_name}")
-    key_data = r.hgetall(f"{PFX_KEY}{key_name}")
-
+@app.get("/api/vault/skill/{conn_id}")
+async def get_skill_description(conn_id: str, request: Request):
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+    if not store.has_grant(agent_name, cid):
+        raise HTTPException(status_code=403, detail=f"No access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    view = _conn_view(conn, include_secret_state=False)
     return {
-        "key_name": key_name,
-        "service": key_data.get("service", ""),
-        "description": key_data.get("description", ""),
-        "skill_description": skill_data.get("description", "") if skill_data else "",
+        "key_name": cid,
+        "connection": cid,
+        "service": view["service"],
+        "description": view["description"],
+        "skill_description": view["skill_description"],
+        "base_url": view["base_url"],
+        "example_call": view["example_call"],
     }
 
 
-
-# ---------------------------------------------------------------------------
-# Agent API — Store/Create key endpoint
-# ---------------------------------------------------------------------------
 class KeyStoreRequest(BaseModel):
     key_name: str
     key_value: str
     service: str = ""
     description: str = ""
     skill_description: str = ""
+    base_url: str = ""
 
 
 @app.post("/api/vault/store")
 async def store_key(request: Request, key_data: KeyStoreRequest):
-    """
-    Agent endpoint: store a new key in the vault.
-    Requires Bearer token with admin privileges or special 'key-admin' grant.
-    """
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = auth[7:]
-    agent_name = verify_agent_token(token)
-    if not agent_name:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
-
-    # Check if agent has permission to store keys
-    # For now, only allow specific agents (valentina, harmony) to store keys
-    if agent_name not in ["valentina", "harmony", "admin"]:
+    """Create an API-key connection (restricted agents only)."""
+    agent_name = require_agent(request)
+    if agent_name not in STORE_ALLOWED_AGENTS:
         audit_log(agent_name, key_data.key_name, "store_denied", "Insufficient privileges")
         raise HTTPException(status_code=403, detail="Agent does not have permission to store keys")
 
-    key_name = key_data.key_name.strip().upper().replace(" ", "_")
-    now = datetime.now(timezone.utc).isoformat()
+    service = (key_data.service or "custom").strip().lower()
+    tpl = get_template(service)
+    if not tpl or tpl["auth"]["kind"] == "oauth2":
+        service, tpl = "custom", CATALOG["custom"]
 
-    # Store the key
-    r.hset(f"{PFX_KEY}{key_name}", mapping={
-        "service": key_data.service,
-        "description": key_data.description,
-        "encrypted_value": encrypt_value(key_data.key_value),
-        "created_at": now,
-        "updated_at": now,
-    })
-    r.zadd(PFX_KEY_INDEX, {key_name: time.time()})
+    conn_id = store.save(
+        key_data.key_name, service=service,
+        label=key_data.service or key_data.key_name,
+        base_url=key_data.base_url or tpl.get("base_url") or "",
+        secrets={"api_key": key_data.key_value},
+        description=key_data.description,
+        skill_description=key_data.skill_description,
+        status="ready" if (key_data.base_url or tpl.get("base_url")) else "needs_base_url",
+    )
+    audit_log(agent_name, conn_id, "connection_created_via_api", f"Service: {service}")
+    return {"success": True, "key_name": conn_id, "connection": conn_id,
+            "message": f"Connection '{conn_id}' stored successfully"}
 
-    # Store skill description if provided
-    if key_data.skill_description.strip():
-        r.hset(f"{PFX_SKILL}{key_name}", mapping={
-            "description": key_data.skill_description,
-            "updated_at": now,
-        })
-        r.zadd(PFX_SKILL_INDEX, {key_name: time.time()})
-
-    audit_log(agent_name, key_name, "key_created_via_api", f"Service: {key_data.service}")
-
-    return {
-        "success": True,
-        "key_name": key_name,
-        "message": f"Key '{key_name}' stored successfully"
-    }
 
 # ---------------------------------------------------------------------------
-# Health check
+# Agent API — the proxy (the whole point)
+# ---------------------------------------------------------------------------
+@app.post("/api/vault/proxy/{conn_id}")
+async def proxy_request(conn_id: str, request: Request):
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "proxy_denied", "No grant")
+        raise HTTPException(status_code=403, detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    method = str(body.get("method", "GET")).upper()
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported method: {method}")
+
+    path = str(body.get("path") or "/")
+    base_url = (conn.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=409, detail="Connection has no base URL configured — fix it in the vault dashboard")
+
+    # Resolve target URL. Absolute URLs allowed only for allowlisted hosts.
+    allowed = store.allowed_hosts(conn)
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        if not path.startswith("/"):
+            path = "/" + path
+        url = base_url + path
+    host = httpx.URL(url).host
+    if host not in allowed:
+        audit_log(agent_name, cid, "proxy_blocked_host", host or "?")
+        raise HTTPException(status_code=403, detail=f"Host '{host}' is not allowed for connection '{cid}'")
+    if httpx.URL(url).scheme != "https":
+        raise HTTPException(status_code=403, detail="Only https upstream URLs are allowed")
+
+    # Caller headers minus anything auth-ish; vault injects the real credential.
+    headers = {
+        k: v for k, v in (body.get("headers") or {}).items()
+        if isinstance(k, str) and k.lower() not in _BLOCKED_REQUEST_HEADERS
+    }
+
+    secrets_d = store.get_secrets(cid)
+    auth_kind = (conn.get("auth") or {}).get("kind")
+    # Everything actually injected upstream must be scrubbed from responses —
+    # including a freshly-refreshed OAuth token that isn't in secrets_d yet.
+    scrub_values = [v for v in secrets_d.values() if isinstance(v, str)]
+    try:
+        if auth_kind == "oauth2":
+            access_token, _ = await oauth_mod.get_valid_access_token(conn["service"], cid, store)
+            scrub_values.append(access_token)
+            injected = build_auth(conn, secrets_d, access_token=access_token)
+        else:
+            injected = build_auth(conn, secrets_d)
+    except (AuthInjectionError, OAuthError) as exc:
+        audit_log(agent_name, cid, "proxy_auth_error", str(exc)[:200])
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    headers.update(injected["headers"])
+    params = dict(body.get("params") or {})
+    params.update(injected["params"])
+
+    timeout = min(float(body.get("timeout") or 30), PROXY_TIMEOUT_MAX)
+    kwargs: Dict[str, Any] = {"headers": headers, "params": params or None, "timeout": timeout}
+    if body.get("json") is not None:
+        kwargs["json"] = body["json"]
+    elif body.get("data") is not None:
+        kwargs["content"] = str(body["data"]).encode()
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            upstream = await client.request(method, url, **kwargs)
+    except httpx.RequestError as exc:
+        audit_log(agent_name, cid, "proxy_upstream_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}")
+
+    raw = upstream.content[:PROXY_BODY_MAX]
+    truncated = len(upstream.content) > PROXY_BODY_MAX
+    content_type = upstream.headers.get("content-type", "")
+
+    # Never echo credentials back, even if the upstream reflects them.
+    def _scrub(text: str) -> str:
+        for sv in scrub_values:
+            if len(sv) >= 8 and sv in text:
+                text = text.replace(sv, "***vault***")
+        return text
+
+    result: Dict[str, Any] = {
+        "status": upstream.status_code,
+        "content_type": content_type,
+        "truncated": truncated,
+    }
+    if "application/json" in content_type:
+        try:
+            result["json"] = json.loads(_scrub(raw.decode(upstream.encoding or "utf-8", "replace")))
+        except ValueError:
+            result["text"] = _scrub(raw.decode(upstream.encoding or "utf-8", "replace"))
+    elif content_type.startswith("text/") or "xml" in content_type or not raw:
+        result["text"] = _scrub(raw.decode(upstream.encoding or "utf-8", "replace"))
+    else:
+        import base64
+        result["body_base64"] = base64.b64encode(raw).decode()
+
+    audit_log(agent_name, cid, "proxy_call",
+              f"{method} {httpx.URL(url).path} -> {upstream.status_code}")
+    return JSONResponse(result, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Health & startup
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
@@ -611,13 +753,12 @@ async def health():
         return JSONResponse({"status": "unhealthy", "error": str(e)}, status_code=500)
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
     init_agents()
-    logger.info("Vault service started. %d agents initialized.", len(AGENT_NAMES))
+    migrated = store.migrate_legacy_keys()
+    logger.info("Vault started. %d agents, %d legacy keys migrated, %d connections.",
+                len(AGENT_NAMES), migrated, len(store.list_ids()))
 
 
 if __name__ == "__main__":

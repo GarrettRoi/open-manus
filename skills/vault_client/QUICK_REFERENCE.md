@@ -1,65 +1,30 @@
-# Vault & n8n Quick Reference
+# Vault Quick Reference (v3 — proxy only)
 
-## Vault Client - Essential Commands
+Keys never leave the vault. Call APIs *through* it.
 
 ```bash
-# List keys
+# What can I use?
 python3 /app/skills/vault_client/vault_client.py list
 
-# Get key
-python3 /app/skills/vault_client/vault_client.py get KEY_NAME
+# Call an API (vault injects the credential)
+python3 /app/skills/vault_client/vault_client.py call CONN METHOD PATH [--json '{...}'] [--param k=v]
 
-# Get skill docs
-python3 /app/skills/vault_client/vault_client.py skill KEY_NAME
+# Examples
+python3 /app/skills/vault_client/vault_client.py call ELEVENLABS GET /v1/voices
+python3 /app/skills/vault_client/vault_client.py call OPENAI POST /v1/chat/completions --json '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+python3 /app/skills/vault_client/vault_client.py call GOOGLE GET /gmail/v1/users/me/messages --param maxResults=5
+python3 /app/skills/vault_client/vault_client.py call QUO GET /phone-numbers
+
+# Usage notes for a connection
+python3 /app/skills/vault_client/vault_client.py skill CONN
 ```
-
-## Python Usage (Recommended)
 
 ```python
-import subprocess
-
-result = subprocess.run(
-    ['python3', '/app/skills/vault_client/vault_client.py', 'get', 'KEY_NAME'],
-    capture_output=True, text=True
-)
-api_key = result.stdout.strip()
+sys.path.insert(0, "/app/skills/vault_client")
+from vault_client import vault
+resp = vault.request("OPENAI", "POST", "/v1/chat/completions", json={...})
+resp["status"]; resp.get("json") or resp.get("text") or resp.get("body_base64")
 ```
 
-## n8n API - Essential Commands
-
-```bash
-# Set env
-export N8N_INSTANCE_URL="https://primary-production-38b8.up.railway.app"
-export N8N_API_KEY="$(python3 /app/skills/vault_client/vault_client.py get NEWEST_N8N_API)"
-
-# List workflows
-curl -s $N8N_INSTANCE_URL/api/v1/workflows -H "X-N8N-API-KEY: $N8N_API_KEY"
-
-# Deploy workflow
-curl -X POST $N8N_INSTANCE_URL/api/v1/workflows \
-  -H "X-N8N-API-KEY: $N8N_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d @workflow.json
-```
-
-## Common Credential IDs
-
-- Gmail: `3qNKDN7I1OYPhVhz`
-- Twilio: `bkjlCKgkMsRw7dzY`
-- OpenAI: `w6c69SQykBvm99DE`
-- OpenRouter: `KFnSADDGaPa7RW09`
-- Google Calendar: `pKXg9ZaFAalac7QU`
-
-## Troubleshooting
-
-**401 Unauthorized?**
-→ Verify key: `python3 /app/skills/vault_client/vault_client.py get NEWEST_N8N_API`
-
-**VAULT_TOKEN not set?**
-→ Use subprocess method instead of direct import
-
-**Key name not found?**
-→ Run: `python3 /app/skills/vault_client/vault_client.py list`
-
----
-Full documentation: `skill_view('vault_client')` or `skill_view('n8n-automation-builder')`
+Gone in v3 (raises an error): `vault.get(...)`, `vault.export_env()`, CLI `get` / `export`.
+Errors: 403 = no grant/blocked host · 409 = connection not set up · 502 = upstream down.
