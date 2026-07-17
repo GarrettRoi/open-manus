@@ -2480,8 +2480,35 @@ class GatewaySlashCommandsMixin:
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
     async def _handle_voice_command(self, event: MessageEvent) -> str:
-        """Handle /voice [on|off|tts|channel|leave|status] command."""
-        args = event.get_command_args().strip().lower()
+        """Handle /voice [on|off|tts|channel|leave|status|voices|set] command."""
+        raw_args = event.get_command_args().strip()
+        args = raw_args.lower()
+
+        # Voice picker: list / swap the ElevenLabs voice.
+        if args in {"voices", "list-voices"}:
+            from tools import voice_picker
+
+            try:
+                return await asyncio.to_thread(voice_picker.format_voice_list)
+            except Exception as exc:
+                return f"⚠️ Could not load the voice list: {exc}"
+        if args == "set" or args.startswith("set "):
+            from tools import voice_picker
+
+            selector = raw_args[3:].strip()
+            if not selector:
+                return "Usage: `/voice set <number|name|voice_id>` — see `/voice voices` for the list."
+            try:
+                voice = await asyncio.to_thread(voice_picker.set_voice, selector)
+            except ValueError as exc:
+                return f"⚠️ {exc}"
+            except Exception as exc:
+                return f"⚠️ Voice swap failed: {exc}"
+            return (
+                f"🎙️ Voice swapped to **{voice.get('name')}** (`{voice['voice_id']}`). "
+                "New speech will use this voice."
+            )
+
         chat_id = event.source.chat_id
         platform = event.source.platform
         voice_key = self._voice_key(platform, chat_id)

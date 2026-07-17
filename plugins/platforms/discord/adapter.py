@@ -4238,8 +4238,39 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_reload_skills(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reload-skills")
 
-        @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
+        async def _voice_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list:
+            """Autocomplete for the /voice `voice` option: top adult female
+            ElevenLabs voices (fetched + cached by tools/voice_picker)."""
+            try:
+                # Deadline-safe: cached list only (possibly stale), with a
+                # background refresh — never network I/O inside Discord's
+                # 3-second autocomplete window.
+                from tools.voice_picker import get_cached_voices_nonblocking
+
+                voices = get_cached_voices_nonblocking()
+            except Exception:
+                return []
+            cur = (current or "").lower()
+            out = []
+            for v in voices:
+                name = v.get("name") or v["voice_id"]
+                if cur and cur not in name.lower():
+                    continue
+                bits = [b for b in (v.get("accent"), v.get("age")) if b]
+                label = f"{name} ({', '.join(bits)})" if bits else name
+                out.append(
+                    discord.app_commands.Choice(name=label[:100], value=v["voice_id"])
+                )
+            return out[:25]
+
+        @tree.command(name="voice", description="Toggle voice reply mode or swap the speaking voice")
+        @discord.app_commands.describe(
+            mode="Voice mode: join, channel, leave, on, tts, off, status, voices, or set",
+            voice="Voice to speak with (pick from the list or paste an ElevenLabs voice ID) — used with mode: set",
+        )
+        @discord.app_commands.autocomplete(voice=_voice_autocomplete)
         @discord.app_commands.choices(mode=[
             # `join` and `channel` both route to _handle_voice_channel_join in
             # gateway/run.py — expose both in the slash UI so autocomplete
@@ -4252,8 +4283,24 @@ class DiscordAdapter(BasePlatformAdapter):
             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
             discord.app_commands.Choice(name="off — text only", value="off"),
             discord.app_commands.Choice(name="status — show current mode", value="status"),
+            discord.app_commands.Choice(name="voices — list the top ElevenLabs voices", value="voices"),
+            discord.app_commands.Choice(name="set — swap the speaking voice", value="set"),
         ])
-        async def slash_voice(interaction: discord.Interaction, mode: str = ""):
+        async def slash_voice(
+            interaction: discord.Interaction, mode: str = "", voice: str = ""
+        ):
+            # A picked/typed voice implies "set" even if mode wasn't chosen.
+            if voice and mode in ("", "set"):
+                await self._run_simple_slash(
+                    interaction, f"/voice set {voice.strip()}"
+                )
+                return
+            if mode == "set" and not voice:
+                await interaction.response.send_message(
+                    "Pick a voice: `/voice set voice:<name or ID>` — use `/voice voices` to see the list.",
+                    ephemeral=True,
+                )
+                return
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
