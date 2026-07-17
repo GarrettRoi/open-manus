@@ -162,7 +162,7 @@ export function AgentFilesView() {
         downloadDataUrl(res.data_url, entry.name);
       }
     } catch (e) {
-      showToast(String(e));
+      showToast(String(e), "error");
     }
   };
 
@@ -172,7 +172,7 @@ export function AgentFilesView() {
       const res = await api.readAgentFile(selectedAgent, entry.area, entry.path);
       downloadDataUrl(res.data_url, entry.name);
     } catch (e) {
-      showToast(String(e));
+      showToast(String(e), "error");
     }
   };
 
@@ -186,15 +186,13 @@ export function AgentFilesView() {
         editor.path,
         editor.content,
       );
-      showToast(
-        res.pushed_to_agent
+      showToast(res.pushed_to_agent
           ? `Saved ${editor.name} — the agent will pick it up on its next sync.`
-          : `Saved ${editor.name} locally (Redis unreachable; ships on next deploy).`,
-      );
+          : `Saved ${editor.name} locally (Redis unreachable; ships on next deploy).`, "success");
       setEditor(null);
       void loadListing(selectedAgent, listing?.path ?? "");
     } catch (e) {
-      showToast(String(e));
+      showToast(String(e), "error");
     } finally {
       setSaving(false);
     }
@@ -209,14 +207,12 @@ export function AgentFilesView() {
         const base = listing?.path ? `${listing.path}/` : "";
         await api.uploadAgentFile(selectedAgent, `${base}${file.name}`, dataUrl);
       }
-      showToast(
-        selectedAgent === "shared"
+      showToast(selectedAgent === "shared"
           ? `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to the shared folder — all agents get them on next sync.`
-          : `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to ${selectedAgent}'s workspace.`,
-      );
+          : `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to ${selectedAgent}'s workspace.`, "success");
       void loadListing(selectedAgent, listing?.path ?? "");
     } catch (e) {
-      showToast(String(e));
+      showToast(String(e), "error");
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -228,11 +224,11 @@ export function AgentFilesView() {
     setDeleting(true);
     try {
       await api.deleteAgentFile(selectedAgent, pendingDelete.path);
-      showToast(`Deleted ${pendingDelete.name}. The agent removes its copy on next sync.`);
+      showToast(`Deleted ${pendingDelete.name}. The agent removes its copy on next sync.`, "success");
       setPendingDelete(null);
       void loadListing(selectedAgent, listing?.path ?? "");
     } catch (e) {
-      showToast(String(e));
+      showToast(String(e), "error");
     } finally {
       setDeleting(false);
     }

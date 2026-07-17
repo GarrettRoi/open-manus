@@ -72,9 +72,9 @@ RUN if [ -f "mini-swe-agent/setup.py" ] || [ -f "mini-swe-agent/pyproject.toml" 
 # Install hermes-agent itself as a CLI tool
 RUN pip install -e . 2>/dev/null || true
 
-# Pre-build the dashboard web UI (vite outputs to hermes_cli/web_dist) so the
-# dashboard can start instantly with --skip-build at runtime.
-RUN cd web && (npm ci || npm install) && npm run build && rm -rf node_modules
+# Dashboard web UI is pre-built and committed at hermes_cli/web_dist
+# (built in the workspace with `cd web && npm run build`); the entrypoint
+# starts the dashboard with --skip-build so no npm is needed at runtime.
 
 # Create workspace and config directories
 RUN mkdir -p /root/.hermes/workspace /root/.hermes/skills /root/.hermes/memory /root/.hermes/sessions

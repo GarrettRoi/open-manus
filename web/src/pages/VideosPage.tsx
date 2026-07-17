@@ -122,10 +122,15 @@ function VideoPlayer({ video }: { video: VideoEntry }) {
       <div className="flex aspect-video flex-col items-center justify-center gap-3 rounded-md border bg-muted/30 text-sm text-muted-foreground">
         <Film className="h-8 w-8" />
         <p>This link is a web page, not a playable video file.</p>
-        <Button asChild variant="outline" size="sm">
-          <a href={safeUrl(video.url) ?? "#"} target="_blank" rel="noreferrer noopener">
-            Open in new tab <ExternalLink className="ml-1 h-3.5 w-3.5" />
-          </a>
+        <Button
+          outlined
+          size="sm"
+          onClick={() => {
+            const url = safeUrl(video.url);
+            if (url) window.open(url, "_blank", "noreferrer,noopener");
+          }}
+        >
+          Open in new tab <ExternalLink className="ml-1 h-3.5 w-3.5" />
         </Button>
       </div>
     );
@@ -174,13 +179,13 @@ export default function VideosPage() {
     setBusy(true);
     try {
       await api.addVideo({ url: addUrl.trim(), title: addTitle.trim() });
-      showToast("Video added");
+      showToast("Video added", "success");
       setAddOpen(false);
       setAddUrl("");
       setAddTitle("");
       await load();
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to add video");
+      showToast(err instanceof Error ? err.message : "Failed to add video", "error");
     } finally {
       setBusy(false);
     }
@@ -191,11 +196,11 @@ export default function VideosPage() {
     setBusy(true);
     try {
       await api.deleteVideo(deleting.id);
-      showToast("Video removed");
+      showToast("Video removed", "success");
       setDeleting(null);
       await load();
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to remove video");
+      showToast(err instanceof Error ? err.message : "Failed to remove video", "error");
     } finally {
       setBusy(false);
     }
@@ -223,10 +228,10 @@ export default function VideosPage() {
               </option>
             ))}
           </select>
-          <Button variant="outline" size="sm" onClick={() => setAddOpen(true)}>
+          <Button outlined size="sm" onClick={() => setAddOpen(true)}>
             <Plus className="mr-1 h-4 w-4" /> Add link
           </Button>
-          <Button variant="outline" size="sm" onClick={() => void load()}>
+          <Button outlined size="sm" onClick={() => void load()}>
             <RefreshCw className="mr-1 h-4 w-4" /> Refresh
           </Button>
         </div>
@@ -289,10 +294,10 @@ export default function VideosPage() {
                     </p>
                   )}
                   <div className="flex flex-wrap items-center gap-1">
-                    <Badge variant="secondary">{video.agent}</Badge>
-                    <Badge variant="outline">{video.kind}</Badge>
+                    <Badge tone="secondary">{video.agent}</Badge>
+                    <Badge tone="outline">{video.kind}</Badge>
                     {video.tags.slice(0, 3).map((t) => (
-                      <Badge key={t} variant="outline">
+                      <Badge key={t} tone="outline">
                         {t}
                       </Badge>
                     ))}
@@ -391,7 +396,7 @@ export default function VideosPage() {
             />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAddOpen(false)}>
+            <Button outlined onClick={() => setAddOpen(false)}>
               Cancel
             </Button>
             <Button onClick={() => void handleAdd()} disabled={busy || !addUrl.trim()}>
