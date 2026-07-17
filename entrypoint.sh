@@ -116,6 +116,22 @@ echo "[entrypoint] Wrote $(wc -l < /root/.hermes/.env) variables to .env"
 
 echo "[entrypoint] Environment configured. Starting Hermes gateway..."
 
+# Optionally start the web dashboard (pre-built into the image). Guarded by
+# HERMES_DASHBOARD; on a non-loopback bind the dashboard's auth gate requires
+# HERMES_DASHBOARD_BASIC_AUTH_USERNAME/_PASSWORD (or OAuth) and fails closed
+# without them.
+case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+        dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+        echo "[entrypoint] Starting dashboard on ${dash_host}:${dash_port}..."
+        (cd /app && hermes dashboard --skip-build --no-open \
+            --host "$dash_host" --port "$dash_port" \
+            >> /tmp/dashboard.log 2>&1) &
+        DASHBOARD_PID=$!
+        ;;
+esac
+
 # Start the Hermes gateway as a child (NOT exec) so the EXIT/SIGTERM trap
 # still runs and can flush memory + workspace state to Redis on shutdown.
 cd /app
