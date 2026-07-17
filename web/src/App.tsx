@@ -28,6 +28,7 @@ import {
   Database,
   Download,
   Eye,
+  Film,
   FolderOpen,
   FileText,
   Globe,
@@ -76,6 +77,7 @@ import ConfigPage from "@/pages/ConfigPage";
 import DocsPage from "@/pages/DocsPage";
 import EnvPage from "@/pages/EnvPage";
 import FilesPage from "@/pages/FilesPage";
+import VideosPage from "@/pages/VideosPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
@@ -134,6 +136,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/files": FilesPage,
+  "/videos": VideosPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
@@ -168,6 +171,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     icon: MessageSquare,
   },
   { path: "/files", label: "Files", icon: FolderOpen },
+  { path: "/videos", label: "Videos", icon: Film },
   {
     path: "/analytics",
     labelKey: "analytics",

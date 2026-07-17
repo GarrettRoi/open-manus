@@ -2312,6 +2312,124 @@ async def agent_files_delete(payload: AgentFileDelete):
     return {"ok": True, "path": rel}
 
 
+# ============================================================================
+# Video gallery API — shared link gallery published by agents (or the
+# dashboard) via skills/video_gallery/publish_video.py. Storage:
+#   videos:item:{id} -> JSON entry, videos:index -> zset id -> unix ts.
+# Links/metadata only; video bytes are never stored.
+# ============================================================================
+
+_VIDEO_INDEX_KEY = "videos:index"
+_VIDEO_ITEM_PREFIX = "videos:item:"
+_VIDEO_MAX_ITEMS = 500
+
+
+class VideoAdd(BaseModel):
+    url: str
+    title: str = ""
+    description: str = ""
+    source_page: str = ""
+    tags: List[str] = []
+
+
+class VideoDelete(BaseModel):
+    id: str
+
+
+def _video_classify(url: str) -> str:
+    from urllib.parse import urlparse as _urlparse
+    try:
+        parsed = _urlparse(url)
+    except ValueError:
+        return "page"
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host in ("youtube.com", "m.youtube.com", "youtu.be", "youtube-nocookie.com"):
+        return "youtube"
+    if host in ("vimeo.com", "player.vimeo.com"):
+        return "vimeo"
+    if any(parsed.path.lower().endswith(ext) for ext in
+           (".mp4", ".webm", ".ogv", ".ogg", ".mov", ".m4v", ".m3u8")):
+        return "direct"
+    return "page"
+
+
+@app.get("/api/videos")
+async def videos_list(limit: int = _VIDEO_MAX_ITEMS, agent: str = ""):
+    limit = max(1, min(limit, _VIDEO_MAX_ITEMS))
+    r = _agent_redis()
+    ids = r.zrevrange(_VIDEO_INDEX_KEY, 0, _VIDEO_MAX_ITEMS - 1)
+    videos = []
+    agent_filter = agent.strip().lower()
+    for vid in ids:
+        raw = r.get(_VIDEO_ITEM_PREFIX + vid)
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if agent_filter and entry.get("agent", "").lower() != agent_filter:
+            continue
+        videos.append(entry)
+        if len(videos) >= limit:
+            break
+    agents = sorted({v.get("agent", "unknown") for v in videos})
+    return {"videos": videos, "agents": agents}
+
+
+@app.post("/api/videos")
+async def videos_add(payload: VideoAdd):
+    url = payload.url.strip()
+    if not re.match(r"^https?://", url):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    if len(url) > 2048:
+        raise HTTPException(status_code=400, detail="URL is too long")
+    r = _agent_redis()
+    vid = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    source_page = payload.source_page.strip()[:2048]
+    if source_page and not re.match(r"^https?://", source_page):
+        raise HTTPException(status_code=400, detail="source_page must be an http(s) URL")
+    entry = {
+        "id": vid,
+        "url": url,
+        "title": payload.title.strip()[:2000] or url.rsplit("/", 1)[-1] or url,
+        "description": payload.description.strip()[:2000],
+        "source_page": source_page,
+        "agent": "dashboard",
+        "tags": [t.strip() for t in payload.tags if t.strip()][:20],
+        "kind": _video_classify(url),
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    }
+    pipe = r.pipeline()
+    pipe.set(_VIDEO_ITEM_PREFIX + vid, json.dumps(entry))
+    pipe.zadd(_VIDEO_INDEX_KEY, {vid: time.time()})
+    pipe.execute()
+    excess = r.zcard(_VIDEO_INDEX_KEY) - _VIDEO_MAX_ITEMS
+    if excess > 0:
+        old = r.zrange(_VIDEO_INDEX_KEY, 0, excess - 1)
+        if old:
+            pipe = r.pipeline()
+            pipe.zrem(_VIDEO_INDEX_KEY, *old)
+            pipe.delete(*[_VIDEO_ITEM_PREFIX + o for o in old])
+            pipe.execute()
+    return {"ok": True, "video": entry}
+
+
+@app.delete("/api/videos")
+async def videos_delete(payload: VideoDelete):
+    vid = payload.id.strip()
+    if not re.fullmatch(r"[0-9a-f]{16}", vid):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+    r = _agent_redis()
+    r.zrem(_VIDEO_INDEX_KEY, vid)
+    removed = r.delete(_VIDEO_ITEM_PREFIX + vid)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"ok": True, "id": vid}
+
+
 @app.get("/api/fs/list")
 async def fs_list(path: str):
     target = _fs_path(path)

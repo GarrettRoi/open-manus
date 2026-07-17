@@ -477,6 +477,22 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ agent, path, data_url: dataUrl }),
     }),
+  listVideos: (agent?: string) =>
+    fetchJSON<VideosListResponse>(
+      `/api/videos${agent ? `?agent=${encodeURIComponent(agent)}` : ""}`,
+    ),
+  addVideo: (body: { url: string; title?: string; description?: string; source_page?: string; tags?: string[] }) =>
+    fetchJSON<{ ok: boolean; video: VideoEntry }>("/api/videos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  deleteVideo: (id: string) =>
+    fetchJSON<{ ok: boolean; id: string }>("/api/videos", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    }),
   deleteAgentFile: (agent: string, path: string) =>
     fetchJSON<{ ok: boolean; path: string }>("/api/agent-files", {
       method: "DELETE",
@@ -1867,6 +1883,25 @@ export interface AgentFileWriteResponse {
   path: string;
   area: AgentFileArea;
   pushed_to_agent: boolean;
+}
+
+export type VideoKind = "youtube" | "vimeo" | "direct" | "page";
+
+export interface VideoEntry {
+  id: string;
+  url: string;
+  title: string;
+  description: string;
+  source_page: string;
+  agent: string;
+  tags: string[];
+  kind: VideoKind;
+  added_at: string;
+}
+
+export interface VideosListResponse {
+  videos: VideoEntry[];
+  agents: string[];
 }
 
 export interface AnalyticsDailyEntry {
