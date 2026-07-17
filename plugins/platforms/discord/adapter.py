@@ -4503,6 +4503,49 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
+        async def _voice_character_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list:
+            """Autocomplete for /voice-character: top ElevenLabs voices
+            (cached by tools/voice_picker — never network I/O inside
+            Discord's 3-second autocomplete window)."""
+            try:
+                from tools.voice_picker import get_cached_voices_nonblocking
+
+                voices = get_cached_voices_nonblocking()
+            except Exception:
+                return []
+            cur = (current or "").lower()
+            out = []
+            for v in voices:
+                name = v.get("name") or v["voice_id"]
+                if cur and cur not in name.lower():
+                    continue
+                bits = [b for b in (v.get("accent"), v.get("age")) if b]
+                label = f"{name} ({', '.join(bits)})" if bits else name
+                out.append(
+                    discord.app_commands.Choice(name=label[:100], value=v["voice_id"])
+                )
+            return out[:25]
+
+        @tree.command(
+            name="voice-character",
+            description="Swap the speaking voice (ElevenLabs) or list the options",
+        )
+        @discord.app_commands.describe(
+            voice="Voice to speak with — pick from the list or paste an ElevenLabs voice ID (leave empty to list)",
+        )
+        @discord.app_commands.autocomplete(voice=_voice_character_autocomplete)
+        async def slash_voice_character(
+            interaction: discord.Interaction, voice: str = ""
+        ):
+            if voice.strip():
+                await self._run_simple_slash(
+                    interaction, f"/voice-character {voice.strip()}"
+                )
+            else:
+                await self._run_simple_slash(interaction, "/voice-character list")
+
         @tree.command(
             name="voicehome",
             description="Set this agent's home voice channel (she auto-joins when you're there)",
