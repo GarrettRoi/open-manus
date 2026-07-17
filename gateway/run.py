@@ -8489,6 +8489,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # plugin adapters don't need a custom factory signature.
                     if hasattr(adapter, "gateway_runner"):
                         adapter.gateway_runner = self
+                    # Home voice channel auto-join: give the adapter a hook
+                    # that performs a full runner-side join (STT callbacks +
+                    # voice-reply mode), mirroring /voice join.
+                    if hasattr(adapter, "_voice_auto_join_hook"):
+                        adapter._voice_auto_join_hook = self._handle_voice_auto_join
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -12540,6 +12545,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Join failed — clear callback
         adapter._voice_input_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
+
+    def _resolve_voice_text_channel(self, adapter, guild):
+        """Pick the text channel used for voice transcripts on auto-join.
+
+        Priority: DISCORD_VOICE_TEXT_CHANNEL_ID env var, then the guild's
+        system channel, then the first text channel the bot can send to.
+        """
+        env_id = (os.getenv("DISCORD_VOICE_TEXT_CHANNEL_ID") or "").strip()
+        if env_id:
+            try:
+                ch = adapter._client.get_channel(int(env_id))
+                if ch is not None:
+                    # Guard against cross-guild misconfiguration: transcripts
+                    # must never route to a channel in a different guild.
+                    if getattr(getattr(ch, "guild", None), "id", None) == guild.id:
+                        return ch
+                    logger.warning(
+                        "DISCORD_VOICE_TEXT_CHANNEL_ID %s is not in guild %s — ignoring",
+                        env_id, guild.id,
+                    )
+                else:
+                    logger.warning("DISCORD_VOICE_TEXT_CHANNEL_ID %s not found", env_id)
+            except (ValueError, AttributeError):
+                logger.warning("Invalid DISCORD_VOICE_TEXT_CHANNEL_ID: %r", env_id)
+        me = getattr(guild, "me", None)
+        ch = getattr(guild, "system_channel", None)
+        if ch is not None and me is not None and ch.permissions_for(me).send_messages:
+            return ch
+        for ch in getattr(guild, "text_channels", []) or []:
+            if me is None or ch.permissions_for(me).send_messages:
+                return ch
+        return None
+
+    async def _handle_voice_auto_join(self, adapter, voice_channel) -> None:
+        """Join a designated 'home' voice channel without a slash command.
+
+        Mirrors _handle_voice_channel_join: wires STT/disconnect callbacks
+        BEFORE joining, then binds a text channel for transcripts and enables
+        spoken replies for it.
+        """
+        guild = voice_channel.guild
+        guild_id = guild.id
+
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+            )
+
+        try:
+            success = await adapter.join_voice_channel(voice_channel)
+        except Exception as e:
+            logger.warning("Auto-join of home voice channel failed: %s", e)
+            return
+        if not success:
+            return
+
+        text_ch = self._resolve_voice_text_channel(adapter, guild)
+        if text_ch is None:
+            logger.warning(
+                "Auto-joined voice channel %s but found no usable text channel "
+                "for transcripts — voice input will be ignored until /voice join "
+                "is used from a text channel",
+                getattr(voice_channel, "name", guild_id),
+            )
+            return
+
+        adapter._voice_text_channels[guild_id] = text_ch.id
+        if hasattr(adapter, "_voice_sources"):
+            adapter._voice_sources[guild_id] = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=str(text_ch.id),
+                user_id="0",
+                user_name="voice",
+                chat_type="channel",
+            ).to_dict()
+        self._voice_mode[self._voice_key(Platform.DISCORD, str(text_ch.id))] = "all"
+        self._save_voice_modes()
+        self._set_adapter_auto_tts_enabled(adapter, str(text_ch.id), enabled=True)
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         """Leave the Discord voice channel."""

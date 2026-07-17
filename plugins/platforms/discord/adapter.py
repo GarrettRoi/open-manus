@@ -783,6 +783,24 @@ class DiscordAdapter(BasePlatformAdapter):
         # the bot in the channel when the user deliberately picked text-only
         # (/voice off) instead of leaving (/voice leave).
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
+        # Designated "home" voice channel (per agent).  When set via
+        # DISCORD_VOICE_CHANNEL_ID, the agent auto-joins this channel whenever
+        # a human is present in it and leaves once it empties.  Auto-join can
+        # be disabled explicitly with DISCORD_VOICE_AUTO_JOIN=false.
+        self._designated_voice_channel_id: Optional[int] = None
+        _dvc = (os.getenv("DISCORD_VOICE_CHANNEL_ID") or "").strip()
+        if _dvc:
+            try:
+                self._designated_voice_channel_id = int(_dvc)
+            except ValueError:
+                logger.warning("[%s] Invalid DISCORD_VOICE_CHANNEL_ID: %r", self.name, _dvc)
+        self._voice_auto_join: bool = (
+            self._designated_voice_channel_id is not None
+            and os.getenv("DISCORD_VOICE_AUTO_JOIN", "true").lower() in {"true", "1", "yes"}
+        )
+        # Runner-provided hook that performs a full voice join (wiring STT
+        # callbacks + voice-reply mode) when auto-joining the home channel.
+        self._voice_auto_join_hook: Optional[Callable] = None  # set by run.py
         # Phase 3: continuous voice mixer (ambient idle bed + ducked speech).
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
@@ -1033,6 +1051,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
+                # Home voice channel: if the owner is already sitting in the
+                # agent's designated channel when we come online, join them.
+                asyncio.create_task(adapter_self.check_designated_voice_channel())
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1146,6 +1167,17 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                # Home-channel auto-join/leave — must run even when the bot is
+                # not yet connected to any voice channel.
+                if member != adapter_self._client.user and not getattr(member, "bot", False):
+                    try:
+                        await adapter_self._handle_designated_voice_state(before, after, member)
+                    except Exception:
+                        logger.warning(
+                            "[%s] Designated voice-channel handling failed",
+                            adapter_self.name, exc_info=True,
+                        )
+
                 # Only track channels where the bot is connected
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -2867,6 +2899,107 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    # ── Designated "home" voice channel (auto-join/leave) ────────────────
+
+    @staticmethod
+    def _channel_has_humans(channel) -> bool:
+        """True when at least one non-bot member is in the voice channel."""
+        return any(not getattr(m, "bot", False) for m in getattr(channel, "members", []) or [])
+
+    def _is_designated_channel(self, channel) -> bool:
+        dvc = self._designated_voice_channel_id
+        return dvc is not None and channel is not None and channel.id == dvc
+
+    async def _handle_designated_voice_state(self, before, after, member) -> None:
+        """Auto-join the home voice channel when a human enters it and leave
+        once no humans remain. Callers must filter out bot members."""
+        if not self._voice_auto_join or not self._client:
+            return
+        entered = self._is_designated_channel(after.channel) and not self._is_designated_channel(before.channel)
+        exited = self._is_designated_channel(before.channel) and not self._is_designated_channel(after.channel)
+
+        if entered:
+            await self._auto_join_designated_channel(
+                after.channel, reason=f"{member.display_name} joined"
+            )
+        elif exited:
+            guild_id = before.channel.guild.id
+            vc = self._voice_clients.get(guild_id)
+            if (
+                vc and vc.is_connected()
+                and vc.channel is not None
+                and vc.channel.id == self._designated_voice_channel_id
+                and not self._channel_has_humans(before.channel)
+            ):
+                logger.info(
+                    "[%s] Home voice channel %s is empty — leaving",
+                    self.name, before.channel.name,
+                )
+                text_ch_id = self._voice_text_channels.get(guild_id)
+                await self.leave_voice_channel(guild_id)
+                if self._on_voice_disconnect and text_ch_id:
+                    try:
+                        self._on_voice_disconnect(str(text_ch_id))
+                    except Exception:
+                        pass
+
+    async def _auto_join_designated_channel(self, channel, reason: str = "") -> None:
+        """Join the home voice channel, preferring the runner hook (which also
+        wires STT callbacks and enables spoken replies)."""
+        guild_id = channel.guild.id
+        vc = self._voice_clients.get(guild_id)
+        if vc and vc.is_connected() and vc.channel is not None and vc.channel.id == channel.id:
+            self._reset_voice_timeout(guild_id)
+            return
+        logger.info(
+            "[%s] Auto-joining home voice channel %s (%s)",
+            self.name, getattr(channel, "name", channel.id), reason,
+        )
+        hook = self._voice_auto_join_hook
+        try:
+            if hook is not None:
+                await hook(self, channel)
+            else:
+                await self.join_voice_channel(channel)
+        except Exception as e:
+            logger.warning("[%s] Auto-join of home voice channel failed: %s", self.name, e)
+            return
+        # Recheck occupancy after connecting: the last human may have left
+        # while the join was in flight (their leave event saw no connected
+        # voice client and could not trigger the auto-leave path).
+        vc = self._voice_clients.get(guild_id)
+        if (
+            vc and vc.is_connected()
+            and vc.channel is not None
+            and vc.channel.id == channel.id
+            and not self._channel_has_humans(vc.channel)
+        ):
+            logger.info(
+                "[%s] Home voice channel emptied during join — leaving", self.name
+            )
+            text_ch_id = self._voice_text_channels.get(guild_id)
+            await self.leave_voice_channel(guild_id)
+            if self._on_voice_disconnect and text_ch_id:
+                try:
+                    self._on_voice_disconnect(str(text_ch_id))
+                except Exception:
+                    pass
+
+    async def check_designated_voice_channel(self) -> None:
+        """Startup check: if humans are already in the home voice channel, join."""
+        dvc = self._designated_voice_channel_id
+        if not self._voice_auto_join or not dvc or not self._client:
+            return
+        try:
+            channel = self._client.get_channel(dvc) or await self._client.fetch_channel(dvc)
+        except Exception as e:
+            logger.warning(
+                "[%s] Cannot resolve DISCORD_VOICE_CHANNEL_ID %s: %s", self.name, dvc, e
+            )
+            return
+        if channel is not None and self._channel_has_humans(channel):
+            await self._auto_join_designated_channel(channel, reason="humans present at startup")
+
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -3044,6 +3177,19 @@ class DiscordAdapter(BasePlatformAdapter):
             await asyncio.sleep(self.VOICE_TIMEOUT)
         except asyncio.CancelledError:
             return
+        # Home-channel sessions are presence-driven: while a human is still in
+        # the designated channel, stay connected regardless of inactivity.
+        # (Auto-leave happens via voice-state updates when the channel empties.)
+        if self._voice_auto_join:
+            vc = self._voice_clients.get(guild_id)
+            if (
+                vc and vc.is_connected()
+                and vc.channel is not None
+                and vc.channel.id == self._designated_voice_channel_id
+                and self._channel_has_humans(vc.channel)
+            ):
+                self._reset_voice_timeout(guild_id)
+                return
         text_ch_id = self._voice_text_channels.get(guild_id)
         # ``/voice off`` mutes spoken replies but deliberately keeps the bot in
         # the channel (leaving is ``/voice leave``). The inactivity timer only
