@@ -15,6 +15,14 @@ Redis keys (per agent):
     agent:{name}:wsync:last_sync        ISO timestamp of last agent-side sync
     agent:{name}:deployfile:{filename}  JSON {content, hash, updated_at}
 
+Shared folder (one copy for ALL agents + the dashboard):
+    Files under workspace/shared/ map to global keys instead:
+    shared:wsync:file:{relpath}     same JSON shape; source = agent name or "dashboard"
+    shared:wsync:deleted:{relpath}  tombstone
+    Every agent pulls the shared folder on sync/restore; any agent (or the
+    dashboard) adding/editing/deleting a file there propagates to everyone.
+    Conflicts on shared files resolve in favor of the remote (last writer wins).
+
 Usage:
     python3 workspace_sync.py --action restore --agent lexi   # on boot
     python3 workspace_sync.py --action sync    --agent lexi   # one push+pull round
@@ -45,6 +53,9 @@ MAX_FILE_SIZE = 5 * 1024 * 1024          # 5 MB per file
 MAX_TOTAL_SIZE = 100 * 1024 * 1024       # 100 MB per agent
 
 DEPLOY_FILES = ("config.yaml", "SOUL.md", "USER.md")
+
+# workspace/shared/ is a single folder shared by all agents + the dashboard.
+SHARED_PREFIX = "shared/"
 
 # Files redis_memory_sync.py already persists at the workspace root — leave
 # them to that script so the two syncs never fight over the same file.
@@ -123,10 +134,14 @@ def walk_workspace() -> dict:
 
 
 def _key(agent: str, rel: str) -> str:
+    if rel.startswith(SHARED_PREFIX):
+        return f"shared:wsync:file:{rel[len(SHARED_PREFIX):]}"
     return f"agent:{agent}:wsync:file:{rel}"
 
 
 def _tomb(agent: str, rel: str) -> str:
+    if rel.startswith(SHARED_PREFIX):
+        return f"shared:wsync:deleted:{rel[len(SHARED_PREFIX):]}"
     return f"agent:{agent}:wsync:deleted:{rel}"
 
 
@@ -141,7 +156,7 @@ def push_file(r, agent: str, rel: str, path: Path) -> str | None:
         "hash": h,
         "mtime": path.stat().st_mtime,
         "updated_at": utcnow(),
-        "source": "agent",
+        "source": agent if rel.startswith(SHARED_PREFIX) else "agent",
     }))
     r.delete(_tomb(agent, rel))
     return h
@@ -161,18 +176,39 @@ def pull_file(agent: str, rel: str, remote: dict) -> bool:
 
 
 def remote_index(r, agent: str) -> dict:
-    """{relpath: raw_json_key_value_not_loaded} — hashes loaded lazily."""
-    prefix = _key(agent, "")
+    """{relpath: redis_key} — values loaded lazily."""
+    prefix = f"agent:{agent}:wsync:file:"
     out = {}
     for key in r.scan_iter(f"{prefix}*"):
         out[key[len(prefix):]] = key
+    shared_prefix = "shared:wsync:file:"
+    for key in r.scan_iter(f"{shared_prefix}*"):
+        out[SHARED_PREFIX + key[len(shared_prefix):]] = key
     return out
+
+
+def migrate_legacy_shared(r, agent: str):
+    """Move any pre-shared-folder keys (agent:{name}:wsync:file:shared/*) to
+    the global shared:* namespace so old mirrors don't shadow the shared view."""
+    prefix = f"agent:{agent}:wsync:file:{SHARED_PREFIX}"
+    for key in list(r.scan_iter(f"{prefix}*")):
+        rel = key[len(prefix):]
+        skey = f"shared:wsync:file:{rel}"
+        if r.get(skey) is None:
+            val = r.get(key)
+            if val is not None:
+                r.set(skey, val)
+        r.delete(key)
+    tomb_prefix = f"agent:{agent}:wsync:deleted:{SHARED_PREFIX}"
+    for key in list(r.scan_iter(f"{tomb_prefix}*")):
+        r.delete(key)
 
 
 def sync(agent: str, verbose: bool = True):
     r = get_redis()
     state = load_state()
     fstate = state.setdefault("files", {})
+    migrate_legacy_shared(r, agent)
     local = walk_workspace()
     remote_keys = remote_index(r, agent)
 
@@ -194,8 +230,11 @@ def sync(agent: str, verbose: bool = True):
             # local changed (or new) since last sync
             remote_raw = r.get(remote_keys[rel]) if rel in remote_keys else None
             remote = json.loads(remote_raw) if remote_raw else None
-            if remote and remote.get("hash") != fstate.get(rel) and remote.get("source") == "dashboard":
-                # both changed; dashboard edit wins
+            if remote and remote.get("hash") != fstate.get(rel) and (
+                remote.get("source") == "dashboard" or rel.startswith(SHARED_PREFIX)
+            ):
+                # both changed; dashboard edit wins (shared files: remote/last
+                # writer wins so all agents converge on one copy)
                 if pull_file(agent, rel, remote):
                     fstate[rel] = remote["hash"]
                     pulled += 1
@@ -244,10 +283,16 @@ def sync(agent: str, verbose: bool = True):
                 fstate[rel] = remote["hash"]
                 pulled += 1
 
-    # dashboard-side deletions (tombstones for files we still have)
-    tomb_prefix = _tomb(agent, "")
-    for key in r.scan_iter(f"{tomb_prefix}*"):
-        rel = key[len(tomb_prefix):]
+    # remote deletions (tombstones for files we still have) — per-agent
+    # tombstones from the dashboard, plus shared-folder tombstones from
+    # anyone (dashboard or another agent).
+    tomb_scan = [
+        (f"agent:{agent}:wsync:deleted:", ""),
+        ("shared:wsync:deleted:", SHARED_PREFIX),
+    ]
+    for tomb_prefix, rel_prefix in tomb_scan:
+      for key in r.scan_iter(f"{tomb_prefix}*"):
+        rel = rel_prefix + key[len(tomb_prefix):]
         target = WORKSPACE_DIR / rel
         if target.exists() and fstate.get(rel):
             try:

@@ -1841,6 +1841,7 @@ export type AgentFileArea = "deploy" | "workspace";
 export interface AgentFilesAgent {
   name: string;
   last_sync: string | null;
+  shared?: boolean;
 }
 
 export interface AgentFilesAgentsResponse {

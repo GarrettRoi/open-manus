@@ -209,7 +209,11 @@ export function AgentFilesView() {
         const base = listing?.path ? `${listing.path}/` : "";
         await api.uploadAgentFile(selectedAgent, `${base}${file.name}`, dataUrl);
       }
-      showToast(`Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to ${selectedAgent}'s workspace.`);
+      showToast(
+        selectedAgent === "shared"
+          ? `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to the shared folder — all agents get them on next sync.`
+          : `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to ${selectedAgent}'s workspace.`,
+      );
       void loadListing(selectedAgent, listing?.path ?? "");
     } catch (e) {
       showToast(String(e));
@@ -271,11 +275,19 @@ export function AgentFilesView() {
               onClick={() => setSelectedAgent(agent.name)}
             >
               <CardContent className="flex items-center gap-3 py-4">
-                <Users className="size-5 shrink-0 text-muted-foreground" />
+                {agent.shared ? (
+                  <Folder className="size-5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <Users className="size-5 shrink-0 text-muted-foreground" />
+                )}
                 <div className="min-w-0">
-                  <div className="truncate font-medium capitalize">{agent.name}</div>
+                  <div className="truncate font-medium capitalize">
+                    {agent.shared ? "Shared" : agent.name}
+                  </div>
                   <div className="truncate text-xs text-muted-foreground">
-                    Last sync: {formatSyncTime(agent.last_sync)}
+                    {agent.shared
+                      ? "One folder synced to every agent"
+                      : `Last sync: ${formatSyncTime(agent.last_sync)}`}
                   </div>
                 </div>
               </CardContent>
@@ -307,9 +319,11 @@ export function AgentFilesView() {
             /{listing.path}
           </Badge>
         )}
-        <Badge tone="outline" className="text-xs">
-          Last sync: {formatSyncTime(listing?.last_sync ?? null)}
-        </Badge>
+        {selectedAgent !== "shared" && (
+          <Badge tone="outline" className="text-xs">
+            Last sync: {formatSyncTime(listing?.last_sync ?? null)}
+          </Badge>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <Button
             type="button"
@@ -439,7 +453,9 @@ export function AgentFilesView() {
             <DialogDescription>
               {editor?.area === "deploy"
                 ? "Deploy file — saved to the repo and pushed to the running agent via Redis."
-                : "Workspace file — pushed to Redis; the agent pulls it on its next sync."}
+                : selectedAgent === "shared"
+                  ? "Shared file — every agent receives it in workspace/shared/ on its next sync."
+                  : "Workspace file — pushed to Redis; the agent pulls it on its next sync."}
             </DialogDescription>
           </DialogHeader>
           <textarea

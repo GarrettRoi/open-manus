@@ -2004,8 +2004,13 @@ def _agent_names() -> List[str]:
         return []
 
 
+_SHARED_AGENT = "shared"  # pseudo-agent: global folder synced to ALL agents
+
+
 def _require_agent(agent: str) -> str:
     name = (agent or "").strip().lower()
+    if name == _SHARED_AGENT:
+        return name
     if not re.fullmatch(r"[a-z0-9_-]{1,64}", name) or name not in _agent_names():
         raise HTTPException(status_code=404, detail="Unknown agent")
     return name
@@ -2052,7 +2057,15 @@ def _ws_norm_rel(path: str) -> str:
 
 
 def _ws_file_key(agent: str, rel: str) -> str:
+    if agent == _SHARED_AGENT:
+        return f"shared:wsync:file:{rel}"
     return f"agent:{agent}:wsync:file:{rel}"
+
+
+def _ws_tomb_key(agent: str, rel: str) -> str:
+    if agent == _SHARED_AGENT:
+        return f"shared:wsync:deleted:{rel}"
+    return f"agent:{agent}:wsync:deleted:{rel}"
 
 
 def _ws_index(r, agent: str) -> Dict[str, dict]:
@@ -2108,6 +2121,7 @@ async def agent_files_agents():
         redis_ok = False
     for name in _agent_names():
         agents.append({"name": name, "last_sync": last_sync.get(name)})
+    agents.insert(0, {"name": _SHARED_AGENT, "last_sync": None, "shared": True})
     return {"agents": agents, "redis_connected": redis_ok}
 
 
@@ -2119,7 +2133,7 @@ async def agent_files_list(agent: str, path: str = ""):
         rel_dir = _ws_norm_rel(path)
 
     entries = []
-    if not rel_dir:
+    if not rel_dir and name != _SHARED_AGENT:
         agent_dir = _AGENT_DEPLOY_ROOT / name
         for fname in _AGENT_DEPLOY_FILES:
             fpath = agent_dir / fname
@@ -2138,7 +2152,8 @@ async def agent_files_list(agent: str, path: str = ""):
     redis_error = None
     try:
         r = _agent_redis()
-        last_sync = r.get(f"agent:{name}:wsync:last_sync")
+        if name != _SHARED_AGENT:
+            last_sync = r.get(f"agent:{name}:wsync:last_sync")
         index = _ws_index(r, name)
         prefix = f"{rel_dir}/" if rel_dir else ""
         seen_dirs = set()
@@ -2270,7 +2285,7 @@ async def agent_files_write(payload: AgentFileWrite):
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "source": "dashboard",
         }))
-        r.delete(f"agent:{name}:wsync:deleted:{rel}")
+        r.delete(_ws_tomb_key(name, rel))
         return {"ok": True, "path": rel, "area": "workspace", "pushed_to_agent": True}
 
     raise HTTPException(status_code=400, detail="area must be 'deploy' or 'workspace'")
@@ -2292,7 +2307,7 @@ async def agent_files_upload(payload: AgentFileUpload):
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard",
     }))
-    r.delete(f"agent:{name}:wsync:deleted:{rel}")
+    r.delete(_ws_tomb_key(name, rel))
     return {"ok": True, "path": rel, "area": "workspace"}
 
 
@@ -2306,7 +2321,7 @@ async def agent_files_delete(payload: AgentFileDelete):
         raise HTTPException(status_code=404, detail="File not found")
     r.delete(key)
     r.set(
-        f"agent:{name}:wsync:deleted:{rel}",
+        _ws_tomb_key(name, rel),
         datetime.now(timezone.utc).isoformat(),
     )
     return {"ok": True, "path": rel}
