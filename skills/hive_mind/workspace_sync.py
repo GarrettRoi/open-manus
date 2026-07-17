@@ -97,6 +97,31 @@ def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _parse_ts(value):
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tomb_blocks_pull(r, agent: str, rel: str, remote: dict) -> bool:
+    """True if a tombstone newer than the remote file exists (deletion wins).
+    Clears the tombstone when the file copy is newer (stale tombstone)."""
+    tomb_key = _tomb(agent, rel)
+    tomb_raw = r.get(tomb_key)
+    if not tomb_raw:
+        return False
+    tomb_ts = _parse_ts(tomb_raw)
+    file_ts = _parse_ts(remote.get("updated_at"))
+    if tomb_ts is None:
+        r.delete(tomb_key)
+        return False
+    if file_ts is None or tomb_ts >= file_ts:
+        return True
+    r.delete(tomb_key)  # file was re-created after the deletion — tomb is stale
+    return False
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text())
@@ -194,10 +219,20 @@ def migrate_legacy_shared(r, agent: str):
     for key in list(r.scan_iter(f"{prefix}*")):
         rel = key[len(prefix):]
         skey = f"shared:wsync:file:{rel}"
-        if r.get(skey) is None:
-            val = r.get(key)
-            if val is not None:
+        val = r.get(key)
+        if val is not None:
+            existing = r.get(skey)
+            if existing is None:
                 r.set(skey, val)
+            else:
+                # both a legacy and a global copy exist — keep the newer one
+                try:
+                    new_ts = _parse_ts(json.loads(val).get("updated_at"))
+                    old_ts = _parse_ts(json.loads(existing).get("updated_at"))
+                except ValueError:
+                    new_ts = old_ts = None
+                if new_ts is not None and (old_ts is None or new_ts > old_ts):
+                    r.set(skey, val)
         r.delete(key)
     tomb_prefix = f"agent:{agent}:wsync:deleted:{SHARED_PREFIX}"
     for key in list(r.scan_iter(f"{tomb_prefix}*")):
@@ -249,6 +284,19 @@ def sync(agent: str, verbose: bool = True):
         if rel.startswith("__"):
             continue
         if rel in remote_keys:
+            raw = r.get(remote_keys[rel])
+            remote = None
+            if raw:
+                try:
+                    remote = json.loads(raw)
+                except ValueError:
+                    remote = None
+            if remote and remote.get("hash") != fstate.get(rel):
+                # someone else (another agent / the dashboard) updated this
+                # file since our last sync — their write wins over our stale
+                # deletion; forget it so the remote scan pulls it back down.
+                del fstate[rel]
+                continue
             r.delete(remote_keys[rel])
         r.set(_tomb(agent, rel), utcnow())
         del fstate[rel]
@@ -279,6 +327,8 @@ def sync(agent: str, verbose: bool = True):
             remote = json.loads(raw)
             if rel in fstate:
                 continue  # handled above as local deletion
+            if _tomb_blocks_pull(r, agent, rel, remote):
+                continue  # deleted more recently than it was written
             if pull_file(agent, rel, remote):
                 fstate[rel] = remote["hash"]
                 pulled += 1
@@ -293,6 +343,19 @@ def sync(agent: str, verbose: bool = True):
     for tomb_prefix, rel_prefix in tomb_scan:
       for key in r.scan_iter(f"{tomb_prefix}*"):
         rel = rel_prefix + key[len(tomb_prefix):]
+        # stale tombstone? if the file key exists and is newer, the
+        # re-creation wins — drop the tombstone and keep the file.
+        file_raw = r.get(_key(agent, rel))
+        if file_raw:
+            try:
+                remote = json.loads(file_raw)
+            except ValueError:
+                remote = {}
+            tomb_ts = _parse_ts(r.get(key))
+            file_ts = _parse_ts(remote.get("updated_at"))
+            if tomb_ts is None or (file_ts is not None and file_ts > tomb_ts):
+                r.delete(key)
+                continue
         target = WORKSPACE_DIR / rel
         if target.exists() and fstate.get(rel):
             try:
@@ -348,6 +411,8 @@ def restore(agent: str):
         try:
             remote = json.loads(raw)
         except ValueError:
+            continue
+        if _tomb_blocks_pull(r, agent, rel, remote):
             continue
         if pull_file(agent, rel, remote):
             fstate[rel] = remote.get("hash")
