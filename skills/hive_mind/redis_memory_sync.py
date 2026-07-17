@@ -38,14 +38,37 @@ MEMORY_DIR = "/root/.hermes"
 PERSIST_FILES = [
     "MEMORY.md",
     "USER.md",
+    # The memory tool actually writes to ~/.hermes/memories/ — the root-level
+    # MEMORY.md/USER.md above are legacy/deploy copies. Both are kept in sync
+    # so nothing the agent learns is lost on redeploy.
+    "memories/MEMORY.md",
+    "memories/USER.md",
     "workspace/MEMORY.md",
     "workspace/cron_jobs.json",
     "workspace/tasks.json",
     "workspace/notes.md",
+    # Session index (which sessions exist / channel bindings)
+    "sessions/sessions.json",
+]
+
+# Directories whose text files are swept wholesale (relative to MEMORY_DIR).
+# key layout: agent:{name}:memory:{dir}:{filename}
+SWEEP_DIRS = {
+    "workspace": (".md", ".txt", ".json", ".yaml", ".yml"),
+    "memories": (".md", ".txt", ".json"),
+    "sessions": (".json",),
+}
+
+# Binary files persisted base64-encoded. state.db holds ALL session
+# transcripts/history — without it, agents lose their conversation history on
+# every redeploy. Snapshotted via the SQLite backup API for a consistent copy.
+BINARY_FILES = [
+    "state.db",
 ]
 
 # Max size per file (bytes) to prevent Redis bloat
 MAX_FILE_SIZE = 512 * 1024  # 512KB
+MAX_BINARY_SIZE = 64 * 1024 * 1024  # 64MB — state.db grows with history
 
 
 def get_redis():
@@ -71,15 +94,16 @@ def save_memory(agent_name: str):
         content = full_path.read_text(encoding="utf-8", errors="replace")
         key = f"agent:{agent_name}:memory:{rel_path.replace('/', ':')}"
         r.set(key, content)
-        r.set(f"agent:{agent_name}:memory:last_saved", datetime.utcnow().isoformat())
         saved.append(rel_path)
 
-    # Also save any files in workspace directory
-    workspace = Path(WORKSPACE_DIR)
-    if workspace.exists():
-        for f in workspace.iterdir():
-            if f.is_file() and f.suffix in (".md", ".txt", ".json", ".yaml", ".yml"):
-                rel = f"workspace/{f.name}"
+    # Sweep whole directories for text files (workspace, memories, sessions)
+    for dirname, suffixes in SWEEP_DIRS.items():
+        base = Path(WORKSPACE_DIR) if dirname == "workspace" else Path(MEMORY_DIR) / dirname
+        if not base.exists():
+            continue
+        for f in base.iterdir():
+            if f.is_file() and f.suffix in suffixes:
+                rel = f"{dirname}/{f.name}"
                 if rel in PERSIST_FILES:
                     continue  # Already handled
                 size = f.stat().st_size
@@ -87,20 +111,87 @@ def save_memory(agent_name: str):
                     skipped.append(f"{rel} (too large)")
                     continue
                 content = f.read_text(encoding="utf-8", errors="replace")
-                key = f"agent:{agent_name}:memory:workspace:{f.name}"
+                key = f"agent:{agent_name}:memory:{dirname}:{f.name}"
                 r.set(key, content)
                 saved.append(rel)
 
+    # Binary files (state.db) — snapshot via SQLite backup API so we never
+    # capture a half-written database, then store base64.
+    for rel_path in BINARY_FILES:
+        full_path = Path(MEMORY_DIR) / rel_path
+        if not full_path.exists():
+            continue
+        try:
+            data = _snapshot_sqlite(full_path) if full_path.suffix == ".db" else full_path.read_bytes()
+        except Exception as e:
+            skipped.append(f"{rel_path} (snapshot failed: {e})")
+            continue
+        if len(data) > MAX_BINARY_SIZE:
+            skipped.append(f"{rel_path} (too large: {len(data)} bytes)")
+            # Loud, operator-visible alert: session history is NO LONGER being
+            # persisted for this agent. Surfaced in Redis so the dashboard /
+            # health checks can pick it up.
+            print(
+                f"[{agent_name}] WARNING: {rel_path} is {len(data)} bytes "
+                f"(cap {MAX_BINARY_SIZE}) — session history is NOT being backed "
+                "up to Redis. Prune old sessions or raise MAX_BINARY_SIZE.",
+                file=sys.stderr,
+            )
+            r.set(
+                f"agent:{agent_name}:memory:alert:state_db_too_large",
+                json.dumps({"size": len(data), "cap": MAX_BINARY_SIZE,
+                            "at": datetime.utcnow().isoformat()}),
+            )
+            continue
+        # Clear any stale size alert once we fit under the cap again
+        r.delete(f"agent:{agent_name}:memory:alert:state_db_too_large")
+        key = f"agent:{agent_name}:memory:binary:{rel_path.replace('/', ':')}"
+        r.set(key, base64.b64encode(data).decode("ascii"))
+        saved.append(rel_path)
+
+    r.set(f"agent:{agent_name}:memory:last_saved", datetime.utcnow().isoformat())
     print(f"[{agent_name}] Saved {len(saved)} files to Redis memory.")
     if skipped:
         print(f"[{agent_name}] Skipped: {', '.join(skipped)}")
     return saved
 
 
+def _snapshot_sqlite(path: Path) -> bytes:
+    """Take a consistent snapshot of a SQLite DB via the backup API."""
+    import sqlite3
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(str(path))
+        try:
+            dst = sqlite3.connect(tmp)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        return Path(tmp).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def restore_memory(agent_name: str):
-    """Restore agent memory files from Redis."""
+    """Restore agent memory files from Redis.
+
+    Existing local files are NEVER overwritten: on a fresh (ephemeral)
+    container nothing exists yet so everything restores; on a volume-backed
+    agent the local copies are newer than the last 5-minute Redis save, so
+    clobbering them would lose data.
+    """
     r = get_redis()
     restored = []
+    skipped = []
 
     # Get all keys for this agent's memory
     pattern = f"agent:{agent_name}:memory:*"
@@ -112,26 +203,41 @@ def restore_memory(agent_name: str):
 
         # Reconstruct file path from key
         suffix = key.replace(f"agent:{agent_name}:memory:", "")
-        
-        if suffix.startswith("workspace:"):
-            filename = suffix.replace("workspace:", "")
-            full_path = Path(WORKSPACE_DIR) / filename
-        else:
-            rel_path = suffix.replace(":", "/")
-            full_path = Path(MEMORY_DIR) / rel_path
 
-        # Create parent directories
-        full_path.parent.mkdir(parents=True, exist_ok=True)
+        # Metadata keys (alerts etc.) are not files
+        if suffix.startswith("alert:"):
+            continue
+
+        is_binary = suffix.startswith("binary:")
+        if is_binary:
+            suffix = suffix[len("binary:"):]
+
+        rel_path = suffix.replace(":", "/")
+        full_path = Path(MEMORY_DIR) / rel_path
+        # Workspace files are anchored at WORKSPACE_DIR (may be overridden)
+        if suffix.startswith("workspace:") or rel_path.startswith("workspace/"):
+            full_path = Path(WORKSPACE_DIR) / rel_path.split("/", 1)[1]
+
+        if full_path.exists():
+            skipped.append(str(full_path))
+            continue
 
         content = r.get(key)
-        if content:
+        if not content:
+            continue
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        if is_binary:
+            full_path.write_bytes(base64.b64decode(content))
+        else:
             full_path.write_text(content, encoding="utf-8")
-            restored.append(str(full_path))
+        restored.append(str(full_path))
 
     if restored:
         print(f"[{agent_name}] Restored {len(restored)} files from Redis memory.")
     else:
         print(f"[{agent_name}] No memory found in Redis (fresh start).")
+    if skipped:
+        print(f"[{agent_name}] Kept {len(skipped)} existing local files (not overwritten).")
     return restored
 
 
