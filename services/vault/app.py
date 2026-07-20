@@ -918,11 +918,21 @@ async def startup():
 # ---------------------------------------------------------------------------
 # Backups (admin-only)
 # ---------------------------------------------------------------------------
+def _require_json_content_type(request: Request):
+    """CSRF guard for cookie-authed mutation endpoints: cross-site forms
+    cannot send application/json without a CORS preflight (which we reject)."""
+    ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ct != "application/json":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+
+
 @app.post("/api/admin/backup")
 async def admin_backup_now(request: Request):
     if not verify_admin_session(request):
         raise HTTPException(status_code=401, detail="Admin session required")
-    result = vault_backup.backup_now(r)
+    _require_json_content_type(request)
+    import asyncio
+    result = await asyncio.to_thread(vault_backup.backup_now, r)
     audit_log("admin", result["file"], "backup_created", f"{result['keys']} keys")
     return result
 
@@ -938,11 +948,14 @@ async def admin_list_backups(request: Request):
 async def admin_restore(request: Request):
     if not verify_admin_session(request):
         raise HTTPException(status_code=401, detail="Admin session required")
+    _require_json_content_type(request)
     body = await request.json()
     filename = body.get("file", "")
     overwrite = bool(body.get("overwrite", False))
+    import asyncio
     try:
-        result = vault_backup.restore_from_file(r, filename, overwrite=overwrite)
+        result = await asyncio.to_thread(
+            vault_backup.restore_from_file, r, filename, overwrite=overwrite)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Backup file not found")
     except ValueError as exc:

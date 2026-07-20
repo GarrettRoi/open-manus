@@ -41,6 +41,10 @@ KEEP = int(os.getenv("VAULT_BACKUP_KEEP", "14"))
 def backup_once(r) -> str:
     entries = {}
     for key in r.scan_iter(b"vault:*", count=1000):
+        # Never include the encryption master key: a backup file must not be
+        # sufficient to decrypt the credentials it contains.
+        if key == b"vault:master_key":
+            continue
         payload = r.dump(key)
         if payload is None:
             continue

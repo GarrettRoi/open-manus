@@ -41,6 +41,10 @@ def backup_now(r, backup_dir: str = BACKUP_DIR) -> dict:
     raw = _raw_client(r)
     entries = {}
     for key in raw.scan_iter(b"vault:*", count=1000):
+        # Never include the encryption master key: a backup file must not be
+        # sufficient to decrypt the credentials it contains.
+        if key == b"vault:master_key":
+            continue
         payload = raw.dump(key)
         if payload is None:
             continue
@@ -94,6 +98,8 @@ def restore_from_file(r, filename: str, backup_dir: str = BACKUP_DIR,
     raw = _raw_client(r)
     restored = skipped = 0
     for key, entry in data["keys"].items():
+        if key == "vault:master_key":
+            continue  # defense in depth — never restore a master key from file
         payload = base64.b64decode(entry["dump_b64"])
         try:
             raw.restore(key.encode(), entry.get("pttl", 0), payload,
@@ -109,11 +115,14 @@ def restore_from_file(r, filename: str, backup_dir: str = BACKUP_DIR,
 
 
 async def backup_loop(r):
-    """Run backup_now every BACKUP_INTERVAL_SECONDS forever (call from startup)."""
+    """Run backup_now every BACKUP_INTERVAL_SECONDS forever (call from startup).
+
+    Backup I/O runs in a worker thread so it never blocks the event loop.
+    """
     import asyncio
     while True:
         try:
-            backup_now(r)
+            await asyncio.to_thread(backup_now, r)
         except Exception:
             logger.exception("Scheduled vault backup failed")
         await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
