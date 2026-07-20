@@ -1498,7 +1498,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 for command in tree.get_commands()
             ]
         desired.sort(key=lambda item: (item.get("type", 1), item.get("name", "")))
-        payload = json.dumps(desired, sort_keys=True, separators=(",", ":"))
+        # v2: commands are guild-scoped only; the global set is purged.
+        # (Marker changes the fingerprint so already-synced agents run the
+        # one-time global purge instead of skipping.)
+        payload = "guild-only-v2:" + json.dumps(desired, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _command_sync_skip_reason(self, app_id: Any, fingerprint: str) -> Optional[str]:
@@ -1630,8 +1633,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
 
             if sync_policy == "bulk":
-                synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
-                logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
+                # Guild-scoped only: bulk-overwrite the global set to empty
+                # (a global copy would duplicate every command in the picker).
+                app_id_bulk = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
+                if app_id_bulk:
+                    await asyncio.wait_for(
+                        self._client.http.bulk_upsert_global_commands(app_id_bulk, []), timeout=30)
+                    logger.info("[%s] Cleared global slash commands via bulk overwrite", self.name)
                 await self._sync_commands_to_guilds()
                 return
 
@@ -1920,7 +1928,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not app_id:
             raise RuntimeError("Discord application ID is unavailable for slash command sync")
 
-        desired_payloads = [command.to_dict(tree) for command in tree.get_commands()]
+        # Commands live ONLY in guild scope (copied per-guild for instant
+        # availability). A global copy on top of the guild copy makes every
+        # command show up twice in Discord's picker, so the desired global
+        # set is empty: this reconcile deletes any lingering global commands.
+        desired_payloads: List[Dict[str, Any]] = []
         desired_by_key = {
             (int(payload.get("type", 1) or 1), str(payload.get("name", "") or "").lower()): payload
             for payload in desired_payloads

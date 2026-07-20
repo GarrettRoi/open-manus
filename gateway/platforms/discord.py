@@ -479,13 +479,18 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         sync_errors.append(f"guild {guild.id}: {ge}")
 
-                # Global sync fallback (can take up to an hour to propagate)
+                # Guild-scoped only: clear the global command set. A global
+                # copy on top of the per-guild copies makes every command
+                # appear twice in Discord's slash-command picker.
                 try:
-                    synced_global = await adapter_self._client.tree.sync()
-                    logger.info("[%s] Synced %d global slash command(s)", adapter_self.name, len(synced_global))
+                    app_id = getattr(adapter_self._client, "application_id", None) or getattr(
+                        getattr(adapter_self._client, "user", None), "id", None)
+                    if app_id:
+                        await adapter_self._client.http.bulk_upsert_global_commands(app_id, [])
+                        logger.info("[%s] Cleared global slash commands (guild-scoped only)", adapter_self.name)
                 except Exception as e:  # pragma: no cover - defensive logging
-                    logger.warning("[%s] Global slash command sync failed: %s", adapter_self.name, e, exc_info=True)
-                    sync_errors.append(f"global: {e}")
+                    logger.warning("[%s] Global slash command cleanup failed: %s", adapter_self.name, e, exc_info=True)
+                    sync_errors.append(f"global cleanup: {e}")
 
                 # Surface sync failures to the home channel instead of
                 # failing silently in the logs.
@@ -690,8 +695,8 @@ class DiscordAdapter(BasePlatformAdapter):
                                 guild = discord.Object(id=message.guild.id)
                                 adapter_self._client.tree.copy_global_to(guild=guild)
                                 synced = await adapter_self._client.tree.sync(guild=guild)
-                                # Sync globally (takes time)
-                                await adapter_self._client.tree.sync()
+                                # No global sync: commands are guild-scoped only
+                                # (a global copy duplicates every command).
                                 await message.channel.send(f"✅ **Success!** Registered {len(synced)} commands (including `/voicekick` and `/voicestatus`) to this server. They should appear in your `/` menu immediately.")
                             else:
                                 await message.channel.send("⚠️ This command must be used in a server channel to sync guild commands.")
