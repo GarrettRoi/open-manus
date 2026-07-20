@@ -40,6 +40,7 @@ from connections import (
 )
 import oauth as oauth_mod
 from oauth import OAuthError
+import backup as vault_backup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vault")
@@ -90,11 +91,20 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 # Encryption helpers
 # ---------------------------------------------------------------------------
 def get_master_key() -> bytes:
+    # Env var first (survives a Redis wipe — the July 2026 incident lost the
+    # Redis-stored key along with everything it encrypted).
+    env_key = os.getenv("VAULT_MASTER_KEY", "").strip()
+    if env_key:
+        return env_key.encode()
     stored = r.get(PFX_MASTER)
     if stored:
         return stored.encode()
     key = Fernet.generate_key()
     r.set(PFX_MASTER, key.decode())
+    logger.warning(
+        "VAULT_MASTER_KEY env var not set — generated a key in Redis. "
+        "Set VAULT_MASTER_KEY on this service so the key survives Redis loss."
+    )
     return key
 
 
@@ -897,6 +907,49 @@ async def startup():
     migrated = store.migrate_legacy_keys()
     logger.info("Vault started. %d agents, %d legacy keys migrated, %d connections.",
                 len(AGENT_NAMES), migrated, len(store.list_ids()))
+    if not os.getenv("VAULT_MASTER_KEY", "").strip():
+        logger.warning("VAULT_MASTER_KEY is not set — encryption key would not "
+                       "survive a Redis wipe. Set it on this service.")
+    # Nightly backups of all vault:* keys to local disk (Railway volume).
+    import asyncio
+    asyncio.create_task(vault_backup.backup_loop(r))
+
+
+# ---------------------------------------------------------------------------
+# Backups (admin-only)
+# ---------------------------------------------------------------------------
+@app.post("/api/admin/backup")
+async def admin_backup_now(request: Request):
+    if not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+    result = vault_backup.backup_now(r)
+    audit_log("admin", result["file"], "backup_created", f"{result['keys']} keys")
+    return result
+
+
+@app.get("/api/admin/backups")
+async def admin_list_backups(request: Request):
+    if not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+    return {"backups": vault_backup.list_backups()}
+
+
+@app.post("/api/admin/restore")
+async def admin_restore(request: Request):
+    if not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+    body = await request.json()
+    filename = body.get("file", "")
+    overwrite = bool(body.get("overwrite", False))
+    try:
+        result = vault_backup.restore_from_file(r, filename, overwrite=overwrite)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Backup file not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    audit_log("admin", filename, "backup_restored",
+              f"{result['restored']} restored, {result['skipped_existing']} skipped")
+    return result
 
 
 if __name__ == "__main__":

@@ -81,6 +81,15 @@ if [ -n "$REDIS_URL" ]; then
     echo "[entrypoint] Workspace sync PID: ${WORKSPACE_SYNC_PID}"
 fi
 
+# Nightly vault backup to this agent's persistent volume (enabled per-service
+# via VAULT_BACKUP_ENABLED=1 — lexi only; protects vault data from Redis loss)
+if [ "$VAULT_BACKUP_ENABLED" = "1" ] && [ -n "$REDIS_URL" ]; then
+    echo "[entrypoint] Starting vault backup loop..."
+    python3 /app/scripts/vault_backup_agent.py &
+    VAULT_BACKUP_PID=$!
+    echo "[entrypoint] Vault backup PID: ${VAULT_BACKUP_PID}"
+fi
+
 # Graceful shutdown handler — save memory before exit
 cleanup() {
     echo "[entrypoint] Shutting down ${AGENT_NAME}..."
@@ -95,6 +104,9 @@ cleanup() {
     fi
     if [ -n "$WORKSPACE_SYNC_PID" ]; then
         kill "$WORKSPACE_SYNC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$VAULT_BACKUP_PID" ]; then
+        kill "$VAULT_BACKUP_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT SIGTERM SIGINT
