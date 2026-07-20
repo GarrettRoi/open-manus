@@ -43,9 +43,17 @@ VAULT_TOKEN = os.getenv("VAULT_TOKEN", "")
 TOOLSET = "vault"
 TOOL_PREFIX = "vault_"
 
-_REFRESH_SECONDS = max(
-    60, int(os.getenv("VAULT_TOOLS_REFRESH_SECONDS", "300") or 300)
-)
+def _parse_refresh_seconds() -> int:
+    raw = os.getenv("VAULT_TOOLS_REFRESH_SECONDS", "300")
+    try:
+        return max(60, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid VAULT_TOOLS_REFRESH_SECONDS=%r — using default 300s.", raw)
+        return 300
+
+
+_REFRESH_SECONDS = _parse_refresh_seconds()
 
 # connection id (vault-side, e.g. "OPENAI") -> registered tool name
 _registered: Dict[str, str] = {}
@@ -252,9 +260,24 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                     logger.exception("Failed to deregister vault tool for %s", conn_id)
                 del _registered[conn_id]
                 removed += 1
-        # Register new / re-register changed
-        for conn_id, conn in seen.items():
+        # Register new / re-register changed. Track tool-name claims within
+        # this sync so two connection ids that normalize to the same tool
+        # name (e.g. "MY-API" and "MY_API") can't overwrite each other's
+        # handler or cause the wrong tool to be deregistered on revoke.
+        claimed = {name: cid for cid, name in _registered.items()
+                   if cid in seen}
+        for conn_id, conn in sorted(seen.items()):
             tool_name = _tool_name_for(conn_id)
+            owner = claimed.get(tool_name)
+            if owner is not None and owner != conn_id:
+                logger.warning(
+                    "Vault tool name collision: connections %r and %r both "
+                    "normalize to tool %r — skipping %r. Rename one "
+                    "connection in the vault dashboard.",
+                    owner, conn_id, tool_name, conn_id,
+                )
+                continue
+            claimed[tool_name] = conn_id
             schema = _build_conn_schema(conn, tool_name)
             existing = registry.get_entry(tool_name)
             if conn_id in _registered and existing is not None:
