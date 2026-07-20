@@ -12549,11 +12549,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter._voice_input_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
-    def _resolve_voice_text_channel(self, adapter, guild):
+    def _resolve_voice_text_channel(self, adapter, guild, voice_channel=None):
         """Pick the text channel used for voice transcripts on auto-join.
 
-        Priority: DISCORD_VOICE_TEXT_CHANNEL_ID env var, then the guild's
-        system channel, then the first text channel the bot can send to.
+        LOCAL BEHAVIOR (do not let upstream syncs revert this): voice-originated
+        turns must land in the voice channel's OWN built-in text chat (in
+        Discord its ID equals the voice channel ID), so replies/typing appear
+        where the conversation is happening.
+
+        Priority: DISCORD_VOICE_TEXT_CHANNEL_ID env var (explicit owner
+        override only), then the voice channel's own built-in chat, then the
+        guild's system channel, then the first text channel the bot can send
+        to (last-resort fallbacks when no voice channel is known).
         """
         env_id = (os.getenv("DISCORD_VOICE_TEXT_CHANNEL_ID") or "").strip()
         if env_id:
@@ -12572,6 +12579,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("DISCORD_VOICE_TEXT_CHANNEL_ID %s not found", env_id)
             except (ValueError, AttributeError):
                 logger.warning("Invalid DISCORD_VOICE_TEXT_CHANNEL_ID: %r", env_id)
+        # Default: the voice channel's own built-in text chat. Modern Discord
+        # voice channels are messageable and share the voice channel's ID.
+        if voice_channel is not None:
+            return voice_channel
         me = getattr(guild, "me", None)
         ch = getattr(guild, "system_channel", None)
         if ch is not None and me is not None and ch.permissions_for(me).send_messages:
@@ -12608,7 +12619,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not success:
             return
 
-        text_ch = self._resolve_voice_text_channel(adapter, guild)
+        text_ch = self._resolve_voice_text_channel(adapter, guild, voice_channel)
         if text_ch is None:
             logger.warning(
                 "Auto-joined voice channel %s but found no usable text channel "
