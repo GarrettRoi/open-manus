@@ -74,6 +74,13 @@ def sanitize_for_voice(text: str) -> str:
     # Clean up whitespace
     text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
+    # Local addition: expand money/math/numbers/abbreviations into words so
+    # TTS engines (ElevenLabs especially) pronounce them naturally.
+    try:
+        from tools.speech_normalize import normalize_for_speech
+        text = normalize_for_speech(text)
+    except Exception:
+        pass  # best-effort; never block TTS
     return text
 
 

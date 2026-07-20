@@ -2589,6 +2589,13 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _MD_LIST_ITEM.sub('', text)
     text = _MD_HR.sub('', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
+    # Local addition: expand money/math/numbers/abbreviations into words so
+    # TTS engines (ElevenLabs especially) pronounce them naturally.
+    try:
+        from tools.speech_normalize import normalize_for_speech
+        text = normalize_for_speech(text)
+    except Exception:
+        pass  # normalization is best-effort; never block TTS
     return text.strip()
 
 

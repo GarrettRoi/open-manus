@@ -2113,11 +2113,14 @@ def merge_pending_message_event(
 
         if (
             merge_text
-            and getattr(existing, "message_type", None) == MessageType.TEXT
-            and event.message_type == MessageType.TEXT
+            and getattr(existing, "message_type", None) in (MessageType.TEXT, MessageType.VOICE)
+            and event.message_type in (MessageType.TEXT, MessageType.VOICE)
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            # Preserve VOICE so downstream auto-TTS still speaks the reply.
+            if event.message_type == MessageType.VOICE:
+                existing.message_type = MessageType.VOICE
             return
 
     pending_messages[session_key] = event
@@ -4765,8 +4768,28 @@ class BasePlatformAdapter(ABC):
                     self._pending_messages,
                     session_key,
                     event,
-                    merge_text=event.message_type == MessageType.TEXT,
+                    merge_text=event.message_type in (MessageType.TEXT, MessageType.VOICE),
                 )
+                # Voice turns queued behind a busy session were previously
+                # invisible — no typing bubble until the current turn ended,
+                # which read as "the bot ignored me".  Fire a best-effort
+                # typing ping so the user sees the turn was received.
+                if event.message_type == MessageType.VOICE:
+                    try:
+                        # Debounce: bursty voice input can queue several turns
+                        # per second; one ping per ~5s per chat is enough to
+                        # signal liveness without hammering the Discord API.
+                        now = time.monotonic()
+                        pinged = getattr(self, "_queued_voice_typing_pings", None)
+                        if pinged is None:
+                            pinged = {}
+                            self._queued_voice_typing_pings = pinged
+                        chat_id = event.source.chat_id
+                        if now - pinged.get(chat_id, 0.0) >= 5.0:
+                            pinged[chat_id] = now
+                            asyncio.create_task(self.send_typing(chat_id))
+                    except Exception:
+                        pass
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
