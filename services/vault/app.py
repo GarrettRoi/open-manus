@@ -199,6 +199,13 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
         "created_at": conn.get("created_at", ""),
         "updated_at": conn.get("updated_at", ""),
     }
+    conn_oauth = (conn.get("auth") or {}).get("oauth")
+    if isinstance(conn_oauth, dict):
+        view["custom_oauth"] = {
+            "authorize_url": conn_oauth.get("authorize_url", ""),
+            "token_url": conn_oauth.get("token_url", ""),
+            "scopes": " ".join(conn_oauth.get("scopes") or []),
+        }
     if include_secret_state:
         secrets_d = store.get_secrets(conn["id"])
         if view["auth_kind"] == "oauth2":
@@ -227,7 +234,8 @@ async def login_submit(request: Request, password: str = Form(...)):
         session_id = secrets.token_urlsafe(32)
         SESSION_TOKENS[session_id] = time.time() + 86400
         response = RedirectResponse(url="/", status_code=303)
-        response.set_cookie("vault_session", session_id, httponly=True, max_age=86400)
+        response.set_cookie("vault_session", session_id, httponly=True, max_age=86400,
+                            samesite="lax", secure=True)
         return response
     return templates.TemplateResponse(request, "login.html", {"error": "Invalid password"})
 
@@ -331,6 +339,53 @@ async def approve_grant_request(request: Request, request_id: str = Form(...)):
     return RedirectResponse("/services?error=Invalid+grant+request", status_code=303)
 
 
+def _validate_oauth_endpoint_url(label: str, url: str) -> str:
+    """Strict validation for admin-supplied OAuth endpoint URLs (SSRF/open-
+    redirect guard). Returns an error message, or '' if the URL is safe."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+    if not url:
+        return f"{label} is required for a custom OAuth app"
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return f"{label} is not a valid URL"
+    if parts.scheme != "https":
+        return f"{label} must start with https://"
+    if parts.username or parts.password:
+        return f"{label} must not contain credentials"
+    host = parts.hostname or ""
+    if not host or "." not in host:
+        return f"{label} must use a public hostname"
+    # Reject IP literals and hostnames resolving to private/reserved ranges.
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
+    except socket.gaierror:
+        return f"{label}: hostname does not resolve"
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if not ip.is_global:
+            return f"{label} must not point at a private or internal address"
+    return ""
+
+
+def _parse_custom_oauth_form(form) -> tuple:
+    """Validate custom-OAuth fields from a form. Returns (oauth_cfg, error)."""
+    authorize_url = (form.get("authorize_url") or "").strip()
+    token_url = (form.get("token_url") or "").strip()
+    scopes = [s for s in (form.get("scopes") or "").replace(",", " ").split() if s]
+    for label, url in (("Authorization URL", authorize_url), ("Token URL", token_url)):
+        if (err := _validate_oauth_endpoint_url(label, url)):
+            return None, err
+    cfg: Dict[str, Any] = {"authorize_url": authorize_url, "token_url": token_url,
+                           "scopes": scopes}
+    return cfg, ""
+
+
 @app.post("/services/add")
 async def add_service(request: Request):
     if (resp := _admin_or_redirect(request)):
@@ -365,6 +420,13 @@ async def add_service(request: Request):
             return RedirectResponse(
                 url="/services?error=Client+ID+and+secret+are+required+for+OAuth+services",
                 status_code=303)
+        if tpl.get("custom_oauth"):
+            oauth_cfg, err = _parse_custom_oauth_form(form)
+            if err:
+                return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
+            if not base_url:
+                return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
+            auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
     else:
@@ -410,11 +472,29 @@ async def update_service(request: Request):
     if client_secret:
         secrets_d["client_secret"] = client_secret
 
+    auth = conn.get("auth")
+    # Custom OAuth connections can update their endpoint config too.
+    if (auth or {}).get("kind") == "oauth2" and (auth or {}).get("oauth") is not None \
+            and (form.get("authorize_url") or form.get("token_url") or form.get("scopes")):
+        merged = dict(auth.get("oauth") or {})
+        if form.get("authorize_url"):
+            merged["authorize_url"] = form.get("authorize_url").strip()
+        if form.get("token_url"):
+            merged["token_url"] = form.get("token_url").strip()
+        if form.get("scopes"):
+            merged["scopes"] = [s for s in form.get("scopes").replace(",", " ").split() if s]
+        for label, key in (("Authorization URL", "authorize_url"), ("Token URL", "token_url")):
+            if (err := _validate_oauth_endpoint_url(label, str(merged.get(key, "")))):
+                return RedirectResponse(
+                    url=f"/services?error={err.replace(' ', '+')}", status_code=303)
+        auth = dict(auth)
+        auth["oauth"] = merged
+
     store.save(
         conn_id, service=conn["service"],
         label=form.get("label") or conn.get("label", ""),
         base_url=(form.get("base_url") or conn.get("base_url", "")).strip(),
-        auth=conn.get("auth"),
+        auth=auth,
         secrets=secrets_d,
         description=form.get("description", conn.get("description", "")),
         skill_description=form.get("skill_description", conn.get("skill_description", "")),
@@ -454,7 +534,8 @@ async def oauth_connect(request: Request, conn_id: str):
         return RedirectResponse(url="/services?error=Add+the+OAuth+client+ID+first", status_code=303)
     try:
         url = oauth_mod.build_authorize_url(
-            conn["service"], conn["id"], secrets_d["client_id"], PUBLIC_URL, store)
+            conn["service"], conn["id"], secrets_d["client_id"], PUBLIC_URL, store,
+            conn=conn)
     except OAuthError as exc:
         return RedirectResponse(url=f"/services?error={str(exc).replace(' ', '+')}", status_code=303)
     return RedirectResponse(url=url, status_code=303)
@@ -478,7 +559,7 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
     try:
         tokens = await oauth_mod.exchange_code(
             pending["service"], code, secrets_d.get("client_id", ""),
-            secrets_d.get("client_secret", ""), PUBLIC_URL)
+            secrets_d.get("client_secret", ""), PUBLIC_URL, conn=conn)
     except OAuthError as exc:
         audit_log("admin", conn_id, "oauth_failed", str(exc)[:200])
         return RedirectResponse(url=f"/services?error={str(exc)[:120].replace(' ', '+')}", status_code=303)
@@ -830,7 +911,8 @@ async def proxy_request(conn_id: str, request: Request):
     scrub_values = [v for v in secrets_d.values() if isinstance(v, str)]
     try:
         if auth_kind == "oauth2":
-            access_token, _ = await oauth_mod.get_valid_access_token(conn["service"], cid, store)
+            access_token, _ = await oauth_mod.get_valid_access_token(
+                conn["service"], cid, store, conn=conn)
             scrub_values.append(access_token)
             injected = build_auth(conn, secrets_d, access_token=access_token)
         else:

@@ -31,12 +31,22 @@ def redirect_uri(public_url: str) -> str:
     return f"{public_url.rstrip('/')}/oauth/callback"
 
 
-def build_authorize_url(service: str, conn_id: str, client_id: str,
-                        public_url: str, store) -> str:
+def oauth_config(service: str, conn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """OAuth endpoints/scopes for a connection: per-connection config (custom
+    OAuth apps store it in auth_json) wins over the static catalog template."""
+    auth = (conn or {}).get("auth") or {}
+    if isinstance(auth.get("oauth"), dict) and auth["oauth"].get("token_url"):
+        return auth["oauth"]
     tpl = get_template(service)
-    if not tpl or tpl["auth"]["kind"] != "oauth2":
-        raise OAuthError(f"{service} is not an OAuth service")
-    oauth = tpl["oauth"]
+    return ((tpl or {}).get("oauth")) or {}
+
+
+def build_authorize_url(service: str, conn_id: str, client_id: str,
+                        public_url: str, store,
+                        conn: Optional[Dict[str, Any]] = None) -> str:
+    oauth = oauth_config(service, conn)
+    if not oauth.get("authorize_url"):
+        raise OAuthError(f"{service} is not an OAuth service (no authorize URL configured)")
     state = pysecrets.token_urlsafe(24)
     store.put_oauth_state(state, {"service": service, "conn_id": conn_id})
     params = {
@@ -51,10 +61,10 @@ def build_authorize_url(service: str, conn_id: str, client_id: str,
 
 
 async def exchange_code(service: str, code: str, client_id: str,
-                        client_secret: str, public_url: str) -> Dict[str, Any]:
+                        client_secret: str, public_url: str,
+                        conn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Exchange an authorization code for tokens. Returns the token payload."""
-    tpl = get_template(service)
-    oauth = (tpl or {}).get("oauth") or {}
+    oauth = oauth_config(service, conn)
     token_url = oauth.get("token_url")
     if not token_url:
         raise OAuthError(f"No token URL for service {service}")
@@ -80,11 +90,13 @@ async def exchange_code(service: str, code: str, client_id: str,
     return _normalize_token_payload(payload)
 
 
-async def refresh_tokens(service: str, secrets: Dict[str, Any]) -> Dict[str, Any]:
+async def refresh_tokens(service: str, secrets: Dict[str, Any],
+                         conn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Refresh an access token. Returns updated token fields (keeps the old
     refresh_token if the provider doesn't rotate it)."""
-    tpl = get_template(service)
-    oauth = (tpl or {}).get("oauth") or {}
+    oauth = oauth_config(service, conn)
+    if not oauth.get("token_url"):
+        raise OAuthError(f"No token URL configured for {service}")
     refresh_token = secrets.get("refresh_token")
     if not refresh_token:
         raise OAuthError("No refresh token stored — reconnect this service")
@@ -135,7 +147,8 @@ def token_expired(secrets: Dict[str, Any]) -> bool:
     return time.time() >= float(expires_at) - _EXPIRY_SLACK_SECONDS
 
 
-async def get_valid_access_token(service: str, conn_id: str, store) -> Tuple[str, bool]:
+async def get_valid_access_token(service: str, conn_id: str, store,
+                                 conn: Optional[Dict[str, Any]] = None) -> Tuple[str, bool]:
     """Return (access_token, was_refreshed); persists refreshed tokens."""
     secrets = store.get_secrets(conn_id)
     token = secrets.get("access_token")
@@ -143,7 +156,7 @@ async def get_valid_access_token(service: str, conn_id: str, store) -> Tuple[str
         raise OAuthError("Service not connected — complete the OAuth login in the vault dashboard")
     if not token_expired(secrets):
         return token, False
-    updated = await refresh_tokens(service, secrets)
+    updated = await refresh_tokens(service, secrets, conn=conn)
     secrets.update(updated)
     store.set_secrets(conn_id, secrets)
     logger.info("Refreshed OAuth token for connection %s", conn_id)

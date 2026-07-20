@@ -114,6 +114,23 @@
             <input type="password" name="api_key" placeholder="paste the key — agents will never see it">
         </div>
 
+        <div id="grp_custom_oauth" style="display:none;">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Authorization URL</label>
+                    <input type="url" name="authorize_url" placeholder="https://example.com/oauth/authorize">
+                </div>
+                <div class="form-group">
+                    <label>Token URL</label>
+                    <input type="url" name="token_url" placeholder="https://example.com/oauth/token">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Scopes (space or comma separated)</label>
+                <input type="text" name="scopes" placeholder="read write offline_access">
+            </div>
+        </div>
+
         <div id="grp_oauth" style="display:none;">
             <div class="form-row">
                 <div class="form-group">
@@ -200,6 +217,20 @@
                 <label>New API key (leave blank to keep current)</label>
                 <input type="password" name="api_key">
             </div>
+            <div id="e_grp_custom_oauth" style="display:none;">
+                <div class="form-group">
+                    <label>Authorization URL</label>
+                    <input type="url" name="authorize_url" id="e_authorize_url">
+                </div>
+                <div class="form-group">
+                    <label>Token URL</label>
+                    <input type="url" name="token_url" id="e_token_url">
+                </div>
+                <div class="form-group">
+                    <label>Scopes (space or comma separated)</label>
+                    <input type="text" name="scopes" id="e_scopes">
+                </div>
+            </div>
             <div id="e_grp_oauth" style="display:none;">
                 <div class="form-group">
                     <label>OAuth client ID (leave blank to keep)</label>
@@ -243,8 +274,12 @@ function onServiceChange() {
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
 
+    // custom OAuth: user supplies the endpoints + base URL
+    const isCustomOAuth = !!tpl.custom_oauth;
+    document.getElementById('grp_custom_oauth').style.display = isCustomOAuth ? '' : 'none';
+
     // base URL field: needed when template has no default
-    const needsBase = !tpl.base_url && !isOAuth;
+    const needsBase = !tpl.base_url && (!isOAuth || isCustomOAuth);
     document.getElementById('grp_base_url').style.display = needsBase ? '' : 'none';
     const fields = tpl.fields || [];
     const baseField = fields.find(f => f.name === 'base_url');
@@ -273,6 +308,11 @@ function openEdit(c) {
     const isOAuth = c.auth_kind === 'oauth2';
     document.getElementById('e_grp_key').style.display = isOAuth ? 'none' : '';
     document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
+    const co = c.custom_oauth;
+    document.getElementById('e_grp_custom_oauth').style.display = co ? '' : 'none';
+    document.getElementById('e_authorize_url').value = co ? (co.authorize_url || '') : '';
+    document.getElementById('e_token_url').value = co ? (co.token_url || '') : '';
+    document.getElementById('e_scopes').value = co ? (co.scopes || '') : '';
     document.getElementById('editModal').classList.add('active');
 }
 function closeEdit() { document.getElementById('editModal').classList.remove('active'); }

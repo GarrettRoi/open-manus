@@ -148,6 +148,30 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /me/messages",
     },
+    "custom_oauth": {
+        "label": "Custom (any OAuth app)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "custom_oauth": True,
+        "fields": [
+            {"name": "base_url", "label": "API base URL",
+             "placeholder": "https://api.example.com/v1", "required": True},
+            {"name": "authorize_url", "label": "Authorization URL",
+             "placeholder": "https://example.com/oauth/authorize", "required": True},
+            {"name": "token_url", "label": "Token URL",
+             "placeholder": "https://example.com/oauth/token", "required": True},
+            {"name": "scopes", "label": "Scopes (space or comma separated)",
+             "placeholder": "read write offline_access", "required": False},
+        ],
+        "setup_help": (
+            "Connect any app that supports OAuth 2.0 (authorization code flow). "
+            "In the app's developer settings, create an OAuth app/client, add the "
+            "redirect URL shown below, then paste its authorize URL, token URL, "
+            "scopes, API base URL, and the client ID + secret here."
+        ),
+        "example_call": "GET /whatever/the/api/offers",
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},
