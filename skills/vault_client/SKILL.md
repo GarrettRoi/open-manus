@@ -14,6 +14,8 @@ metadata:
 
 The vault holds every credential (API keys AND OAuth logins for Google, GitHub, Outlook, ...). You **never** receive a key. Instead you send the API request *through* the vault, which attaches the credential and returns the response.
 
+> ℹ️ **Native tools first:** every connection you've been granted is also registered as its own native `vault_<name>` tool (e.g. `vault_openai`), plus a `vault` meta-tool for `list` / `request_access` / `refresh`. Prefer those over this skill — this client remains as a fallback for scripts and terminal use.
+
 > ⚠️ **v3 breaking change:** `get` and `export` are gone. `vault.get("KEY")` raises an error. Route calls through `vault.request(...)` instead.
 
 ---

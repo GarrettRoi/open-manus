@@ -182,6 +182,19 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+VAULT_GUIDANCE = (
+    "External API credentials live in a secure vault and are exposed to you "
+    "as native tools: each granted connection appears as its own vault_<name> "
+    "tool (e.g. vault_openai) that proxies the API call with the credential "
+    "attached server-side. Prefer these per-service tools for external API "
+    "calls — use local tools (terminal, files, web) for everything else. "
+    "You can never read raw keys. If a service you need has no vault_<name> "
+    "tool, call vault(action='list') to see your grants, "
+    "vault(action='refresh') to re-sync, or vault(action='request_access', "
+    "service=..., reason=...) to ask the owner for access — then tell the "
+    "user it's pending approval in the vault dashboard."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

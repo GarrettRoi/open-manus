@@ -50,6 +50,11 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
+    # Vault meta-tool (per-connection vault_<name> tools join the `vault`
+    # toolset dynamically at runtime; only the static meta-tool lives here
+    # so platform reverse-mapping can recover the toolset — see
+    # hermes_cli/tools_config.py::_get_platform_tools recovery block).
+    "vault",
     # Planning & memory
     "todo", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
@@ -166,6 +171,16 @@ TOOLSETS = {
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
         "tools": ["skills_list", "skill_view", "skill_manage"],
+        "includes": []
+    },
+
+    "vault": {
+        "description": (
+            "Secure credential vault: list/request connections via the `vault` "
+            "tool; each granted connection is also registered dynamically as "
+            "its own vault_<name> tool (credentials stay server-side)."
+        ),
+        "tools": ["vault"],
         "includes": []
     },
     
