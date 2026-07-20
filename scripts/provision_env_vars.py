@@ -5,7 +5,10 @@ This script sets the correct API keys, credentials, and tool configs
 for each agent service so they are fully operational.
 
 Run: python3 scripts/provision_env_vars.py
+     python3 scripts/provision_env_vars.py --vault-tokens   # also sync VAULT_TOKEN
+                                                            # values from the vault
 """
+import argparse
 import os
 import json
 import time
@@ -36,6 +39,8 @@ AGENT_SERVICES = {
     "valentina": "ffe6a337-2475-47ab-83f0-8fceb80312b0",
     "addison":   "4fbd8c66-944b-46b5-83b2-ce2f1c8b6bd9",
     "lexi":      "08006723-2b99-4fa5-aec0-f4afe96a242c",
+    "victoria":  "",  # TODO: fill in once Victoria's Railway service exists
+    "vivian":    "",  # TODO: fill in once Vivian's Railway service exists
 }
 
 # ============================================================
@@ -252,20 +257,52 @@ def set_agent_vars(agent_name: str, service_id: str, variables: dict):
     return result
 
 
+def fetch_vault_tokens() -> dict:
+    """Fetch each agent's current vault token (token_plain) from Redis —
+    the same store the vault service uses. Requires REDIS_URL."""
+    import redis as redis_lib
+    redis_url = os.environ.get("REDIS_URL", "")
+    if not redis_url:
+        raise SystemExit("--vault-tokens requires REDIS_URL to be set")
+    r = redis_lib.from_url(redis_url, decode_responses=True)
+    tokens = {}
+    for agent_name in AGENT_SERVICES:
+        data = r.hgetall(f"vault:agent:{agent_name}")
+        token = (data or {}).get("token_plain", "")
+        if token:
+            tokens[agent_name] = token
+        else:
+            print(f"  ! No vault token found for {agent_name}")
+    return tokens
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Provision agent env vars on Railway")
+    parser.add_argument("--vault-tokens", action="store_true",
+                        help="Also fetch each agent's current vault token and "
+                             "set it as VAULT_TOKEN on the agent's service")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Open Manus — Agent Environment Variable Provisioner")
     print("=" * 60)
-    
+
+    vault_tokens = fetch_vault_tokens() if args.vault_tokens else {}
+
     success_count = 0
     error_count = 0
     
     for agent_name, service_id in AGENT_SERVICES.items():
+        if not service_id:
+            print(f"\n[{agent_name.upper()}] No Railway service ID yet — skipping")
+            continue
         print(f"\n[{agent_name.upper()}] Service ID: {service_id}")
         
         # Merge shared + agent-specific vars
         agent_specific = AGENT_VARS.get(agent_name, {})
         all_vars = {**SHARED_VARS, **agent_specific}
+        if agent_name in vault_tokens:
+            all_vars["VAULT_TOKEN"] = vault_tokens[agent_name]
         
         # Remove empty values
         all_vars = {k: v for k, v in all_vars.items() if v}

@@ -7,6 +7,10 @@
 <div class="page-header">
     <h2>Agent Tokens</h2>
     <p>Each agent uses a unique token to authenticate with the vault.</p>
+    <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px;">
+        <button class="btn btn-sm" id="sync-tokens-btn" onclick="syncAllTokens(this)">&#128640; Sync all tokens to Railway</button>
+        <span id="sync-tokens-result" style="font-size: 13px; color: var(--text-muted);"></span>
+    </div>
 </div>
 
 <div class="card">
@@ -18,6 +22,7 @@
                     <th>Agent</th>
                     <th>Token</th>
                     <th>Created</th>
+                    <th>Sync to Railway</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -32,6 +37,20 @@
                         </div>
                     </td>
                     <td style="color: var(--text-muted); font-size: 13px;">{{ agent.created_at[:10] if agent.created_at else '&#8212;' }}</td>
+                    <td style="font-size: 13px;">
+                        {% if agent.railway_sync_status == 'ok' %}
+                            <span style="color: #22c55e;">&#10003; Synced</span>
+                        {% elif agent.railway_sync_status == 'failed' %}
+                            <span style="color: #ef4444;">&#10007; Failed</span>
+                        {% elif agent.railway_sync_status == 'pending' %}
+                            <span style="color: #eab308;">&#9203; Pending</span>
+                        {% else %}
+                            <span style="color: var(--text-muted);">&#8212;</span>
+                        {% endif %}
+                        {% if agent.railway_sync_at %}
+                            <div style="font-size: 11px; color: var(--text-muted);">{{ agent.railway_sync_at[:19].replace('T', ' ') }}</div>
+                        {% endif %}
+                    </td>
                     <td>
                         <form method="post" action="/agents/regenerate" style="display:inline;" onsubmit="return confirm('Regenerate token for {{ agent.name|capitalize }}? The old token will stop working immediately.')">
                             <input type="hidden" name="agent_name" value="{{ agent.name }}">
@@ -80,6 +99,26 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+async function syncAllTokens(btn) {
+    const out = document.getElementById('sync-tokens-result');
+    btn.disabled = true;
+    out.textContent = 'Syncing…';
+    try {
+        const resp = await fetch('/api/admin/sync-tokens', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Sync failed');
+        out.textContent = `Pushed ${data.synced}/${data.total} tokens to Railway.`;
+        const failed = Object.entries(data.results).filter(([, v]) => v !== 'ok').map(([k, v]) => `${k}: ${v}`);
+        if (failed.length) out.textContent += ' Issues: ' + failed.join(', ');
+        setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+        out.textContent = 'Error: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+}
+</script>
 <style>
     .desktop-only { display: block; }
     .mobile-only { display: none; }

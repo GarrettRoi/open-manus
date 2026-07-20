@@ -47,6 +47,17 @@ logger = logging.getLogger("vault")
 
 # ---------------------------------------------------------------------------
 # Configuration
+#
+# Railway token push feature — required env vars (set on the vault Railway
+# service, service ID 61b10056-76e2-4995-82a9-5c3c9c4681f0):
+#   RAILWAY_ACCOUNT_API      Railway personal/account API token used to call
+#                            the Railway GraphQL API (variableCollectionUpsert).
+#   RAILWAY_VAULT_SERVICE_ID The vault's own Railway service ID
+#                            (61b10056-76e2-4995-82a9-5c3c9c4681f0).
+# Optional (defaults below match the Open Manus Agents project):
+#   RAILWAY_PROJECT_ID, RAILWAY_ENVIRONMENT_ID
+# If RAILWAY_ACCOUNT_API is missing, token pushes are skipped with a warning —
+# the vault still works, but VAULT_TOKEN must be set on agents manually.
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ADMIN_PASSWORD = os.getenv("VAULT_ADMIN_PASSWORD", "changeme")
@@ -66,6 +77,35 @@ AGENT_NAMES = [
     "raven", "sabrina", "sasha", "scarlett", "tatiana", "valentina", "lexi",
     "victoria", "vivian",
 ]
+
+# Railway GraphQL — for pushing VAULT_TOKEN to each agent's service.
+RAILWAY_API = "https://backboard.railway.com/graphql/v2"
+RAILWAY_ACCOUNT_API = os.getenv("RAILWAY_ACCOUNT_API", "").strip()
+RAILWAY_VAULT_SERVICE_ID = os.getenv(
+    "RAILWAY_VAULT_SERVICE_ID", "61b10056-76e2-4995-82a9-5c3c9c4681f0").strip()
+RAILWAY_PROJECT_ID = os.getenv(
+    "RAILWAY_PROJECT_ID", "ea6649cb-ac92-44fd-bea9-3fbf6ad5e473").strip()
+RAILWAY_ENVIRONMENT_ID = os.getenv(
+    "RAILWAY_ENVIRONMENT_ID", "e57f146e-e0b8-4d5c-a443-c30e0baf016f").strip()
+
+# Agent Railway service IDs (mirrors scripts/provision_env_vars.py).
+RAILWAY_AGENT_SERVICE_IDS = {
+    "harmony":   "fb56002a-09d9-48c5-87ab-6453bae2b325",
+    "samantha":  "55729960-9915-4b58-be4b-0502418e5f60",
+    "tatiana":   "35016475-6a1e-42a2-95be-1c3ef62982cb",
+    "jade":      "5e296395-c8f8-451b-ab2d-5d46e9cf9699",
+    "sasha":     "52155bb0-e561-4e58-9c1e-13ae5b359943",
+    "scarlett":  "f4a3cad5-3328-4bf5-aab5-ce185ebb99ff",
+    "sabrina":   "85b08450-d0f7-4454-a3b8-2118bd30cd6c",
+    "cora":      "144238cf-424d-4e4c-af6b-b8ebdd25cebe",
+    "raven":     "333c04b2-a264-429c-a11c-343b7eca19b7",
+    "bianca":    "03310b9d-eb82-48d1-aef9-b206c358e85a",
+    "valentina": "ffe6a337-2475-47ab-83f0-8fceb80312b0",
+    "addison":   "4fbd8c66-944b-46b5-83b2-ce2f1c8b6bd9",
+    "lexi":      "08006723-2b99-4fa5-aec0-f4afe96a242c",
+    "victoria":  "",  # TODO: fill in once Victoria's Railway service exists
+    "vivian":    "",  # TODO: fill in once Vivian's Railway service exists
+}
 
 # Agents allowed to create new API-key connections via the API.
 STORE_ALLOWED_AGENTS = {"valentina", "harmony", "admin"}
@@ -139,9 +179,76 @@ def audit_log(agent: str, target: str, action: str, detail: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Railway token push
+# ---------------------------------------------------------------------------
+async def push_vault_token_to_railway(agent_name: str, token_plain: str) -> bool:
+    """Push VAULT_TOKEN to the agent's Railway service via GraphQL.
+
+    Records the outcome on the agent's Redis hash (railway_sync_status /
+    railway_sync_at). Never raises — returns True on success, False otherwise.
+    """
+    key = f"{PFX_AGENT}{agent_name}"
+
+    def _record(status: str):
+        try:
+            r.hset(key, mapping={
+                "railway_sync_status": status,
+                "railway_sync_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
+
+    if not RAILWAY_ACCOUNT_API:
+        logger.warning("RAILWAY_ACCOUNT_API not set — skipping Railway token "
+                       "push for %s", agent_name)
+        _record("pending")
+        return False
+    service_id = RAILWAY_AGENT_SERVICE_IDS.get(agent_name, "")
+    if not service_id:
+        logger.warning("No Railway service ID known for agent %s — skipping "
+                       "token push", agent_name)
+        _record("pending")
+        return False
+
+    mutation = """
+    mutation variableCollectionUpsert($input: VariableCollectionUpsertInput!) {
+        variableCollectionUpsert(input: $input)
+    }
+    """
+    payload = {
+        "query": mutation,
+        "variables": {
+            "input": {
+                "projectId": RAILWAY_PROJECT_ID,
+                "environmentId": RAILWAY_ENVIRONMENT_ID,
+                "serviceId": service_id,
+                "variables": {"VAULT_TOKEN": token_plain},
+            }
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                RAILWAY_API, json=payload,
+                headers={"Authorization": f"Bearer {RAILWAY_ACCOUNT_API}"})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("errors"):
+            raise RuntimeError(str(data["errors"]))
+    except Exception as e:
+        logger.warning("Railway token push failed for %s: %s", agent_name, e)
+        _record("failed")
+        return False
+    logger.info("Pushed VAULT_TOKEN to Railway for %s", agent_name)
+    _record("ok")
+    audit_log("admin", agent_name, "railway_token_push", "VAULT_TOKEN synced to Railway")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Agents / auth
 # ---------------------------------------------------------------------------
-def init_agents():
+async def init_agents():
     for name in AGENT_NAMES:
         key = f"{PFX_AGENT}{name}"
         if not r.exists(key):
@@ -154,6 +261,8 @@ def init_agents():
             })
             r.zadd(PFX_AGENT_INDEX, {name: time.time()})
             logger.info("Created agent token for %s", name)
+            # New token → push straight to the agent's Railway service.
+            await push_vault_token_to_railway(name, token)
 
 
 SESSION_TOKENS: Dict[str, float] = {}
@@ -624,7 +733,27 @@ async def regenerate_token(request: Request, agent_name: str = Form(...)):
         "token_plain": token,
     })
     audit_log("admin", agent_name, "token_regenerated")
+    await push_vault_token_to_railway(agent_name, token)
     return RedirectResponse(url="/agents", status_code=303)
+
+
+@app.post("/api/admin/sync-tokens")
+async def sync_all_tokens(request: Request):
+    """Push every agent's current VAULT_TOKEN to Railway (bulk recovery)."""
+    if not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+    results: Dict[str, str] = {}
+    for name in AGENT_NAMES:
+        data = r.hgetall(f"{PFX_AGENT}{name}")
+        token = (data or {}).get("token_plain", "")
+        if not token:
+            results[name] = "no_token"
+            continue
+        results[name] = "ok" if await push_vault_token_to_railway(name, token) else "failed"
+    ok = sum(1 for v in results.values() if v == "ok")
+    audit_log("admin", "all_agents", "railway_token_sync",
+              f"Bulk sync: {ok}/{len(results)} pushed")
+    return {"synced": ok, "total": len(results), "results": results}
 
 
 @app.get("/audit", response_class=HTMLResponse)
@@ -985,7 +1114,7 @@ async def health():
 
 @app.on_event("startup")
 async def startup():
-    init_agents()
+    await init_agents()
     migrated = store.migrate_legacy_keys()
     logger.info("Vault started. %d agents, %d legacy keys migrated, %d connections.",
                 len(AGENT_NAMES), migrated, len(store.list_ids()))
