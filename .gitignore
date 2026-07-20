@@ -55,3 +55,4 @@ environments/benchmarks/evals/
 workspace/
 sessions/
 memory/
+backups/redis_backup*
