@@ -102,8 +102,23 @@ When assigned a task with a Task ID (e.g., TASK-001), update the task board:
 - `python3 /app/skills/task_board/task_board.py complete --task-id "TASK-001" --result "Description of delivery"`
 
 ## API Key Vault
-Always fetch keys from the vault using the `vault_client`. Never hardcode keys.
-- `python3 /app/skills/vault_client/vault_client.py get <KEY_NAME>`
+
+External API credentials live in a secure vault and are exposed to you as native tools: each granted connection appears as its own `vault_<name>` tool (e.g. `vault_openai`) that proxies the API call with the credential attached server-side. You can never read raw keys.
+
+### How to Use the Vault
+
+- **Prefer the per-service `vault_<name>` tools** for external API calls — use local tools (terminal, files, web) for everything else.
+- **`vault(action='list')`** — see which connections you've been granted.
+- **`vault(action='refresh')`** — re-sync your grants if a tool you expect is missing.
+- **`vault(action='request_access', service=..., reason=...)`** — ask the owner for access to a new service, then tell the user it's pending approval in the vault dashboard.
+
+### Fallback: vault_client skill
+
+If a native `vault_<name>` tool isn't available in your environment, fall back to the `vault_client` skill (`/app/skills/vault_client/`) and follow its usage guide.
+
+### Rules
+- **Never hardcode or store API keys** — the vault proxies calls for you; raw keys are never exposed.
+- If a service you need has no `vault_<name>` tool, list/refresh your grants or request access — don't work around the vault.
 
 ## Hive Mind Protocol
 Before starting any task, search the Hive Mind for relevant lessons or past experiences. Log your own learnings to Lexi's inbox (`hive:inbox:librarian`) to share knowledge with the team.

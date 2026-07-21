@@ -129,39 +129,22 @@ python3 /app/skills/task_board/task_board.py complete --task-id "TASK-001" --res
 
 ## API Key Vault
 
-You have access to a centralized API Key Vault for securely fetching API keys. Never hardcode keys — always fetch from the vault.
+External API credentials live in a secure vault and are exposed to you as native tools: each granted connection appears as its own `vault_<name>` tool (e.g. `vault_openai`) that proxies the API call with the credential attached server-side. You can never read raw keys.
 
-### Quick Reference
+### How to Use the Vault
 
-```bash
-# List all keys you have access to
-python3 /app/skills/vault_client/vault_client.py list
+- **Prefer the per-service `vault_<name>` tools** for external API calls — use local tools (terminal, files, web) for everything else.
+- **`vault(action='list')`** — see which connections you've been granted.
+- **`vault(action='refresh')`** — re-sync your grants if a tool you expect is missing.
+- **`vault(action='request_access', service=..., reason=...)`** — ask the owner for access to a new service, then tell the user it's pending approval in the vault dashboard.
 
-# Fetch a specific key
-python3 /app/skills/vault_client/vault_client.py get OPENAI_API_KEY
+### Fallback: vault_client skill
 
-# Get the skill/usage guide for a key
-python3 /app/skills/vault_client/vault_client.py skill OPENAI_API_KEY
-
-# Export all keys as environment variables
-python3 /app/skills/vault_client/vault_client.py export
-```
-
-### In Python Code
-
-```python
-import sys
-sys.path.insert(0, '/app/skills/vault_client')
-from vault_client import vault
-
-api_key = vault.get("OPENAI_API_KEY")
-```
+If a native `vault_<name>` tool isn't available in your environment, fall back to the `vault_client` skill (`/app/skills/vault_client/`) and follow its usage guide.
 
 ### Rules
-- **Always fetch keys from the vault** — never hardcode or store them
-- **Check `vault list`** to see what tools/services are available to you
-- **Read `vault skill <KEY_NAME>`** to learn how to use each API
-- If you need a key you don't have access to, ask Harmony to request it from Garrett
+- **Never hardcode or store API keys** — the vault proxies calls for you; raw keys are never exposed.
+- If a service you need has no `vault_<name>` tool, list/refresh your grants or request access — don't work around the vault.
 
 ## Before Every Task — Hive Mind Protocol
 
