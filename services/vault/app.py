@@ -806,7 +806,10 @@ async def list_connections(request: Request):
             '"json": {...}, "headers": {...}}'
         )
         available.append(view)
-    audit_log(agent_name, "*", "list_keys")
+    # Agents' background tool-sync polls this every few minutes; keep those
+    # out of the audit trail so real activity stays visible.
+    if request.headers.get("x-vault-background") != "1":
+        audit_log(agent_name, "*", "list_keys")
     return {"agent": agent_name, "available_connections": available,
             # legacy field name so old client code degrades readably
             "available_keys": available}
@@ -966,11 +969,15 @@ async def store_key(request: Request, key_data: KeyStoreRequest):
     if not tpl or tpl["auth"]["kind"] == "oauth2":
         service, tpl = "custom", CATALOG["custom"]
 
+    api_key = (key_data.key_value or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="key_value must not be empty")
+
     conn_id = store.save(
         key_data.key_name, service=service,
         label=key_data.service or key_data.key_name,
         base_url=key_data.base_url or tpl.get("base_url") or "",
-        secrets={"api_key": key_data.key_value},
+        secrets={"api_key": api_key},
         description=key_data.description,
         skill_description=key_data.skill_description,
         status="ready" if (key_data.base_url or tpl.get("base_url")) else "needs_base_url",

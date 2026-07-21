@@ -67,7 +67,8 @@ _warned_unreachable = False
 # ---------------------------------------------------------------------------
 
 def _vault_http(method: str, path: str, payload: Optional[dict] = None,
-                timeout: float = 15) -> Any:
+                timeout: float = 15,
+                extra_headers: Optional[dict] = None) -> Any:
     """Raw authenticated request to the vault itself (not the upstream API)."""
     if not VAULT_TOKEN:
         raise RuntimeError("VAULT_TOKEN not set")
@@ -80,19 +81,23 @@ def _vault_http(method: str, path: str, payload: Optional[dict] = None,
             "Authorization": f"Bearer {VAULT_TOKEN}",
             "Accept": "application/json",
             **({"Content-Type": "application/json"} if data else {}),
+            **(extra_headers or {}),
         },
     )
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
-def _fetch_connections() -> Optional[List[dict]]:
+def _fetch_connections(background: bool = True) -> Optional[List[dict]]:
     """Return granted connections, or None when the vault is unavailable."""
     global _warned_unreachable
     if not VAULT_TOKEN:
         return None
     try:
-        data = _vault_http("GET", "/api/vault/list")
+        # Background (routine sync) polls are kept out of the vault audit log;
+        # agent-initiated lists (background=False) still get audited.
+        hdrs = {"X-Vault-Background": "1"} if background else None
+        data = _vault_http("GET", "/api/vault/list", extra_headers=hdrs)
         _warned_unreachable = False
         conns = data.get("available_connections") or data.get("available_keys") or []
         return [c for c in conns if isinstance(c, dict) and c.get("id")]
@@ -337,7 +342,7 @@ def check_vault_requirements() -> bool:
 def vault_meta_handler(args: dict, **_kw) -> str:
     action = (args or {}).get("action") or "list"
     if action == "list":
-        conns = _fetch_connections()
+        conns = _fetch_connections(background=False)
         if conns is None:
             return json.dumps({
                 "error": "Vault is unreachable right now. Try again shortly, "
