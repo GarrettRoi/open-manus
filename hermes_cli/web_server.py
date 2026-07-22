@@ -2455,8 +2455,30 @@ async def videos_stream(vid: str, request: Request):
     if not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="Invalid stored URL")
 
+    import ipaddress
+    import socket
+
     import httpx
     from fastapi.responses import StreamingResponse
+
+    def _host_is_public(target_url: str) -> bool:
+        """SSRF guard: reject URLs whose host resolves to a private,
+        loopback, or link-local address. Checked per redirect hop."""
+        parsed = urllib.parse.urlparse(target_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        try:
+            infos = socket.getaddrinfo(parsed.hostname, None)
+        except socket.gaierror:
+            return False
+        for info in infos:
+            try:
+                addr = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                return False
+            if not addr.is_global:
+                return False
+        return True
 
     upstream_headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -2466,17 +2488,43 @@ async def videos_stream(vid: str, request: Request):
     if range_header:
         upstream_headers["Range"] = range_header
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, read=60.0))
+    client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(30.0, read=60.0))
+    resp = None
     try:
-        req = client.build_request("GET", url, headers=upstream_headers)
-        resp = await client.send(req, stream=True)
+        # Follow redirects manually so every hop passes the SSRF guard.
+        current = url
+        for _hop in range(5):
+            if not _host_is_public(current):
+                raise HTTPException(status_code=502, detail="Upstream host not allowed")
+            req = client.build_request("GET", current, headers=upstream_headers)
+            resp = await client.send(req, stream=True)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location")
+                await resp.aclose()
+                resp = None
+                if not location:
+                    raise HTTPException(status_code=502, detail="Bad upstream redirect")
+                current = urllib.parse.urljoin(current, location)
+                continue
+            break
+        else:
+            raise HTTPException(status_code=502, detail="Too many upstream redirects")
     except httpx.HTTPError as exc:
         await client.aclose()
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+    except HTTPException:
+        if resp is not None:
+            await resp.aclose()
+        await client.aclose()
+        raise
     if resp.status_code >= 400:
+        status = resp.status_code
         await resp.aclose()
         await client.aclose()
-        raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}")
+        if status == 416:
+            # Preserve range semantics so players can recover from bad seeks.
+            raise HTTPException(status_code=416, detail="Range not satisfiable")
+        raise HTTPException(status_code=502, detail=f"Upstream returned {status}")
 
     passthrough = {}
     for h in ("content-type", "content-length", "content-range", "accept-ranges"):
