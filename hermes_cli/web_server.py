@@ -2432,6 +2432,69 @@ async def videos_add(payload: VideoAdd):
     return {"ok": True, "video": entry}
 
 
+@app.get("/api/videos/stream/{vid}")
+async def videos_stream(vid: str, request: Request):
+    """Proxy-stream a stored direct video so the browser never contacts the
+    CDN itself. Some hosts (e.g. RedGifs) return 403 when the request carries
+    a foreign Referer, and browsers don't reliably omit it (Safari ignores
+    referrerpolicy on media). Only URLs already stored in the gallery can be
+    streamed — this is not an open proxy."""
+    if not re.fullmatch(r"[0-9a-f]{16}", vid):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+    r = _agent_redis()
+    raw = r.get(_VIDEO_ITEM_PREFIX + vid)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Video not found")
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if entry.get("kind") != "direct":
+        raise HTTPException(status_code=400, detail="Not a direct video")
+    url = entry.get("url", "")
+    if not re.match(r"^https?://", url):
+        raise HTTPException(status_code=400, detail="Invalid stored URL")
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    upstream_headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        upstream_headers["Range"] = range_header
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, read=60.0))
+    try:
+        req = client.build_request("GET", url, headers=upstream_headers)
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+    if resp.status_code >= 400:
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}")
+
+    passthrough = {}
+    for h in ("content-type", "content-length", "content-range", "accept-ranges"):
+        if h in resp.headers:
+            passthrough[h] = resp.headers[h]
+    passthrough.setdefault("accept-ranges", "bytes")
+
+    async def _body():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(_body(), status_code=resp.status_code, headers=passthrough)
+
+
 @app.delete("/api/videos")
 async def videos_delete(payload: VideoDelete):
     vid = payload.id.strip()

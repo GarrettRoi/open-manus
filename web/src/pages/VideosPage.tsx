@@ -102,10 +102,12 @@ function VideoPlayer({ video }: { video: VideoEntry }) {
       target.setAttribute("data-plyr-embed-id", id);
     } else {
       const el = document.createElement("video");
-      // Many hosts (e.g. RedGifs' CDN) return 403 when the request carries
-      // a foreign Referer header; omit it so direct playback works.
+      // Stream direct videos through the dashboard proxy: hosts like
+      // RedGifs' CDN return 403 when the browser sends a foreign Referer,
+      // and browsers don't reliably omit it (Safari ignores referrerpolicy
+      // on media elements). The server fetches the file without a Referer.
       el.setAttribute("referrerpolicy", "no-referrer");
-      el.src = video.url;
+      el.src = `/api/videos/stream/${encodeURIComponent(video.id)}`;
       el.controls = true;
       el.playsInline = true;
       target = el;
