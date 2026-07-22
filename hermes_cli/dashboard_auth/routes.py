@@ -195,6 +195,17 @@ async def auth_login(request: Request, provider: str, next: str = ""):
 
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
+    except NotImplementedError:
+        # Password-only providers (e.g. "basic") have no OAuth redirect
+        # flow — start_login is deliberately unimplemented. Anything that
+        # lands here (the gate's single-provider auto-redirect, an old
+        # bookmark) should see the password form, not a 500.
+        from urllib.parse import urlencode
+        safe_next = _validate_post_login_target(next)
+        qs = f"?{urlencode({'next': safe_next})}" if safe_next else ""
+        return RedirectResponse(
+            url=f"{_prefix(request)}/login{qs}", status_code=302
+        )
     except ProviderError as e:
         audit_log(
             AuditEvent.LOGIN_FAILURE,
