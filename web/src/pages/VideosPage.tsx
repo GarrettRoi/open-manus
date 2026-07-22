@@ -102,6 +102,9 @@ function VideoPlayer({ video }: { video: VideoEntry }) {
       target.setAttribute("data-plyr-embed-id", id);
     } else {
       const el = document.createElement("video");
+      // Many hosts (e.g. RedGifs' CDN) return 403 when the request carries
+      // a foreign Referer header; omit it so direct playback works.
+      el.setAttribute("referrerpolicy", "no-referrer");
       el.src = video.url;
       el.controls = true;
       el.playsInline = true;
