@@ -14,3 +14,6 @@ externalPort = 8099
 [postMerge]
 path = "scripts/post-merge-setup.sh"
 timeoutMs = 180000
+
+[nix]
+packages = ["gitFull", "libxcrypt", "libyaml", "playwright-driver"]
