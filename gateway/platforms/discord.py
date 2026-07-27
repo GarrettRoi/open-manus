@@ -402,6 +402,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_channel_id = os.getenv("DISCORD_VOICE_CHANNEL_ID")
         self._voice_queue = asyncio.Queue()
         self._voice_worker_task: Optional[asyncio.Task] = None
+        self._tts_queue = asyncio.Queue()
+        self._tts_worker_task: Optional[asyncio.Task] = None
         self._voice_keepalive_task: Optional[asyncio.Task] = None
         self._voice_volume = 1.0
         self._voice_muted = False
@@ -1044,6 +1046,10 @@ class DiscordAdapter(BasePlatformAdapter):
             
             # Start voice worker
             self._voice_worker_task = asyncio.create_task(self._voice_worker())
+            # Start TTS worker (generates audio in the background so send()
+            # returns immediately and long messages / tool boundaries don't
+            # block or cut off voice playback).
+            self._tts_worker_task = asyncio.create_task(self._tts_worker())
             
             self._running = True
             return True
@@ -1060,6 +1066,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._voice_worker_task:
             self._voice_worker_task.cancel()
             self._voice_worker_task = None
+        if self._tts_worker_task:
+            try:
+                self._tts_queue.put_nowait(None)
+            except Exception:
+                pass
+            self._tts_worker_task.cancel()
+            self._tts_worker_task = None
 
         if self._client:
             try:
@@ -1114,7 +1127,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 message_ids.append(str(msg.id))
             
             # ── VOICE STREAMING (TTS) ──
-            # If we are in a voice channel AND TTS is configured, stream the sanitized content
+            # If we are in a voice channel AND TTS is configured, hand the text
+            # to the background TTS worker. The worker synthesizes each message
+            # off the event loop and feeds the audio queue so send() returns
+            # immediately; long messages (split into multiple Discord text
+            # messages) and tool-use pauses no longer cut off the voice.
             if self._voice_client and self._voice_client.is_connected() and self._voice_tts_enabled:
                 if not _has_ffmpeg():
                     logger.warning("[%s] FFmpeg not found. Voice streaming skipped.", self.name)
@@ -1122,51 +1139,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     try:
                         sanitized_text = sanitize_for_voice(content)
                         if sanitized_text:
-                            # Use ElevenLabs to generate speech and stream it
-                            from elevenlabs.client import ElevenLabs
-                            api_key = os.getenv("ELEVENLABS_API_KEY")
-                            if not api_key:
-                                logger.error("[%s] ELEVENLABS_API_KEY not found.", self.name)
-                            else:
-                                client = ElevenLabs(api_key=api_key)
-                                
-                                # Generate audio stream with latency optimization
-                                # We use a lower latency setting for live chat
-                                optimize_latency = os.getenv("ELEVENLABS_LATENCY_LEVEL", "3")
-                                
-                                audio_stream = client.text_to_speech.convert(
-                                    text=sanitized_text,
-                                    voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"),
-                                    model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
-                                    output_format="mp3_44100_128",
-                                    optimize_streaming_latency=int(optimize_latency)
-                                )
-                                
-                                # CHUNKED STREAMING: To reduce latency, we process the stream in chunks
-                                # and put each chunk into the voice queue as it arrives.
-                                # This allows the bot to start speaking before the full audio is generated.
-                                chunk_size = 128 * 1024  # ~128KB chunks (~1-2 seconds of audio)
-                                current_chunk = bytearray()
-                                chunks_added = 0
-                                
-                                for chunk in audio_stream:
-                                    current_chunk.extend(chunk)
-                                    if len(current_chunk) >= chunk_size:
-                                        await self._voice_queue.put(bytes(current_chunk))
-                                        chunks_added += 1
-                                        current_chunk = bytearray()
-                                        # Log only the first chunk to show we started streaming
-                                        if chunks_added == 1:
-                                            logger.info("[%s] Started streaming first audio chunk to voice queue", self.name)
-                                
-                                # Don't forget the last partial chunk
-                                if current_chunk:
-                                    await self._voice_queue.put(bytes(current_chunk))
-                                    chunks_added += 1
-                                
-                                logger.info("[%s] Added %d audio chunks to voice queue", self.name, chunks_added)
+                            await self._tts_queue.put(sanitized_text)
+                            logger.info("[%s] Queued TTS for %d characters of voice text", self.name, len(sanitized_text))
                     except Exception as ve:
-                        logger.error("[%s] Voice streaming failed: %s", self.name, ve)
+                        logger.error("[%s] Failed to queue TTS: %s", self.name, ve)
 
             return SendResult(
                 success=True,
@@ -1415,6 +1391,76 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("[%s] Voice worker error: %s", self.name, e)
                 await asyncio.sleep(1)
+
+    async def _tts_worker(self):
+        """Background worker: synthesize queued text into audio and feed the voice queue.
+
+        Running TTS off the main event loop means send() returns immediately, so a
+        long message split into several Discord text messages (or a message followed
+        by tool progress) doesn't block the loop or truncate the voice stream. Each
+        queued text item becomes one complete audio item that the voice worker plays
+        in order.
+        """
+        logger.info("[%s] TTS worker started", self.name)
+        while True:
+            try:
+                text = await self._tts_queue.get()
+                if text is None:
+                    self._tts_queue.task_done()
+                    break
+                try:
+                    await self._tts_synthesize(text)
+                except Exception as e:
+                    logger.error("[%s] TTS synthesis failed: %s", self.name, e)
+                self._tts_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[%s] TTS worker error: %s", self.name, e)
+                await asyncio.sleep(1)
+        logger.info("[%s] TTS worker stopped", self.name)
+
+    async def _tts_synthesize(self, text: str) -> None:
+        """Generate ElevenLabs audio for *text* and queue it as one playback item."""
+        if not (self._voice_client and self._voice_client.is_connected() and self._voice_tts_enabled):
+            return
+        if not _has_ffmpeg():
+            logger.warning("[%s] FFmpeg not found. TTS skipped.", self.name)
+            return
+        if not text:
+            return
+
+        api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            logger.error("[%s] ELEVENLABS_API_KEY not found.", self.name)
+            return
+
+        from elevenlabs.client import ElevenLabs
+        client = ElevenLabs(api_key=api_key)
+        optimize_latency = os.getenv("ELEVENLABS_LATENCY_LEVEL", "3")
+
+        def _generate():
+            audio_stream = client.text_to_speech.convert(
+                text=text,
+                voice_id=os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgmqS2iNRB47"),
+                model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+                output_format="mp3_44100_128",
+                optimize_streaming_latency=int(optimize_latency),
+            )
+            audio = bytearray()
+            for chunk in audio_stream:
+                audio.extend(chunk)
+            return bytes(audio)
+
+        try:
+            audio = await asyncio.to_thread(_generate)
+        except Exception as e:
+            logger.error("[%s] ElevenLabs TTS generation failed: %s", self.name, e)
+            return
+
+        if audio:
+            await self._voice_queue.put(audio)
+            logger.info("[%s] Queued TTS audio for playback (%d bytes, %d chars)", self.name, len(audio), len(text))
 
     async def _voice_keepalive(self):
         """Send silent Opus packets to prevent Discord from closing the receive socket.
@@ -2004,6 +2050,7 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.append(f"")
             lines.append(f"Keepalive task running: `{self._voice_keepalive_task is not None and not self._voice_keepalive_task.done()}`")
             lines.append(f"Voice worker task running: `{self._voice_worker_task is not None and not self._voice_worker_task.done()}`")
+            lines.append(f"TTS worker task running: `{self._tts_worker_task is not None and not self._tts_worker_task.done()}`")
             lines.append(f"Voice muted: `{self._voice_muted}`")
             lines.append(f"Voice volume: `{self._voice_volume}`")
 
