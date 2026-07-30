@@ -61,6 +61,9 @@ logger = logging.getLogger("vault")
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ADMIN_PASSWORD = os.getenv("VAULT_ADMIN_PASSWORD", "changeme")
+# Shared secret for the JSON admin API (used by the fleet dashboard).
+# Falls back to VAULT_ADMIN_PASSWORD unless that is still the default.
+ADMIN_API_TOKEN = os.getenv("VAULT_ADMIN_TOKEN", "").strip()
 VAULT_PORT = int(os.getenv("PORT", "8080"))
 # Public URL of this vault (Railway domain) — required for OAuth callbacks.
 PUBLIC_URL = (os.getenv("VAULT_PUBLIC_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
@@ -271,6 +274,26 @@ SESSION_TOKENS: Dict[str, float] = {}
 def verify_admin_session(request: Request) -> bool:
     session_id = request.cookies.get("vault_session")
     return bool(session_id) and SESSION_TOKENS.get(session_id, 0) > time.time()
+
+
+def verify_admin_api(request: Request) -> bool:
+    """Admin auth for the JSON API: browser session OR shared-secret header.
+
+    The header token is ``VAULT_ADMIN_TOKEN`` when set; otherwise the admin
+    password is accepted — but never while it is still the insecure default.
+    """
+    if verify_admin_session(request):
+        return True
+    supplied = (request.headers.get("X-Vault-Admin-Token") or "").strip()
+    if not supplied:
+        return False
+    expected = ADMIN_API_TOKEN or (ADMIN_PASSWORD if ADMIN_PASSWORD != "changeme" else "")
+    return bool(expected) and secrets.compare_digest(supplied, expected)
+
+
+def require_admin_api(request: Request) -> None:
+    if not verify_admin_api(request):
+        raise HTTPException(status_code=401, detail="Admin auth required")
 
 
 def verify_agent_token(token: str) -> Optional[str]:
@@ -652,18 +675,27 @@ async def oauth_connect(request: Request, conn_id: str):
 
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    if not verify_admin_session(request):
-        return RedirectResponse(url="/login", status_code=303)
+    # Auth model: the single-use, server-generated OAuth state token IS the
+    # authorization for this callback (it can only exist if an admin — via
+    # the vault UI or the token-authed dashboard API — started the flow).
+    # Requiring a vault session here would break dashboard-initiated logins.
+    has_session = verify_admin_session(request)
     if error:
-        return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
+        if has_session:
+            return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
+        return HTMLResponse(f"<h3>OAuth denied: {error}</h3><p>You can close this tab.</p>", status_code=400)
     pending = store.pop_oauth_state(state) if state else None
     if not pending or not code:
-        return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
+        if has_session:
+            return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
+        return HTMLResponse("<h3>Invalid or expired OAuth state.</h3><p>Go back to the dashboard and click Connect again.</p>", status_code=400)
 
     conn_id = pending["conn_id"]
     conn = store.get(conn_id)
     if not conn:
-        return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
+        if has_session:
+            return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
+        return HTMLResponse("<h3>Connection no longer exists.</h3>", status_code=404)
     secrets_d = store.get_secrets(conn_id)
     try:
         tokens = await oauth_mod.exchange_code(
@@ -677,7 +709,12 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
     store.set_secrets(conn_id, secrets_d)
     r.hset(f"vault:conn:{conn_id}", "status", "ready")
     audit_log("admin", conn_id, "oauth_connected", f"Service: {pending['service']}")
-    return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
+    if has_session:
+        return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
+    return HTMLResponse(
+        "<h3>Connected successfully ✅</h3>"
+        "<p>This account is now stored in the vault. You can close this tab "
+        "and return to the dashboard.</p>")
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1147,176 @@ async def proxy_request(conn_id: str, request: Request):
 # ---------------------------------------------------------------------------
 # Health & startup
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# JSON admin API — used by the fleet dashboard (Lexi) to manage connections
+# and grants remotely. Auth: admin session cookie OR X-Vault-Admin-Token.
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/overview")
+async def admin_overview(request: Request):
+    require_admin_api(request)
+    conns = [(_conn_view(c)) for cid in store.list_ids() if (c := store.get(cid))]
+    grants = {
+        agent: [cid for cid in store.list_ids() if store.has_grant(agent, cid)]
+        for agent in AGENT_NAMES
+    }
+    catalog_view = {
+        key: {
+            "label": tpl.get("label", key),
+            "auth_kind": tpl["auth"]["kind"],
+            "setup_help": tpl.get("setup_help", ""),
+            "fields": tpl.get("fields", []),
+            "base_url": tpl.get("base_url", ""),
+            "scopes": (tpl.get("oauth") or {}).get("scopes", []),
+        }
+        for key, tpl in CATALOG.items()
+    }
+    return {
+        "connections": conns,
+        "agents": AGENT_NAMES,
+        "grants": grants,
+        "catalog": catalog_view,
+        "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL) if PUBLIC_URL else "",
+        "public_url_missing": not PUBLIC_URL,
+    }
+
+
+def _form_like(body: Dict[str, Any]):
+    """Adapter so JSON bodies flow through the same form-parsing helpers."""
+    class _D(dict):
+        def get(self, k, d=None):
+            v = super().get(k, d)
+            return v if v is None else str(v)
+    return _D(body or {})
+
+
+@app.post("/api/admin/connections")
+async def admin_add_connection(request: Request):
+    require_admin_api(request)
+    _require_json_content_type(request)
+    body = await request.json()
+    form = _form_like(body)
+
+    service = (form.get("service") or "custom").strip().lower()
+    tpl = get_template(service)
+    if not tpl:
+        raise HTTPException(status_code=400, detail="Unknown service")
+    name = form.get("name") or service
+    conn_id = normalize_id(name)
+    if not conn_id:
+        raise HTTPException(status_code=400, detail="Name required")
+    if store.get(conn_id):
+        raise HTTPException(status_code=409, detail=f"A connection named '{conn_id}' already exists")
+
+    auth = dict(tpl["auth"])
+    base_url = (form.get("base_url") or tpl.get("base_url") or "").strip()
+    if auth["kind"] == "header":
+        if form.get("header_name"):
+            auth["header_name"] = form.get("header_name").strip()
+        if form.get("prefix") is not None and service == "custom":
+            auth["prefix"] = form.get("prefix")
+
+    secrets_d: Dict[str, Any] = {}
+    status = "ready"
+    if auth["kind"] == "oauth2":
+        client_id = (form.get("client_id") or "").strip()
+        client_secret = (form.get("client_secret") or "").strip()
+        if not client_id or not client_secret:
+            raise HTTPException(status_code=400,
+                                detail="Client ID and secret are required for OAuth services")
+        if tpl.get("custom_oauth"):
+            oauth_cfg, err = _parse_custom_oauth_form(form)
+            if err:
+                raise HTTPException(status_code=400, detail=err)
+            if not base_url:
+                raise HTTPException(status_code=400, detail="Base URL required")
+            auth["oauth"] = oauth_cfg
+        secrets_d = {"client_id": client_id, "client_secret": client_secret}
+        status = "needs_login"
+    else:
+        api_key = (form.get("api_key") or "").strip()
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key required")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Base URL required")
+        secrets_d = {"api_key": api_key}
+
+    store.save(
+        conn_id, service=service, label=form.get("label") or tpl["label"],
+        base_url=base_url, auth=auth, secrets=secrets_d,
+        description=form.get("description") or "",
+        skill_description=form.get("skill_description") or "",
+        status=status,
+    )
+    audit_log("admin", conn_id, "connection_created", f"Service: {service} (via dashboard)")
+
+    # Optional immediate grants for one or more agents.
+    for agent in (body.get("grant_agents") or []):
+        if agent in AGENT_NAMES:
+            store.set_grant(agent, conn_id, True)
+            audit_log("admin", conn_id, "grant_added", f"Granted to {agent} (via dashboard)")
+
+    conn = store.get(conn_id)
+    return {"connection": _conn_view(conn), "needs_login": status == "needs_login"}
+
+
+@app.post("/api/admin/connections/{conn_id}/delete")
+async def admin_delete_connection(conn_id: str, request: Request):
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    if not store.get(cid):
+        raise HTTPException(status_code=404, detail="Connection not found")
+    store.delete(cid, AGENT_NAMES)
+    audit_log("admin", cid, "connection_deleted", "(via dashboard)")
+    return {"ok": True}
+
+
+@app.post("/api/admin/connections/{conn_id}/connect-link")
+async def admin_connect_link(conn_id: str, request: Request):
+    """Return a provider authorize URL for an OAuth connection.
+
+    The dashboard opens this URL in the user's browser; the callback is
+    validated by the single-use OAuth state, so no vault session is needed.
+    """
+    require_admin_api(request)
+    conn = store.get(normalize_id(conn_id))
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if (conn.get("auth") or {}).get("kind") != "oauth2":
+        raise HTTPException(status_code=400, detail="Not an OAuth service")
+    if not PUBLIC_URL:
+        raise HTTPException(status_code=503,
+                            detail="Set VAULT_PUBLIC_URL on the vault service to enable OAuth logins")
+    secrets_d = store.get_secrets(conn["id"])
+    if not secrets_d.get("client_id"):
+        raise HTTPException(status_code=400, detail="Add the OAuth client ID first")
+    try:
+        url = oauth_mod.build_authorize_url(
+            conn["service"], conn["id"], secrets_d["client_id"], PUBLIC_URL, store,
+            conn=conn)
+    except OAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"url": url, "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL)}
+
+
+@app.post("/api/admin/grants")
+async def admin_set_grant(request: Request):
+    require_admin_api(request)
+    _require_json_content_type(request)
+    body = await request.json()
+    agent = (body.get("agent") or "").strip().lower()
+    cid = normalize_id(body.get("conn_id") or "")
+    granted = bool(body.get("granted"))
+    if agent not in AGENT_NAMES:
+        raise HTTPException(status_code=400, detail="Unknown agent")
+    if not store.get(cid):
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if store.set_grant(agent, cid, granted):
+        audit_log("admin", cid,
+                  "grant_added" if granted else "grant_removed",
+                  f"{'Granted to' if granted else 'Revoked from'} {agent} (via dashboard)")
+    return {"ok": True}
+
+
 @app.get("/health")
 async def health():
     try:

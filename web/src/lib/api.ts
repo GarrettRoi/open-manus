@@ -619,6 +619,35 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // Vault — fleet credential vault (accounts & API keys per agent)
+  getVaultOverview: () =>
+    fetchJSON<VaultOverview>("/api/vault/overview"),
+  createVaultConnection: (body: VaultConnectionCreate) =>
+    fetchJSON<{ connection: VaultConnection; needs_login: boolean }>(
+      "/api/vault/connections",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  deleteVaultConnection: (connId: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/vault/connections/${encodeURIComponent(connId)}/delete`,
+      { method: "POST" },
+    ),
+  getVaultConnectLink: (connId: string) =>
+    fetchJSON<{ url: string; redirect_uri: string }>(
+      `/api/vault/connections/${encodeURIComponent(connId)}/connect-link`,
+      { method: "POST" },
+    ),
+  setVaultGrant: (agent: string, connId: string, granted: boolean) =>
+    fetchJSON<{ ok: boolean }>("/api/vault/grants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent, conn_id: connId, granted }),
+    }),
+
   // Profiles
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
@@ -1971,6 +2000,61 @@ export interface ProfileDescribeAutoResult {
   reason: string;
   description: string | null;
   description_auto: boolean;
+}
+
+// ── Vault types ──────────────────────────────────────────────────────
+export interface VaultConnection {
+  id: string;
+  service: string;
+  label: string;
+  base_url: string;
+  auth_kind: string;
+  status: string;
+  description: string;
+  skill_description: string;
+  example_call: string;
+  created_at: string;
+  updated_at: string;
+  connected?: boolean;
+  has_client?: boolean;
+  token_expires_at?: string;
+  custom_oauth?: { authorize_url: string; token_url: string; scopes: string };
+}
+
+export interface VaultCatalogEntry {
+  label: string;
+  auth_kind: string;
+  setup_help: string;
+  fields: { name: string; label: string; placeholder?: string; required?: boolean }[];
+  base_url: string;
+  scopes: string[];
+}
+
+export interface VaultOverview {
+  connections: VaultConnection[];
+  agents: string[];
+  grants: Record<string, string[]>;
+  catalog: Record<string, VaultCatalogEntry>;
+  redirect_uri: string;
+  public_url_missing: boolean;
+}
+
+export interface VaultConnectionCreate {
+  service: string;
+  name: string;
+  label?: string;
+  api_key?: string;
+  client_id?: string;
+  client_secret?: string;
+  base_url?: string;
+  header_name?: string;
+  prefix?: string;
+  authorize_url?: string;
+  token_url?: string;
+  scopes?: string;
+  description?: string;
+  skill_description?: string;
+  grant_agents?: string[];
 }
 
 export interface ProfileInfo {
