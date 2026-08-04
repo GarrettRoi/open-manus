@@ -2961,6 +2961,30 @@ class DiscordAdapter(BasePlatformAdapter):
             tmp.replace(path)
         except Exception as e:
             logger.warning("[%s] Failed to persist home voice state: %s", self.name, e)
+        # Mirror to Redis so the setting survives redeploys (fresh containers
+        # have no ~/.hermes/discord_home_voice.json; the entrypoint re-creates
+        # it from this key via apply_agent_settings.py). Best-effort.
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        agent = os.getenv("AGENT_NAME", "").strip().lower()
+        if redis_url and agent:
+            def _mirror():  # network I/O off the event loop
+                try:
+                    import redis as _redis
+
+                    _r = _redis.from_url(redis_url, decode_responses=True,
+                                         socket_timeout=5)
+                    _r.set(
+                        f"agent:{agent}:settings:home_voice_channel",
+                        json.dumps({"channel_id": channel_id}),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Could not persist home voice channel to Redis "
+                        "(will be lost on redeploy): %s", self.name, e)
+
+            import threading
+            threading.Thread(target=_mirror, daemon=True,
+                             name="home-voice-redis-mirror").start()
 
     def _set_home_voice_channel(self, channel_id: Optional[int]) -> None:
         """Apply + persist a new home voice channel (None clears it)."""
