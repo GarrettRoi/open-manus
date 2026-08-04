@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -246,17 +247,21 @@ def _email_call(conn_id: str, args: dict) -> str:
         "list_messages": "list",
         "read_message": "read",
         "send": "send",
+        "download_attachment": "attachment",
     }
     action = str(args.get("action") or "list_messages")
     payload: Dict[str, Any] = {"action": action_map.get(action, action)}
     for key in ("folder", "limit", "unseen_only", "uid", "to", "cc", "bcc",
-                "subject", "body", "reply_to", "in_reply_to"):
+                "subject", "body", "reply_to", "in_reply_to", "filename",
+                "index"):
         val = args.get(key)
         if val not in (None, "", []):
             payload[key] = val
     try:
         resp = _vault_http("POST", f"/api/vault/email/{conn_id}", payload,
-                           timeout=60)
+                           timeout=120)
+        if payload["action"] == "attachment" and isinstance(resp, dict):
+            return _save_email_attachment(resp, args)
         return json.dumps(resp, ensure_ascii=False, default=str)
     except HTTPError as e:
         body = ""
@@ -278,6 +283,53 @@ def _email_call(conn_id: str, args: dict) -> str:
         return json.dumps({"error": f"Email action failed: {e}"})
 
 
+def _save_email_attachment(resp: Dict[str, Any], args: dict) -> str:
+    """Decode a vault attachment response and write the file locally.
+
+    Returns JSON with the saved path so the agent can open/manipulate it.
+    """
+    import base64
+    import re as _re
+
+    att = resp.get("attachment") or {}
+    b64 = att.get("content_b64")
+    if not b64:
+        return json.dumps(resp, ensure_ascii=False, default=str)
+
+    # Sanitize the filename: basename only, printable chars, no traversal.
+    raw_name = str(att.get("filename") or "attachment.bin")
+    name = os.path.basename(raw_name.replace("\\", "/"))
+    name = _re.sub(r"[^\w.\- ()\[\]]", "_", name).strip(". ") or "attachment.bin"
+
+    save_dir = str(args.get("save_dir") or "").strip()
+    if save_dir:
+        save_dir = os.path.realpath(os.path.expanduser(save_dir))
+        home = os.path.realpath(os.path.expanduser("~"))
+        if not (save_dir == home or save_dir.startswith(home + os.sep)
+                or save_dir.startswith("/tmp/")):
+            save_dir = ""  # outside allowed roots — fall back to Downloads
+    if not save_dir:
+        save_dir = os.path.expanduser("~/Downloads")
+    os.makedirs(save_dir, exist_ok=True)
+
+    path = os.path.join(save_dir, name)
+    if os.path.exists(path):  # don't clobber earlier downloads
+        stem, ext = os.path.splitext(name)
+        path = os.path.join(save_dir, f"{stem}_{int(time.time())}{ext}")
+
+    data = base64.b64decode(b64)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return json.dumps({
+        "saved": True,
+        "path": path,
+        "filename": att.get("filename"),
+        "content_type": att.get("content_type"),
+        "size": len(data),
+        "note": "File saved locally — you can now read, process, or re-send it.",
+    }, ensure_ascii=False)
+
+
 def _build_email_schema(conn: dict, tool_name: str) -> dict:
     conn_id = conn["id"]
     label = conn.get("label") or conn_id
@@ -288,7 +340,9 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
         + " through the secure vault (classic IMAP/SMTP — the vault logs in "
           "server-side; you never see the password). Actions: "
           "list_messages (folder, limit, unseen_only), read_message (uid from "
-          "list_messages), send (to, subject, body, cc, bcc), list_folders."
+          "list_messages), download_attachment (uid + filename or index — "
+          "saves the file to ~/Downloads), send (to, subject, body, cc, "
+          "bcc), list_folders."
     )
     for field in ("description", "skill_description"):
         text = (conn.get(field) or "").strip()
@@ -305,7 +359,7 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
                 "action": {
                     "type": "string",
                     "enum": ["list_messages", "read_message", "send",
-                             "list_folders"],
+                             "list_folders", "download_attachment"],
                 },
                 "folder": {
                     "type": "string",
@@ -321,7 +375,23 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
                 },
                 "uid": {
                     "type": "string",
-                    "description": "Message uid (from list_messages) to read.",
+                    "description": "Message uid (from list_messages) to read "
+                                   "or download an attachment from.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Attachment filename (from read_message) "
+                                   "to download.",
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "0-based attachment index (alternative to "
+                                   "filename).",
+                },
+                "save_dir": {
+                    "type": "string",
+                    "description": "Directory to save the attachment "
+                                   "(default ~/Downloads).",
                 },
                 "to": {
                     "type": "string",

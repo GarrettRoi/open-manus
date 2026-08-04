@@ -302,6 +302,94 @@ def op_read(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
 
+ATTACHMENT_MAX = 15 * 1024 * 1024  # 15 MB raw — beyond this, refuse
+
+
+def op_attachment(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    """Download one attachment from a message and return it base64-encoded.
+
+    Body: {"action": "attachment", "uid": "...", "filename": "report.pdf"}
+    or    {"action": "attachment", "uid": "...", "index": 0}
+    The agent-side tool decodes and saves the file locally.
+    """
+    import base64
+
+    uid = str(body.get("uid") or "").strip()
+    if not uid.isdigit():
+        raise EmailOpError("'uid' (from the list action) is required")
+    want_name = str(body.get("filename") or "").strip()
+    want_index = body.get("index")
+    if not want_name and want_index is None:
+        raise EmailOpError("Provide 'filename' (from read) or 'index' (0-based)")
+
+    m = _imap_connect(secrets)
+    try:
+        _select_folder(m, str(body.get("folder") or "INBOX"))
+        typ, msg_data = m.uid("fetch", uid.encode(), "(BODY.PEEK[])")
+        if typ != "OK" or not msg_data or not any(isinstance(p, tuple) for p in msg_data):
+            raise EmailOpError(f"Message uid {uid} not found in that folder")
+        raw = b""
+        for part in msg_data:
+            if isinstance(part, tuple) and len(part) >= 2:
+                raw = part[1]
+                break
+        msg = email.message_from_bytes(raw)
+
+        atts = []
+        for part in (msg.walk() if msg.is_multipart() else []):
+            fname = part.get_filename()
+            if fname:
+                atts.append((_dec(fname), part))
+        if not atts:
+            raise EmailOpError(f"Message uid {uid} has no attachments")
+
+        chosen = None
+        if want_name:
+            for fname, part in atts:
+                if fname == want_name:
+                    chosen = (fname, part)
+                    break
+            if chosen is None:  # forgiving case-insensitive fallback
+                for fname, part in atts:
+                    if fname.lower() == want_name.lower():
+                        chosen = (fname, part)
+                        break
+            if chosen is None:
+                raise EmailOpError(
+                    f"No attachment named {want_name!r}. Available: "
+                    + ", ".join(f for f, _ in atts))
+        else:
+            try:
+                idx = int(want_index)
+            except (TypeError, ValueError):
+                raise EmailOpError("'index' must be a number (0-based)")
+            if idx < 0 or idx >= len(atts):
+                raise EmailOpError(
+                    f"index {idx} out of range — message has {len(atts)} attachment(s)")
+            chosen = atts[idx]
+
+        fname, part = chosen
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            raise EmailOpError(f"Could not decode attachment {fname!r}")
+        if len(payload) > ATTACHMENT_MAX:
+            raise EmailOpError(
+                f"Attachment {fname!r} is {len(payload) // (1024 * 1024)} MB — "
+                f"larger than the {ATTACHMENT_MAX // (1024 * 1024)} MB limit")
+        return {"attachment": {
+            "uid": uid,
+            "filename": fname,
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+            "content_b64": base64.b64encode(payload).decode("ascii"),
+        }}
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
 def _addr_list(value: Any) -> List[str]:
     if isinstance(value, list):
         items = [str(v) for v in value]
@@ -381,6 +469,7 @@ ACTIONS = {
     "list": op_list,
     "read": op_read,
     "send": op_send,
+    "attachment": op_attachment,
 }
 
 

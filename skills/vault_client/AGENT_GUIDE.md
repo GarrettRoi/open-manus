@@ -84,12 +84,16 @@ Some connections are classic mailboxes, not HTTP APIs. They show up as
 native tools too (e.g. `vault_gmail_personal`) with an `action` parameter:
 
 - `action="list_messages"` (folder, limit, unseen_only) — newest first
-- `action="read_message"` (uid from list_messages)
+- `action="read_message"` (uid from list_messages; result lists attachment filenames)
+- `action="download_attachment"` (uid + filename or index, optional save_dir)
+  — the vault fetches the attachment and the tool saves it locally
+  (default `~/Downloads`) and returns the path so you can read/process it
 - `action="send"` (to, subject, body, cc, bcc)
 - `action="list_folders"`
 
 Via the skill instead: `vault.email(CONNECTION, action, **kwargs)` maps to
-`POST /api/vault/email/{CONNECTION}` with `{"action": "folders|list|read|send", ...}`.
+`POST /api/vault/email/{CONNECTION}` with `{"action": "folders|list|read|send|attachment", ...}`.
+(`attachment` returns `content_b64` — decode and write it to a file yourself.)
 The vault logs into the mail servers itself — you never see the password.
 Do NOT use `vault.request(...)`/the HTTP proxy on an email connection; it
 will refuse and point you here.

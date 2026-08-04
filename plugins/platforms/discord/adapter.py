@@ -4739,6 +4739,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._run_simple_slash(interaction, "/voice-character list")
 
         @tree.command(
+            name="devrequests",
+            description="Review agents' dev modification requests (approve or deny)",
+        )
+        async def slash_devrequests(interaction: discord.Interaction):
+            if not await self._check_slash_authorization(interaction, "/devrequests"):
+                return
+            try:
+                try:
+                    from dev_requests_ui import handle_devrequests_slash
+                except ImportError:
+                    from .dev_requests_ui import handle_devrequests_slash
+                await handle_devrequests_slash(interaction)
+            except Exception as e:
+                logger.exception("/devrequests failed")
+                try:
+                    await interaction.response.send_message(
+                        f"Dev request review failed: {e}", ephemeral=True)
+                except Exception:
+                    try:
+                        await interaction.followup.send(
+                            f"Dev request review failed: {e}", ephemeral=True)
+                    except Exception:
+                        pass
+
+        @tree.command(
             name="voicehome",
             description="Set this agent's home voice channel (she auto-joins when you're there)",
         )

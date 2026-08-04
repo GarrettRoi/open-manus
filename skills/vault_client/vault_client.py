@@ -129,6 +129,9 @@ class VaultClient:
             "folders"                       -> {"folders": [...]}
             "list"  (folder="INBOX", limit=10, unseen_only=False)
             "read"  (uid=..., folder="INBOX")
+            "attachment" (uid=..., filename=... or index=0)
+                -> {"attachment": {filename, content_type, size, content_b64}}
+                (decode content_b64 and write it to a file yourself)
             "send"  (to=..., subject=..., body=..., cc=..., bcc=...)
 
         Example:

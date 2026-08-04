@@ -1024,7 +1024,7 @@ async def list_connections(request: Request):
         if view.get("auth_kind") == "email":
             view["how_to_call"] = (
                 f"POST {{vault}}/api/vault/email/{cid} with JSON "
-                '{"action": "folders|list|read|send", ...} — e.g. '
+                '{"action": "folders|list|read|send|attachment", ...} — e.g. '
                 '{"action": "list", "limit": 10, "unseen_only": true}, '
                 '{"action": "read", "uid": "..."}, or '
                 '{"action": "send", "to": "a@b.com", "subject": "...", "body": "..."}'
@@ -1398,6 +1398,7 @@ async def email_request(conn_id: str, request: Request):
 
     detail = {"list": f"folder={body.get('folder') or 'INBOX'}",
               "read": f"uid={body.get('uid')}",
+              "attachment": f"uid={body.get('uid')} file={body.get('filename') or body.get('index')}",
               "send": f"to={result.get('to')}"}.get(action, "")
     audit_log(agent_name, cid, f"email_{action}", detail)
     # Belt-and-braces scrub (the password should never appear in results).
