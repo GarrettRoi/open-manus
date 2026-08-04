@@ -83,6 +83,15 @@ the vault dashboard, because they require a browser login.
 Some connections are classic mailboxes, not HTTP APIs. They show up as
 native tools too (e.g. `vault_gmail_personal`) with an `action` parameter:
 
+- `action="search_messages"` — smart search; combine ANY of: `from`, `to`,
+  `cc`, `subject`, `text` (keywords), `since`/`before` (YYYY-MM-DD),
+  `last_days` (e.g. 20), `unseen` (true/false), `flagged`,
+  `min_size_kb`/`max_size_kb`, `has_attachment`, `attachment_name`
+  (substring or `*.pdf` wildcard), `folder`, `limit`. Results are newest
+  first with attachment names included, plus `total_matches` and `more`.
+  On Gmail mailboxes this uses Gmail's native search automatically.
+  Examples: `{action: "search_messages", from: "john", last_days: 20}`,
+  `{action: "search_messages", attachment_name: "contract", since: "2026-07-01"}`
 - `action="list_messages"` (folder, limit, unseen_only) — newest first
 - `action="read_message"` (uid from list_messages; result lists attachment filenames)
 - `action="download_attachment"` (uid + filename or index, optional save_dir)
@@ -92,7 +101,8 @@ native tools too (e.g. `vault_gmail_personal`) with an `action` parameter:
 - `action="list_folders"`
 
 Via the skill instead: `vault.email(CONNECTION, action, **kwargs)` maps to
-`POST /api/vault/email/{CONNECTION}` with `{"action": "folders|list|read|send|attachment", ...}`.
+`POST /api/vault/email/{CONNECTION}` with `{"action": "folders|list|search|read|send|attachment", ...}`.
+(In Python, pass the sender filter as `from_=...` — it's sent as `"from"`.)
 (`attachment` returns `content_b64` — decode and write it to a file yourself.)
 The vault logs into the mail servers itself — you never see the password.
 Do NOT use `vault.request(...)`/the HTTP proxy on an email connection; it

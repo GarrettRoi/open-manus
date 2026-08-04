@@ -9,6 +9,10 @@ Actions:
     folders                      -> {"folders": [...]}
     list   (folder, limit,       -> {"messages": [{uid, from, to, subject,
             unseen_only)              date, seen}, ...]}
+    search (from, to, cc,        -> {"total_matches", "more", "messages":
+            subject, text,            [{..., attachments: [names]}]}
+            since, before, last_days, unseen, flagged, min/max_size_kb,
+            has_attachment, attachment_name, folder, limit)
     read   (uid, folder,         -> {"message": {uid, from, to, cc, subject,
             mark_seen)                date, body, truncated}}
     send   (to, subject, body,   -> {"sent": true, "to": [...]}
@@ -226,6 +230,265 @@ def op_list(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
         return {"folder": str(body.get("folder") or "INBOX"),
                 "unseen_only": unseen_only, "count": len(messages),
                 "messages": messages}
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+SEARCH_SCAN_MAX = 150  # most candidates we'll inspect for attachment filters
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _imap_date(value: str, label: str):
+    """Parse YYYY-MM-DD (or DD-Mon-YYYY) into an IMAP date string."""
+    from datetime import datetime as _dt
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            d = _dt.strptime(s, fmt)
+            return f"{d.day:02d}-{_MONTHS[d.month - 1]}-{d.year}"
+        except ValueError:
+            continue
+    raise EmailOpError(f"Invalid {label} date {s!r} — use YYYY-MM-DD")
+
+
+def _quote_atom(value: str) -> str:
+    """Quote a search string for IMAP; reject CR/LF injection."""
+    s = str(value)
+    if "\r" in s or "\n" in s:
+        raise EmailOpError("Search text cannot contain line breaks")
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _build_imap_criteria(f: Dict[str, Any]) -> str:
+    """Translate structured filters into standard IMAP SEARCH criteria (AND)."""
+    crit: List[str] = []
+    for key, kw in (("from", "FROM"), ("to", "TO"), ("cc", "CC"),
+                    ("subject", "SUBJECT"), ("text", "TEXT")):
+        if f.get(key):
+            crit.append(f"{kw} {_quote_atom(f[key])}")
+    if f.get("since"):
+        crit.append(f"SINCE {_imap_date(f['since'], 'since')}")
+    if f.get("before"):
+        crit.append(f"BEFORE {_imap_date(f['before'], 'before')}")
+    if f.get("unseen") is True:
+        crit.append("UNSEEN")
+    elif f.get("unseen") is False:
+        crit.append("SEEN")
+    if f.get("flagged"):
+        crit.append("FLAGGED")
+    if f.get("min_size_kb"):
+        crit.append(f"LARGER {int(float(f['min_size_kb']) * 1024)}")
+    if f.get("max_size_kb"):
+        crit.append(f"SMALLER {int(float(f['max_size_kb']) * 1024)}")
+    return f"({' '.join(crit)})" if crit else "ALL"
+
+
+def _build_gmail_query(f: Dict[str, Any]) -> str:
+    """Translate the same filters into Gmail X-GM-RAW search syntax."""
+    def q(v: str) -> str:
+        v = str(v).strip()
+        return f'"{v}"' if (" " in v and '"' not in v) else v
+    parts: List[str] = []
+    if f.get("from"):
+        parts.append(f"from:{q(f['from'])}")
+    if f.get("to"):
+        parts.append(f"to:{q(f['to'])}")
+    if f.get("cc"):
+        parts.append(f"cc:{q(f['cc'])}")
+    if f.get("subject"):
+        parts.append(f"subject:{q(f['subject'])}")
+    if f.get("text"):
+        parts.append(q(f["text"]))
+    if f.get("since"):
+        parts.append("after:" + str(f["since"]).replace("-", "/"))
+    if f.get("before"):
+        parts.append("before:" + str(f["before"]).replace("-", "/"))
+    if f.get("unseen") is True:
+        parts.append("is:unread")
+    elif f.get("unseen") is False:
+        parts.append("is:read")
+    if f.get("flagged"):
+        parts.append("is:starred")
+    if f.get("min_size_kb"):
+        parts.append(f"larger:{int(float(f['min_size_kb']))}k")
+    if f.get("max_size_kb"):
+        parts.append(f"smaller:{int(float(f['max_size_kb']))}k")
+    if f.get("has_attachment"):
+        parts.append("has:attachment")
+    if f.get("attachment_name"):
+        parts.append(f"filename:{q(f['attachment_name'])}")
+    return " ".join(parts) or "in:anywhere"
+
+
+# BODYSTRUCTURE attachment filenames: ("attachment" ("filename" "x")) or
+# ("name" "x") parameters on parts.
+_BS_NAME_RE = re.compile(
+    rb'"(?:file)?name"\s+"((?:[^"\\]|\\.)*)"', re.I)
+
+
+def _bodystructure_attachments(bs_blob: bytes) -> List[str]:
+    names = []
+    for m in _BS_NAME_RE.finditer(bs_blob or b""):
+        raw = m.group(1).decode(errors="replace").replace('\\"', '"')
+        name = _dec(raw)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _attachment_name_matches(names: List[str], pattern: str) -> bool:
+    """Case-insensitive substring or * wildcard match on attachment names."""
+    import fnmatch
+    pat = pattern.lower()
+    for n in names:
+        nl = n.lower()
+        if "*" in pat or "?" in pat:
+            if fnmatch.fnmatch(nl, pat):
+                return True
+        elif pat in nl:
+            return True
+    return False
+
+
+def op_search(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    """Structured mailbox search.
+
+    Filters (all optional, combined with AND): from, to, cc, subject,
+    text (keywords in headers+body), since / before (YYYY-MM-DD),
+    last_days (relative shortcut), unseen (true=unread only, false=read
+    only), flagged, min_size_kb / max_size_kb, has_attachment,
+    attachment_name (substring or * wildcard), folder, limit.
+    """
+    from datetime import datetime as _dt, timedelta
+
+    limit = max(1, min(int(body.get("limit") or 10), LIST_MAX))
+    f: Dict[str, Any] = {}
+    for key in ("from", "to", "cc", "subject", "text", "since", "before",
+                "attachment_name"):
+        val = body.get(key)
+        if val not in (None, ""):
+            f[key] = str(val).strip()
+    if body.get("query") and not f.get("text"):
+        f["text"] = str(body["query"]).strip()
+    if body.get("last_days"):
+        try:
+            days = max(1, int(body["last_days"]))
+        except (TypeError, ValueError):
+            raise EmailOpError("'last_days' must be a whole number of days")
+        f["since"] = (_dt.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    if "unseen" in body and body.get("unseen") is not None:
+        f["unseen"] = bool(body["unseen"])
+    elif body.get("unseen_only"):
+        f["unseen"] = True
+    if body.get("flagged"):
+        f["flagged"] = True
+    for key in ("min_size_kb", "max_size_kb"):
+        if body.get(key) not in (None, ""):
+            try:
+                f[key] = float(body[key])
+            except (TypeError, ValueError):
+                raise EmailOpError(f"'{key}' must be a number (kilobytes)")
+    if body.get("has_attachment") is not None and "has_attachment" in body:
+        f["has_attachment"] = bool(body["has_attachment"])
+    if f.get("attachment_name"):
+        f["has_attachment"] = True
+
+    m = _imap_connect(secrets)
+    try:
+        _select_folder(m, str(body.get("folder") or "INBOX"))
+        gmail = "X-GM-EXT-1" in (m.capabilities or ())
+        used_gmail = False
+        if gmail:
+            try:
+                typ, data = m.uid("search", "X-GM-RAW",
+                                  _quote_atom(_build_gmail_query(f)))
+                if typ == "OK":
+                    used_gmail = True
+                else:
+                    raise imaplib.IMAP4.error("X-GM-RAW rejected")
+            except imaplib.IMAP4.error:
+                typ, data = m.uid("search", None, _build_imap_criteria(f))
+        else:
+            typ, data = m.uid("search", None, _build_imap_criteria(f))
+        if typ != "OK":
+            raise EmailOpError("Search failed on the mail server")
+
+        uids = (data[0] or b"").split()
+        total_matches = len(uids)
+        uids = uids[::-1]  # newest first
+
+        # Gmail already applied attachment filters natively.
+        need_att_filter = (not used_gmail) and (
+            f.get("has_attachment") is not None or f.get("attachment_name"))
+        want_has = f.get("has_attachment")
+
+        messages = []
+        scanned = 0
+        exhausted_scan = False
+        for uid in uids:
+            if len(messages) >= limit:
+                break
+            if need_att_filter and scanned >= SEARCH_SCAN_MAX:
+                exhausted_scan = True
+                break
+            scanned += 1
+            typ, msg_data = m.uid(
+                "fetch", uid,
+                "(FLAGS BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])",
+            )
+            if typ != "OK" or not msg_data:
+                continue
+            flags_and_bs = b" ".join(p for p in msg_data if isinstance(p, bytes))
+            header_blob = b""
+            for part in msg_data:
+                if isinstance(part, tuple) and len(part) >= 2:
+                    if isinstance(part[0], bytes):
+                        flags_and_bs += b" " + part[0]
+                    header_blob = part[1]
+                    break
+            att_names = _bodystructure_attachments(flags_and_bs)
+            if need_att_filter:
+                if want_has is True and not att_names:
+                    continue
+                if want_has is False and att_names:
+                    continue
+                if f.get("attachment_name") and not _attachment_name_matches(
+                        att_names, f["attachment_name"]):
+                    continue
+            msg = email.message_from_bytes(header_blob or b"")
+            messages.append({
+                "uid": uid.decode(),
+                "from": _dec(msg.get("From")),
+                "to": _dec(msg.get("To")),
+                "subject": _dec(msg.get("Subject")),
+                "date": _dec(msg.get("Date")),
+                "seen": b"\\Seen" in flags_and_bs,
+                "attachments": att_names,
+            })
+
+        more = (total_matches > scanned if need_att_filter
+                else total_matches > len(messages))
+        result = {
+            "folder": str(body.get("folder") or "INBOX"),
+            "total_matches": total_matches,
+            "count": len(messages),
+            "more": bool(more),
+            "messages": messages,
+            "search_engine": "gmail" if used_gmail else "imap",
+        }
+        if exhausted_scan:
+            result["note"] = (
+                f"Attachment filtering inspected the newest {SEARCH_SCAN_MAX} "
+                "matches only — narrow the search (dates, sender) to see older mail.")
+        return result
     finally:
         try:
             m.logout()
@@ -482,6 +745,7 @@ def op_send(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
 ACTIONS = {
     "folders": op_folders,
     "list": op_list,
+    "search": op_search,
     "read": op_read,
     "send": op_send,
     "attachment": op_attachment,

@@ -245,6 +245,8 @@ def _email_call(conn_id: str, args: dict) -> str:
     action_map = {
         "list_folders": "folders",
         "list_messages": "list",
+        "search_messages": "search",
+        "search": "search",
         "read_message": "read",
         "send": "send",
         "download_attachment": "attachment",
@@ -253,10 +255,16 @@ def _email_call(conn_id: str, args: dict) -> str:
     payload: Dict[str, Any] = {"action": action_map.get(action, action)}
     for key in ("folder", "limit", "unseen_only", "uid", "to", "cc", "bcc",
                 "subject", "body", "reply_to", "in_reply_to", "filename",
-                "index"):
+                "index", "from", "text", "query", "since", "before",
+                "last_days", "unseen", "flagged", "has_attachment",
+                "attachment_name", "min_size_kb", "max_size_kb"):
         val = args.get(key)
         if val not in (None, "", []):
             payload[key] = val
+    # booleans that are meaningful as False too (e.g. has_attachment: false)
+    for key in ("unseen", "has_attachment"):
+        if args.get(key) is False:
+            payload[key] = False
     try:
         resp = _vault_http("POST", f"/api/vault/email/{conn_id}", payload,
                            timeout=120)
@@ -346,10 +354,14 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
         + (f" ({address})" if address else "")
         + " through the secure vault (classic IMAP/SMTP — the vault logs in "
           "server-side; you never see the password). Actions: "
-          "list_messages (folder, limit, unseen_only), read_message (uid from "
-          "list_messages), download_attachment (uid + filename or index — "
-          "saves the file to ~/Downloads), send (to, subject, body, cc, "
-          "bcc), list_folders."
+          "search_messages — powerful search combining any of: from, to, cc, "
+          "subject, text keywords, since/before dates or last_days, unseen, "
+          "flagged, size, has_attachment, attachment_name (substring or * "
+          "wildcard). Use minimal criteria, e.g. {from: 'john', last_days: "
+          "20} or {attachment_name: 'contract', has_attachment: true}. "
+          "Also: list_messages (newest first), read_message (uid), "
+          "download_attachment (uid + filename or index — saves the file to "
+          "~/Downloads), send (to, subject, body, cc, bcc), list_folders."
     )
     for field in ("description", "skill_description"):
         text = (conn.get(field) or "").strip()
@@ -365,8 +377,68 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list_messages", "read_message", "send",
-                             "list_folders", "download_attachment"],
+                    "enum": ["search_messages", "list_messages",
+                             "read_message", "send", "list_folders",
+                             "download_attachment"],
+                },
+                "from": {
+                    "type": "string",
+                    "description": "Sender name or address contains this (search).",
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Recipient filter (search) OR recipient "
+                                   "address(es), comma-separated (send).",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Keywords to find in the message headers "
+                                   "and body (search).",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Only messages on/after this date, "
+                                   "YYYY-MM-DD (search).",
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only messages before this date, "
+                                   "YYYY-MM-DD (search).",
+                },
+                "last_days": {
+                    "type": "integer",
+                    "description": "Shortcut: only messages from the last N "
+                                   "days (search).",
+                },
+                "unseen": {
+                    "type": "boolean",
+                    "description": "true = unread only, false = read only "
+                                   "(search).",
+                },
+                "flagged": {
+                    "type": "boolean",
+                    "description": "Only flagged/starred messages (search).",
+                },
+                "has_attachment": {
+                    "type": "boolean",
+                    "description": "true = only messages with attachments, "
+                                   "false = only without (search).",
+                },
+                "attachment_name": {
+                    "type": "string",
+                    "description": "Attachment filename filter — substring "
+                                   "or * wildcard, e.g. 'contract' or "
+                                   "'*.pdf' (search).",
+                },
+                "min_size_kb": {
+                    "type": "number",
+                    "description": "Only messages larger than this many KB "
+                                   "(search).",
+                },
+                "max_size_kb": {
+                    "type": "number",
+                    "description": "Only messages smaller than this many KB "
+                                   "(search).",
                 },
                 "folder": {
                     "type": "string",
@@ -400,13 +472,11 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
                     "description": "Directory to save the attachment "
                                    "(default ~/Downloads).",
                 },
-                "to": {
-                    "type": "string",
-                    "description": "Recipient(s), comma-separated (send).",
-                },
-                "cc": {"type": "string", "description": "CC recipients (send)."},
+                "cc": {"type": "string",
+                       "description": "CC filter (search) or CC recipients (send)."},
                 "bcc": {"type": "string", "description": "BCC recipients (send)."},
-                "subject": {"type": "string", "description": "Subject (send)."},
+                "subject": {"type": "string",
+                            "description": "Subject filter (search) or subject line (send)."},
                 "body": {"type": "string", "description": "Plain-text body (send)."},
                 "reply_to": {
                     "type": "string",

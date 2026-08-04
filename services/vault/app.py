@@ -1024,8 +1024,10 @@ async def list_connections(request: Request):
         if view.get("auth_kind") == "email":
             view["how_to_call"] = (
                 f"POST {{vault}}/api/vault/email/{cid} with JSON "
-                '{"action": "folders|list|read|send|attachment", ...} — e.g. '
+                '{"action": "folders|list|search|read|send|attachment", ...} — e.g. '
                 '{"action": "list", "limit": 10, "unseen_only": true}, '
+                '{"action": "search", "from": "john", "last_days": 20, '
+                '"has_attachment": true}, '
                 '{"action": "read", "uid": "..."}, or '
                 '{"action": "send", "to": "a@b.com", "subject": "...", "body": "..."}'
             )
@@ -1397,6 +1399,12 @@ async def email_request(conn_id: str, request: Request):
         raise HTTPException(status_code=502, detail=f"Email operation failed: {exc}")
 
     detail = {"list": f"folder={body.get('folder') or 'INBOX'}",
+              "search": ("filters=" + ",".join(sorted(
+                  k for k in ("from", "to", "cc", "subject", "text", "query",
+                              "since", "before", "last_days", "unseen",
+                              "unseen_only", "flagged", "has_attachment",
+                              "attachment_name", "min_size_kb", "max_size_kb")
+                  if body.get(k) not in (None, "", False)))),
               "read": f"uid={body.get('uid')}",
               "attachment": f"uid={body.get('uid')} file={body.get('filename') or body.get('index')}",
               "send": f"to={result.get('to')}"}.get(action, "")

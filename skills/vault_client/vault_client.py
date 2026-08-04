@@ -128,6 +128,14 @@ class VaultClient:
         password):
             "folders"                       -> {"folders": [...]}
             "list"  (folder="INBOX", limit=10, unseen_only=False)
+            "search" (any of: from_, to, cc, subject, text, since/before
+                YYYY-MM-DD, last_days=N, unseen=True/False, flagged,
+                min_size_kb, max_size_kb, has_attachment,
+                attachment_name="contract" or "*.pdf", folder, limit)
+                -> {"total_matches", "messages": [{uid, from, to, subject,
+                    date, seen, attachments}], "more": bool}
+                NOTE: pass sender filter as from_=... (Python keyword);
+                it is sent as "from".
             "read"  (uid=..., folder="INBOX")
             "attachment" (uid=..., filename=... or index=0)
                 -> {"attachment": {filename, content_type, size, content_b64}}
@@ -140,6 +148,8 @@ class VaultClient:
                         subject="Hi", body="...")
         """
         payload: Dict[str, Any] = {"action": action}
+        if "from_" in kwargs:  # 'from' is a Python keyword
+            kwargs["from"] = kwargs.pop("from_")
         payload.update({k: v for k, v in kwargs.items() if v is not None})
         return self._http(
             "POST", f"/api/vault/email/{connection.strip().upper()}",
