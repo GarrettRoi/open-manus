@@ -114,6 +114,39 @@
             <input type="password" name="api_key" placeholder="paste the key — agents will never see it">
         </div>
 
+        <div id="grp_email" style="display:none;">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Email address</label>
+                    <input type="text" name="username" placeholder="you@example.com">
+                </div>
+                <div class="form-group">
+                    <label>Password (or app password)</label>
+                    <input type="password" name="password" placeholder="agents will never see it">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>IMAP server (incoming)</label>
+                    <input type="text" name="imap_host" placeholder="imap.gmail.com">
+                </div>
+                <div class="form-group">
+                    <label>IMAP port</label>
+                    <input type="text" name="imap_port" placeholder="993" value="993">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>SMTP server (outgoing)</label>
+                    <input type="text" name="smtp_host" placeholder="smtp.gmail.com">
+                </div>
+                <div class="form-group">
+                    <label>SMTP port</label>
+                    <input type="text" name="smtp_port" placeholder="587" value="587">
+                </div>
+            </div>
+        </div>
+
         <div id="grp_custom_oauth" style="display:none;">
             <div class="form-row">
                 <div class="form-group">
@@ -217,6 +250,32 @@
                 <label>New API key (leave blank to keep current)</label>
                 <input type="password" name="api_key">
             </div>
+            <div id="e_grp_email" style="display:none;">
+                <div class="form-group">
+                    <label>New password / app password (leave blank to keep)</label>
+                    <input type="password" name="password">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>IMAP server (leave blank to keep)</label>
+                        <input type="text" name="imap_host" placeholder="imap.gmail.com">
+                    </div>
+                    <div class="form-group">
+                        <label>IMAP port</label>
+                        <input type="text" name="imap_port" placeholder="993">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>SMTP server (leave blank to keep)</label>
+                        <input type="text" name="smtp_host" placeholder="smtp.gmail.com">
+                    </div>
+                    <div class="form-group">
+                        <label>SMTP port</label>
+                        <input type="text" name="smtp_port" placeholder="587">
+                    </div>
+                </div>
+            </div>
             <div id="e_grp_custom_oauth" style="display:none;">
                 <div class="form-group">
                     <label>Authorization URL</label>
@@ -269,8 +328,10 @@ function onServiceChange() {
     document.getElementById('svc_help').textContent = tpl.setup_help || '';
 
     const isOAuth = tpl.auth.kind === 'oauth2';
+    const isEmail = tpl.auth.kind === 'email';
     document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
-    document.getElementById('grp_api_key').style.display = isOAuth ? 'none' : '';
+    document.getElementById('grp_api_key').style.display = (isOAuth || isEmail) ? 'none' : '';
+    document.getElementById('grp_email').style.display = isEmail ? '' : 'none';
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
 
@@ -279,7 +340,7 @@ function onServiceChange() {
     document.getElementById('grp_custom_oauth').style.display = isCustomOAuth ? '' : 'none';
 
     // base URL field: needed when template has no default
-    const needsBase = !tpl.base_url && (!isOAuth || isCustomOAuth);
+    const needsBase = !tpl.base_url && !isEmail && (!isOAuth || isCustomOAuth);
     document.getElementById('grp_base_url').style.display = needsBase ? '' : 'none';
     const fields = tpl.fields || [];
     const baseField = fields.find(f => f.name === 'base_url');
@@ -306,7 +367,9 @@ function openEdit(c) {
     document.getElementById('e_description').value = c.description || '';
     document.getElementById('e_skill').value = c.skill_description || '';
     const isOAuth = c.auth_kind === 'oauth2';
-    document.getElementById('e_grp_key').style.display = isOAuth ? 'none' : '';
+    const isEmail = c.auth_kind === 'email';
+    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail) ? 'none' : '';
+    document.getElementById('e_grp_email').style.display = isEmail ? '' : 'none';
     document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
     const co = c.custom_oauth;
     document.getElementById('e_grp_custom_oauth').style.display = co ? '' : 'none';
