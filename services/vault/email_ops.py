@@ -22,6 +22,7 @@ import imaplib
 import re
 import smtplib
 import socket
+import ssl
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
@@ -36,10 +37,12 @@ class EmailOpError(Exception):
     """User-facing email operation failure (bad login, bad folder, ...)."""
 
 
-def _check_host(host: str, label: str) -> None:
-    """Connect-time SSRF re-check (mitigates DNS rebinding after save-time
-    validation in the admin API): the hostname must not be an IP literal and
-    must resolve to global addresses only."""
+def _resolve_pinned_ip(host: str, port: int, label: str) -> str:
+    """Connect-time SSRF guard: resolve *once*, validate every address, and
+    return one validated global IP. Callers MUST connect to the returned IP
+    (not the hostname) so the address that was validated is the address used
+    — closing the DNS-rebinding time-of-check/time-of-use gap. The original
+    hostname is kept only for TLS SNI/certificate verification."""
     import ipaddress
     try:
         ipaddress.ip_address(host)
@@ -47,11 +50,12 @@ def _check_host(host: str, label: str) -> None:
     except ValueError:
         pass
     try:
-        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None,
-                                                       proto=socket.IPPROTO_TCP)}
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
         raise EmailOpError(f"{label} server {host} does not resolve")
-    for addr in addrs:
+    pinned = ""
+    for info in infos:
+        addr = info[4][0]
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
@@ -60,6 +64,55 @@ def _check_host(host: str, label: str) -> None:
             raise EmailOpError(
                 f"{label} server {host} resolves to a private/internal "
                 "address — refusing to connect")
+        if not pinned:
+            pinned = addr
+    if not pinned:
+        raise EmailOpError(f"{label} server {host} has no usable address")
+    return pinned
+
+
+class _PinnedIMAP4_SSL(imaplib.IMAP4_SSL):
+    """IMAP4_SSL that connects to a pre-validated IP while doing TLS
+    SNI/hostname verification against the real hostname."""
+
+    def __init__(self, host: str, port: int, pinned_ip: str, timeout: float):
+        self._pinned_ip = pinned_ip
+        self._tls_hostname = host
+        ctx = ssl.create_default_context()
+        super().__init__(host, port, ssl_context=ctx, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            timeout if timeout is not None else None)
+        return self.ssl_context.wrap_socket(
+            sock, server_hostname=self._tls_hostname)
+
+
+class _PinnedSMTP(smtplib.SMTP):
+    """SMTP that connects to a pre-validated IP; ``self._host`` keeps the real
+    hostname so STARTTLS certificate verification still checks it."""
+
+    def __init__(self, host: str, port: int, pinned_ip: str, timeout: float):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port, timeout=timeout)
+
+    def _get_socket(self, host, port, timeout):
+        return socket.create_connection((self._pinned_ip, port), timeout)
+
+
+class _PinnedSMTP_SSL(smtplib.SMTP_SSL):
+    """SMTP_SSL (implicit TLS, port 465) pinned to a pre-validated IP with
+    SNI/certificate verification against the real hostname."""
+
+    def __init__(self, host: str, port: int, pinned_ip: str, timeout: float):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port, timeout=timeout,
+                         context=ssl.create_default_context())
+
+    def _get_socket(self, host, port, timeout):
+        sock = socket.create_connection((self._pinned_ip, port), timeout)
+        return self.context.wrap_socket(sock, server_hostname=self._host)
 
 
 def _dec(value: Any) -> str:
@@ -77,9 +130,9 @@ def _imap_connect(secrets: Dict[str, Any]) -> imaplib.IMAP4_SSL:
     port = int(secrets.get("imap_port") or 993)
     if not host:
         raise EmailOpError("No IMAP server configured for this connection")
-    _check_host(host, "IMAP")
+    pinned_ip = _resolve_pinned_ip(host, port, "IMAP")
     try:
-        m = imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT)
+        m = _PinnedIMAP4_SSL(host, port, pinned_ip, timeout=TIMEOUT)
     except (OSError, socket.timeout) as e:
         raise EmailOpError(f"Cannot reach IMAP server {host}:{port} ({e})")
     try:
@@ -294,14 +347,15 @@ def op_send(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     port = int(secrets.get("smtp_port") or 587)
     if not host:
         raise EmailOpError("No SMTP server configured for this connection")
-    _check_host(host, "SMTP")
+    pinned_ip = _resolve_pinned_ip(host, port, "SMTP")
     try:
         if port == 465:
-            server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)
+            server: smtplib.SMTP = _PinnedSMTP_SSL(host, port, pinned_ip,
+                                                   timeout=TIMEOUT)
         else:
-            server = smtplib.SMTP(host, port, timeout=TIMEOUT)
+            server = _PinnedSMTP(host, port, pinned_ip, timeout=TIMEOUT)
             server.ehlo()
-            server.starttls()
+            server.starttls(context=ssl.create_default_context())
             server.ehlo()
         try:
             server.login(username, secrets.get("password") or "")
