@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   ExternalLink,
   Link2,
   Plus,
@@ -60,6 +62,7 @@ export default function AccountsPage() {
   const [error, setError] = useState("");
   const [adding, setAdding] = useState<string | null>(null); // service key
   const [busy, setBusy] = useState(false);
+  const [showMore, setShowMore] = useState(false);
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -211,30 +214,46 @@ export default function AccountsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex flex-wrap gap-2">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             {FEATURED.filter((k) => overview.catalog[k]).map((key) => (
-              <Button
+              <ProviderTile
                 key={key}
-                ghost={adding !== key}
+                label={overview.catalog[key].label}
+                active={adding === key}
                 onClick={() => setAdding(adding === key ? null : key)}
-              >
-                <Plus className="mr-1 h-4 w-4" />
-                {overview.catalog[key].label}
-              </Button>
+              />
             ))}
-            {Object.keys(overview.catalog)
-              .filter((k) => !FEATURED.includes(k))
-              .map((key) => (
-                <Button
-                  key={key}
-                  ghost={adding !== key}
-                  onClick={() => setAdding(adding === key ? null : key)}
-                >
-                  <Plus className="mr-1 h-4 w-4" />
-                  {overview.catalog[key].label}
-                </Button>
-              ))}
           </div>
+          {Object.keys(overview.catalog).some((k) => !FEATURED.includes(k)) && (
+            <>
+              <button
+                type="button"
+                className="mt-3 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setShowMore((v) => !v)}
+              >
+                {showMore ? (
+                  <ChevronUp className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                )}
+                {showMore ? "Hide other providers" : "More providers…"}
+              </button>
+              {showMore && (
+                <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {Object.keys(overview.catalog)
+                    .filter((k) => !FEATURED.includes(k))
+                    .map((key) => (
+                      <ProviderTile
+                        key={key}
+                        label={overview.catalog[key].label}
+                        active={adding === key}
+                        onClick={() => setAdding(adding === key ? null : key)}
+                      />
+                    ))}
+                </div>
+              )}
+            </>
+          )}
 
           {adding && overview.catalog[adding] && (
             <AddConnectionForm
@@ -325,6 +344,32 @@ export default function AccountsPage() {
   );
 }
 
+function ProviderTile({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        "flex min-h-[3rem] items-center justify-center gap-1.5 rounded-lg border px-2 py-2 text-sm transition-colors " +
+        (active
+          ? "border-midground bg-midground/15 font-semibold text-midground"
+          : "border-border text-foreground hover:bg-midground/5")
+      }
+    >
+      <Plus className="h-4 w-4 shrink-0" />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
 function ConnectionRow({
   conn,
   granted,
@@ -343,47 +388,49 @@ function ConnectionRow({
   const isOAuth = conn.auth_kind === "oauth2";
   const needsLogin = isOAuth && !conn.connected;
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded border border-border px-3 py-2">
-      <Link2 className="h-4 w-4 shrink-0 text-text-tertiary" />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium">
-            {conn.label || conn.id}
-          </span>
-          <Badge>{conn.service}</Badge>
-          {isOAuth ? (
-            conn.connected ? (
+    <div className="flex flex-col gap-2 rounded-lg border border-border px-3 py-2.5 sm:flex-row sm:items-center">
+      <div className="flex min-w-0 flex-1 items-start gap-2">
+        <Link2 className="mt-0.5 h-4 w-4 shrink-0 text-text-tertiary" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="truncate text-sm font-medium">
+              {conn.label || conn.id}
+            </span>
+            <Badge>{conn.service}</Badge>
+            {isOAuth ? (
+              conn.connected ? (
+                <Badge className="border-emerald-500/40 text-emerald-400">
+                  logged in
+                </Badge>
+              ) : (
+                <Badge className="border-amber-500/40 text-amber-400">
+                  needs login
+                </Badge>
+              )
+            ) : conn.connected ? (
               <Badge className="border-emerald-500/40 text-emerald-400">
-                logged in
+                key set
               </Badge>
             ) : (
               <Badge className="border-amber-500/40 text-amber-400">
-                needs login
+                no key
               </Badge>
-            )
-          ) : conn.connected ? (
-            <Badge className="border-emerald-500/40 text-emerald-400">
-              key set
-            </Badge>
-          ) : (
-            <Badge className="border-amber-500/40 text-amber-400">
-              no key
-            </Badge>
-          )}
-        </div>
-        <div className="truncate text-xs text-muted-foreground">
-          {conn.id}
-          {conn.base_url ? ` · ${conn.base_url}` : ""}
+            )}
+          </div>
+          <div className="truncate text-xs text-muted-foreground">
+            {conn.id}
+            {conn.base_url ? ` · ${conn.base_url}` : ""}
+          </div>
         </div>
       </div>
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-1.5 sm:shrink-0">
         {needsLogin && (
-          <Button size="sm" onClick={onLogin} disabled={busy}>
+          <Button size="sm" onClick={onLogin} disabled={busy} className="flex-1 sm:flex-none">
             <ExternalLink className="mr-1 h-3.5 w-3.5" /> Log in
           </Button>
         )}
-        <Button size="sm" ghost onClick={onToggle} disabled={busy}>
-          {granted ? "Disable for agent" : "Enable for agent"}
+        <Button size="sm" ghost onClick={onToggle} disabled={busy} className="flex-1 sm:flex-none">
+          {granted ? "Disable" : "Enable for agent"}
         </Button>
         <Button
           size="sm"
@@ -391,7 +438,7 @@ function ConnectionRow({
           onClick={onDelete}
           disabled={busy}
           aria-label="Delete connection"
-          className="text-red-400 hover:text-red-300"
+          className="shrink-0 text-red-400 hover:text-red-300"
         >
           <Trash2 className="h-3.5 w-3.5" />
         </Button>
@@ -521,11 +568,11 @@ function AddConnectionForm({
         ))}
       </div>
 
-      <div className="flex justify-end gap-2">
-        <Button ghost onClick={onCancel}>
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+        <Button ghost onClick={onCancel} className="w-full sm:w-auto">
           Cancel
         </Button>
-        <Button onClick={submit} disabled={saving}>
+        <Button onClick={submit} disabled={saving} className="w-full sm:w-auto">
           {saving ? <Spinner /> : isOAuth ? "Save & log in" : "Save"}
         </Button>
       </div>
