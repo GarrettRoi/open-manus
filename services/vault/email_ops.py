@@ -36,6 +36,32 @@ class EmailOpError(Exception):
     """User-facing email operation failure (bad login, bad folder, ...)."""
 
 
+def _check_host(host: str, label: str) -> None:
+    """Connect-time SSRF re-check (mitigates DNS rebinding after save-time
+    validation in the admin API): the hostname must not be an IP literal and
+    must resolve to global addresses only."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        raise EmailOpError(f"{label} server must be a hostname, not an IP address")
+    except ValueError:
+        pass
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None,
+                                                       proto=socket.IPPROTO_TCP)}
+    except socket.gaierror:
+        raise EmailOpError(f"{label} server {host} does not resolve")
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if not ip.is_global:
+            raise EmailOpError(
+                f"{label} server {host} resolves to a private/internal "
+                "address — refusing to connect")
+
+
 def _dec(value: Any) -> str:
     """Decode a possibly RFC2047-encoded header to a plain string."""
     if value is None:
@@ -51,6 +77,7 @@ def _imap_connect(secrets: Dict[str, Any]) -> imaplib.IMAP4_SSL:
     port = int(secrets.get("imap_port") or 993)
     if not host:
         raise EmailOpError("No IMAP server configured for this connection")
+    _check_host(host, "IMAP")
     try:
         m = imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT)
     except (OSError, socket.timeout) as e:
@@ -267,6 +294,7 @@ def op_send(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     port = int(secrets.get("smtp_port") or 587)
     if not host:
         raise EmailOpError("No SMTP server configured for this connection")
+    _check_host(host, "SMTP")
     try:
         if port == 465:
             server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)

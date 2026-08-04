@@ -509,18 +509,52 @@ def _validate_oauth_endpoint_url(label: str, url: str) -> str:
     return ""
 
 
+def _validate_mail_host(label: str, host: str) -> str:
+    """SSRF guard for admin-supplied IMAP/SMTP hostnames. Returns an error
+    message, or '' if the host is safe (public hostname, resolves to global
+    IPs only — no IP literals, loopback, private ranges, or metadata IPs)."""
+    import ipaddress
+    import socket
+    if not host:
+        return f"{label} server is required"
+    if any(c in host for c in "/@:?#[] \t"):
+        return f"{label} server must be a bare hostname (no URL, port, or path)"
+    try:
+        ipaddress.ip_address(host)
+        return f"{label} server must be a hostname, not an IP address"
+    except ValueError:
+        pass
+    if "." not in host or host.endswith(".internal") or host.endswith(".local"):
+        return f"{label} server must be a public hostname"
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
+    except socket.gaierror:
+        return f"{label} server hostname does not resolve"
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if not ip.is_global:
+            return f"{label} server must not point at a private or internal address"
+    return ""
+
+
 def _parse_email_form(form) -> tuple:
     """Validate email (IMAP/SMTP) connection fields. Returns (secrets, error)."""
     username = (form.get("username") or "").strip()
     password = (form.get("password") or form.get("api_key") or "").strip()
-    imap_host = (form.get("imap_host") or "").strip()
-    smtp_host = (form.get("smtp_host") or "").strip()
+    imap_host = (form.get("imap_host") or "").strip().lower()
+    smtp_host = (form.get("smtp_host") or "").strip().lower()
     if not username or "@" not in username:
         return None, "A valid email address is required"
     if not password:
         return None, "The mailbox password (or app password) is required"
     if not imap_host or not smtp_host:
         return None, "IMAP and SMTP server hostnames are required"
+    for label, host in (("IMAP", imap_host), ("SMTP", smtp_host)):
+        if (err := _validate_mail_host(label, host)):
+            return None, err
     try:
         imap_port = int(form.get("imap_port") or 993)
         smtp_port = int(form.get("smtp_port") or 587)
@@ -640,8 +674,18 @@ async def update_service(request: Request):
         for fld in ("username", "password", "imap_host", "imap_port",
                     "smtp_host", "smtp_port"):
             val = (form.get(fld) or "").strip()
-            if val:
-                secrets_d[fld] = val
+            if not val:
+                continue
+            if fld in ("imap_host", "smtp_host"):
+                val = val.lower()
+                if (err := _validate_mail_host(fld.split("_")[0].upper(), val)):
+                    return RedirectResponse(
+                        url=f"/services?error={err.replace(' ', '+')}",
+                        status_code=303)
+            if fld in ("imap_port", "smtp_port") and not val.isdigit():
+                return RedirectResponse(
+                    url="/services?error=Ports+must+be+numbers", status_code=303)
+            secrets_d[fld] = val
     client_id = (form.get("client_id") or "").strip()
     client_secret = (form.get("client_secret") or "").strip()
     if client_id:
