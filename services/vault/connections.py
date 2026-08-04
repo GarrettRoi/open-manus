@@ -375,9 +375,12 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
 
     # Extra static headers (custom API connections) — stored with the secrets
     # because they may embed credentials; injected server-side like the key.
+    # The credential header always wins: an extra header can never override
+    # the auth header (defense in depth on top of save-time validation).
     extra = secrets.get("extra_headers")
     if isinstance(extra, dict):
+        auth_header_names = {h.lower() for h in headers}
         for hname, hval in extra.items():
-            if isinstance(hname, str) and hname:
+            if isinstance(hname, str) and hname and hname.lower() not in auth_header_names:
                 headers[hname] = str(hval)
     return {"headers": headers, "params": params}

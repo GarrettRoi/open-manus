@@ -586,7 +586,10 @@ def _parse_email_form(form) -> tuple:
 
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
-                      "cookie", "upgrade", "te", "trailer"}
+                      "cookie", "upgrade", "te", "trailer",
+                      # the vault injects auth itself — extras may never carry
+                      # or override the credential header
+                      "authorization", "proxy-authorization"}
 
 
 def _parse_extra_headers(form) -> tuple:
