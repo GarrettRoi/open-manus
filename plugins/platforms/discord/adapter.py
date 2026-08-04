@@ -3017,7 +3017,9 @@ class DiscordAdapter(BasePlatformAdapter):
         dvc = self._designated_voice_channel_id
         return dvc is not None and channel is not None and channel.id == dvc
 
-    def _voice_session_is_busy(self, guild_id: int) -> bool:
+    def _voice_session_is_busy(
+        self, guild_id: int, assume_busy_without_mapping: bool = False,
+    ) -> bool:
         """True while the voice session still has work in flight: audio
         playing, TTS speech in the mixer, or (via the runner hook) a running
         agent turn / active background tool processes for the linked session."""
@@ -3034,12 +3036,18 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         checker = getattr(self, "_voice_busy_checker", None)
         text_ch_id = self._voice_text_channels.get(guild_id)
-        if checker and text_ch_id:
-            try:
-                if checker(str(text_ch_id)):
-                    return True
-            except Exception:
-                pass
+        if checker:
+            if text_ch_id:
+                try:
+                    if checker(str(text_ch_id)):
+                        return True
+                except Exception:
+                    pass
+            elif assume_busy_without_mapping:
+                # The runner hasn't linked a text channel yet (e.g. the join
+                # just happened) — session work would be invisible to us, so
+                # err on the side of staying.
+                return True
         return False
 
     def _cancel_deferred_voice_leave(self, guild_id: int) -> None:
@@ -3074,9 +3082,20 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _deferred_voice_leave(self, guild_id: int, reason: str) -> None:
         try:
             poll = self.VOICE_LINGER_POLL
+            started = asyncio.get_running_loop().time()
+
+            def _busy() -> bool:
+                # During the first minute, a missing text-channel mapping
+                # (runner hasn't linked the session yet — join race) counts
+                # as busy so in-flight work can't be invisibly skipped.
+                grace_window = (asyncio.get_running_loop().time() - started) < 60
+                return self._voice_session_is_busy(
+                    guild_id, assume_busy_without_mapping=grace_window
+                )
+
             while True:
                 # Phase 1: wait for all in-flight work to finish.
-                while self._voice_session_is_busy(guild_id):
+                while _busy():
                     await asyncio.sleep(poll)
                     if self._deferred_leave_should_abort(guild_id):
                         return
@@ -3088,7 +3107,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     remaining -= poll
                     if self._deferred_leave_should_abort(guild_id):
                         return
-                    if self._voice_session_is_busy(guild_id):
+                    if _busy():
                         busy_again = True
                         break
                 if not busy_again:

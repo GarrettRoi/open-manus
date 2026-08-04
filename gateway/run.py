@@ -12689,13 +12689,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cid = str(chat_id or "").strip()
         if not cid:
             return False
+
+        def _matches(session_key: str) -> bool:
+            # Exact segment match — session keys are colon-delimited and embed
+            # the raw chat_id as its own segment. A plain substring check
+            # would false-positive when one Discord ID is a substring of
+            # another (channel vs user/thread IDs).
+            return cid in session_key.split(":")
+
         try:
             for session_key in list(self._running_agents.keys()):
-                if cid in session_key:
+                if _matches(session_key):
                     return True
             from tools.process_registry import process_registry
             for session_key in process_registry.active_session_keys():
-                if cid in session_key:
+                if _matches(session_key):
                     return True
         except Exception as e:
             logger.debug("voice busy check failed for chat %s: %s", chat_id, e)
