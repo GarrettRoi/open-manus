@@ -312,13 +312,20 @@ def _save_email_attachment(resp: Dict[str, Any], args: dict) -> str:
         save_dir = os.path.expanduser("~/Downloads")
     os.makedirs(save_dir, exist_ok=True)
 
-    path = os.path.join(save_dir, name)
-    if os.path.exists(path):  # don't clobber earlier downloads
-        stem, ext = os.path.splitext(name)
-        path = os.path.join(save_dir, f"{stem}_{int(time.time())}{ext}")
-
     data = base64.b64decode(b64)
-    with open(path, "wb") as fh:
+    # Exclusive-create with a retrying suffix: never clobber an earlier
+    # download, even for same-second or concurrent saves.
+    stem, ext = os.path.splitext(name)
+    path = os.path.join(save_dir, name)
+    for attempt in range(1, 1000):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            break
+        except FileExistsError:
+            path = os.path.join(save_dir, f"{stem}_{attempt}{ext}")
+    else:
+        return json.dumps({"error": "Could not find a free filename to save the attachment."})
+    with os.fdopen(fd, "wb") as fh:
         fh.write(data)
     return json.dumps({
         "saved": True,

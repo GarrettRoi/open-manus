@@ -14,6 +14,7 @@ silently delete it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
@@ -53,8 +54,10 @@ class DevRequestApprovalView(discord.ui.View):
         if not await self._guard(interaction):
             return
         try:
-            item = _store().set_status(
-                self.req_id, status, decided_by=str(interaction.user))
+            # Redis is synchronous — keep it off the Discord event loop.
+            item = await asyncio.to_thread(
+                _store().set_status, self.req_id, status,
+                str(interaction.user))
         except Exception as e:
             logger.exception("dev request decision failed")
             await interaction.response.send_message(
@@ -63,6 +66,15 @@ class DevRequestApprovalView(discord.ui.View):
         if item is None:
             await interaction.response.send_message(
                 f"Request #{self.req_id} no longer exists.", ephemeral=True)
+            return
+        if item.get("conflict"):
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(
+                content=f"Request #{self.req_id} was already decided "
+                        f"({item.get('status')}).",
+                view=self)
             return
         self.resolved = True
         for child in self.children:
@@ -95,7 +107,7 @@ def _format_request(item: dict) -> str:
 async def handle_devrequests_slash(interaction) -> None:
     """List pending dev requests, each with its own Approve/Deny buttons."""
     try:
-        pending = _store().list_requests(status="pending")
+        pending = await asyncio.to_thread(_store().list_requests, "pending")
     except Exception as e:
         await interaction.response.send_message(
             f"Could not reach the request store: {e}", ephemeral=True)

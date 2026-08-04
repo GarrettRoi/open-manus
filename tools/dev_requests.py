@@ -32,6 +32,8 @@ TOOLSET = "vault"  # ships alongside the vault tools every agent already has
 TITLE_MAX = 200
 DESCRIPTION_MAX = 8000
 LIST_MAX = 20
+PENDING_MAX = 200            # bound the pending queue — agents can't flood Redis
+ITEM_TTL = 90 * 24 * 3600    # requests expire from Redis after 90 days
 
 
 def _redis():
@@ -52,6 +54,10 @@ def _agent_name() -> str:
 def submit_request(title: str, description: str, project: str = "",
                    agent: str = "") -> Dict[str, Any]:
     r = _redis()
+    if r.llen("devreq:pending") >= PENDING_MAX:
+        raise RuntimeError(
+            f"The pending request queue is full ({PENDING_MAX}). "
+            "Ask the owner to review /devrequests before submitting more.")
     req_id = str(r.incr("devreq:seq"))
     item = {
         "id": req_id,
@@ -62,7 +68,8 @@ def submit_request(title: str, description: str, project: str = "",
         "status": "pending",
         "created_at": int(time.time()),
     }
-    r.set(f"devreq:item:{req_id}", json.dumps(item, ensure_ascii=False))
+    r.set(f"devreq:item:{req_id}", json.dumps(item, ensure_ascii=False),
+          ex=ITEM_TTL)
     r.rpush("devreq:pending", req_id)
     return item
 
@@ -92,20 +99,31 @@ def list_requests(status: str = "pending", limit: int = LIST_MAX) -> List[Dict[s
 
 
 def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[str, Any]]:
-    """Move a request between states (used by the Discord approval UI)."""
+    """Decide a PENDING request (used by the Discord approval UI).
+
+    Atomic via LREM: removing the id from the pending list is the claim.
+    If another reviewer already decided it, LREM returns 0 and we return the
+    item unchanged with a "conflict" marker — no duplicate approvals.
+    """
     r = _redis()
     item = get_request(req_id)
     if not item:
         return None
-    old = item.get("status")
+    if item.get("status") != "pending":
+        item["conflict"] = "already decided"
+        return item
+    if r.lrem("devreq:pending", 0, req_id) == 0:
+        item = get_request(req_id) or item
+        item["conflict"] = "already decided"
+        return item
     item["status"] = status
     item["decided_by"] = decided_by
     item["decided_at"] = int(time.time())
-    r.set(f"devreq:item:{req_id}", json.dumps(item, ensure_ascii=False))
-    if old == "pending":
-        r.lrem("devreq:pending", 0, req_id)
+    r.set(f"devreq:item:{req_id}", json.dumps(item, ensure_ascii=False),
+          ex=ITEM_TTL)
     if status == "approved":
         r.rpush("devreq:approved", req_id)
+        r.ltrim("devreq:approved", -PENDING_MAX, -1)
     return item
 
 

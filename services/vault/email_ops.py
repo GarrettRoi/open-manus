@@ -303,6 +303,7 @@ def op_read(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 ATTACHMENT_MAX = 15 * 1024 * 1024  # 15 MB raw — beyond this, refuse
+MESSAGE_MAX = 25 * 1024 * 1024     # refuse to even fetch messages above this
 
 
 def op_attachment(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
@@ -325,6 +326,16 @@ def op_attachment(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, An
     m = _imap_connect(secrets)
     try:
         _select_folder(m, str(body.get("folder") or "INBOX"))
+        # Bound memory BEFORE downloading: check the full message size first.
+        typ, size_data = m.uid("fetch", uid.encode(), "(RFC822.SIZE)")
+        if typ == "OK" and size_data and size_data[0]:
+            msize = re.search(rb"RFC822\.SIZE\s+(\d+)", size_data[0]
+                              if isinstance(size_data[0], bytes)
+                              else str(size_data[0]).encode())
+            if msize and int(msize.group(1)) > MESSAGE_MAX:
+                raise EmailOpError(
+                    f"Message uid {uid} is {int(msize.group(1)) // (1024 * 1024)} MB — "
+                    f"too large to fetch (limit {MESSAGE_MAX // (1024 * 1024)} MB)")
         typ, msg_data = m.uid("fetch", uid.encode(), "(BODY.PEEK[])")
         if typ != "OK" or not msg_data or not any(isinstance(p, tuple) for p in msg_data):
             raise EmailOpError(f"Message uid {uid} not found in that folder")
@@ -333,6 +344,10 @@ def op_attachment(secrets: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, An
             if isinstance(part, tuple) and len(part) >= 2:
                 raw = part[1]
                 break
+        if len(raw) > MESSAGE_MAX:
+            raise EmailOpError(
+                f"Message uid {uid} is larger than the "
+                f"{MESSAGE_MAX // (1024 * 1024)} MB fetch limit")
         msg = email.message_from_bytes(raw)
 
         atts = []
