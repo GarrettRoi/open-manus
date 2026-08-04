@@ -372,4 +372,12 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
         )
     else:
         raise AuthInjectionError(f"Unknown auth kind: {kind}")
+
+    # Extra static headers (custom API connections) — stored with the secrets
+    # because they may embed credentials; injected server-side like the key.
+    extra = secrets.get("extra_headers")
+    if isinstance(extra, dict):
+        for hname, hval in extra.items():
+            if isinstance(hname, str) and hname:
+                headers[hname] = str(hval)
     return {"headers": headers, "params": params}

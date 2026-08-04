@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -339,8 +340,19 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             "token_url": conn_oauth.get("token_url", ""),
             "scopes": " ".join(conn_oauth.get("scopes") or []),
         }
+    # Public key is public by definition (client-side/publishable keys) —
+    # safe to show to admins AND agents; the secret key never leaves the vault.
+    _pk_secrets = store.get_secrets(conn["id"])
+    if _pk_secrets.get("public_key"):
+        view["public_key"] = _pk_secrets["public_key"]
     if include_secret_state:
-        secrets_d = store.get_secrets(conn["id"])
+        secrets_d = _pk_secrets
+        if isinstance(secrets_d.get("extra_headers"), dict):
+            # names only — values may embed credentials
+            view["extra_header_names"] = sorted(secrets_d["extra_headers"].keys())
+        if view["auth_kind"] == "header":
+            view["auth_header_name"] = (conn.get("auth") or {}).get("header_name", "")
+            view["auth_prefix"] = (conn.get("auth") or {}).get("prefix", "")
         if view["auth_kind"] == "oauth2":
             view["connected"] = bool(secrets_d.get("access_token"))
             exp = secrets_d.get("expires_at")
@@ -572,6 +584,51 @@ def _parse_email_form(form) -> tuple:
     }, ""
 
 
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
+                      "cookie", "upgrade", "te", "trailer"}
+
+
+def _parse_extra_headers(form) -> tuple:
+    """Extra static headers for custom API connections.
+
+    Accepts either repeated form fields (extra_header_name / extra_header_value
+    — from the dashboard's add-row UI) or an ``extra_headers`` object (JSON
+    admin API). Returns (dict | None, error). None means "not provided".
+    """
+    pairs: list = []
+    if hasattr(form, "getlist"):
+        names = form.getlist("extra_header_name")
+        values = form.getlist("extra_header_value")
+        pairs = list(zip(names, values))
+    raw = form.get("extra_headers") if hasattr(form, "get") else None
+    if raw is not None and not pairs:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None, "extra_headers must be a JSON object"
+        if not isinstance(raw, dict):
+            return None, "extra_headers must be an object of header name -> value"
+        pairs = list(raw.items())
+    if not pairs:
+        return None, ""
+    headers: Dict[str, str] = {}
+    for name, value in pairs:
+        name = str(name or "").strip()
+        value = str(value or "").strip()
+        if not name and not value:
+            continue  # empty row from the UI
+        if not _HEADER_NAME_RE.match(name):
+            return None, f"Invalid header name: {name!r}"
+        if name.lower() in _FORBIDDEN_HEADERS:
+            return None, f"Header {name!r} cannot be overridden"
+        if len(value) > 4096:
+            return None, f"Header {name!r} value is too long"
+        headers[name] = value
+    return headers, ""
+
+
 def _parse_custom_oauth_form(form) -> tuple:
     """Validate custom-OAuth fields from a form. Returns (oauth_cfg, error)."""
     authorize_url = (form.get("authorize_url") or "").strip()
@@ -639,6 +696,14 @@ async def add_service(request: Request):
         if not api_key:
             return RedirectResponse(url="/services?error=API+key+required", status_code=303)
         secrets_d = {"api_key": api_key}
+        public_key = (form.get("public_key") or "").strip()
+        if public_key:
+            secrets_d["public_key"] = public_key
+        extra_headers, err = _parse_extra_headers(form)
+        if err:
+            return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
+        if extra_headers:
+            secrets_d["extra_headers"] = extra_headers
         if not base_url:
             return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
 
@@ -670,6 +735,33 @@ async def update_service(request: Request):
     api_key = (form.get("api_key") or "").strip()
     if api_key:
         secrets_d["api_key"] = api_key
+    public_key = (form.get("public_key") or "").strip()
+    if public_key:
+        secrets_d["public_key"] = public_key
+    extra_headers, hdr_err = _parse_extra_headers(form)
+    if hdr_err:
+        return RedirectResponse(
+            url=f"/services?error={hdr_err.replace(' ', '+')}", status_code=303)
+    if extra_headers is not None:
+        # any non-empty rows replace the whole set; a single row with name
+        # "-" and empty value clears all extra headers
+        if extra_headers == {"-": ""} or list(extra_headers.keys()) == ["-"]:
+            secrets_d.pop("extra_headers", None)
+        elif extra_headers:
+            secrets_d["extra_headers"] = extra_headers
+    # auth header name / prefix edits for header-kind (custom) connections
+    _auth0 = conn.get("auth") or {}
+    if _auth0.get("kind") == "header":
+        changed = False
+        _auth0 = dict(_auth0)
+        if (form.get("header_name") or "").strip():
+            _auth0["header_name"] = form.get("header_name").strip()
+            changed = True
+        if form.get("prefix") is not None and str(form.get("prefix")) != "":
+            _auth0["prefix"] = str(form.get("prefix"))
+            changed = True
+        if changed:
+            conn["auth"] = _auth0
     if (conn.get("auth") or {}).get("kind") == "email":
         for fld in ("username", "password", "imap_host", "imap_port",
                     "smtp_host", "smtp_port"):
@@ -1190,6 +1282,9 @@ async def proxy_request(conn_id: str, request: Request):
     # Everything actually injected upstream must be scrubbed from responses —
     # including a freshly-refreshed OAuth token that isn't in secrets_d yet.
     scrub_values = [v for v in secrets_d.values() if isinstance(v, str)]
+    if isinstance(secrets_d.get("extra_headers"), dict):
+        scrub_values.extend(
+            str(v) for v in secrets_d["extra_headers"].values() if v)
     try:
         if auth_kind == "oauth2":
             access_token, _ = await oauth_mod.get_valid_access_token(
@@ -1411,6 +1506,14 @@ async def admin_add_connection(request: Request):
         if not base_url:
             raise HTTPException(status_code=400, detail="Base URL required")
         secrets_d = {"api_key": api_key}
+        public_key = (form.get("public_key") or "").strip()
+        if public_key:
+            secrets_d["public_key"] = public_key
+        extra_headers, hdr_err = _parse_extra_headers(body)
+        if hdr_err:
+            raise HTTPException(status_code=400, detail=hdr_err)
+        if extra_headers:
+            secrets_d["extra_headers"] = extra_headers
 
     store.save(
         conn_id, service=service, label=form.get("label") or tpl["label"],
