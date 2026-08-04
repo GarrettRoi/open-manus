@@ -754,6 +754,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
+    # After the linked session finishes all its work (agent turns, background
+    # tool processes, TTS playback), linger this long before auto-leaving an
+    # empty voice channel.
+    VOICE_LINGER_SECONDS = int(os.getenv("DISCORD_VOICE_LINGER_SECONDS", "180"))
+    # How often the deferred-leave watcher re-checks busy/occupancy state.
+    VOICE_LINGER_POLL = 10
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -791,6 +797,13 @@ class DiscordAdapter(BasePlatformAdapter):
         # the bot in the channel when the user deliberately picked text-only
         # (/voice off) instead of leaving (/voice leave).
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
+        # Returns True while the session linked to a text-channel id still has
+        # work in flight (running agent turn or active background processes);
+        # set by run.py. Used to keep the bot in voice until everything the
+        # session kicked off has finished.
+        self._voice_busy_checker: Optional[Callable] = None  # set by run.py
+        # guild_id -> deferred-leave watcher task (empty-channel linger)
+        self._voice_linger_tasks: Dict[int, asyncio.Task] = {}
         # Designated "home" voice channel (per agent).  When set via
         # DISCORD_VOICE_CHANNEL_ID, the agent auto-joins this channel whenever
         # a human is present in it and leaves once it empties.  Auto-join can
@@ -3004,6 +3017,100 @@ class DiscordAdapter(BasePlatformAdapter):
         dvc = self._designated_voice_channel_id
         return dvc is not None and channel is not None and channel.id == dvc
 
+    def _voice_session_is_busy(self, guild_id: int) -> bool:
+        """True while the voice session still has work in flight: audio
+        playing, TTS speech in the mixer, or (via the runner hook) a running
+        agent turn / active background tool processes for the linked session."""
+        vc = self._voice_clients.get(guild_id)
+        try:
+            if vc and vc.is_connected() and vc.is_playing():
+                return True
+        except Exception:
+            pass
+        mixer = None
+        if getattr(self, "_voice_mixers", None):
+            mixer = self._voice_mixers.get(guild_id)
+        if mixer is not None and getattr(mixer, "speech_active", False):
+            return True
+        checker = getattr(self, "_voice_busy_checker", None)
+        text_ch_id = self._voice_text_channels.get(guild_id)
+        if checker and text_ch_id:
+            try:
+                if checker(str(text_ch_id)):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _cancel_deferred_voice_leave(self, guild_id: int) -> None:
+        task = self._voice_linger_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_deferred_voice_leave(self, guild_id: int, reason: str) -> None:
+        """Leave the (now human-empty) voice channel only after the session's
+        work has finished, plus a VOICE_LINGER_SECONDS grace period."""
+        existing = self._voice_linger_tasks.get(guild_id)
+        if existing and not existing.done():
+            return
+        logger.info(
+            "[%s] Voice channel empty (%s) — staying until session work "
+            "finishes, then lingering %ss before leaving",
+            self.name, reason, self.VOICE_LINGER_SECONDS,
+        )
+        self._voice_linger_tasks[guild_id] = asyncio.ensure_future(
+            self._deferred_voice_leave(guild_id, reason)
+        )
+
+    def _deferred_leave_should_abort(self, guild_id: int) -> bool:
+        """Abort the deferred leave when already disconnected or when a human
+        came back to the channel."""
+        vc = self._voice_clients.get(guild_id)
+        if not vc or not vc.is_connected():
+            return True
+        ch = vc.channel
+        return ch is not None and self._channel_has_humans(ch)
+
+    async def _deferred_voice_leave(self, guild_id: int, reason: str) -> None:
+        try:
+            poll = self.VOICE_LINGER_POLL
+            while True:
+                # Phase 1: wait for all in-flight work to finish.
+                while self._voice_session_is_busy(guild_id):
+                    await asyncio.sleep(poll)
+                    if self._deferred_leave_should_abort(guild_id):
+                        return
+                # Phase 2: grace period. If new work starts, go back to phase 1.
+                remaining = self.VOICE_LINGER_SECONDS
+                busy_again = False
+                while remaining > 0:
+                    await asyncio.sleep(min(poll, remaining))
+                    remaining -= poll
+                    if self._deferred_leave_should_abort(guild_id):
+                        return
+                    if self._voice_session_is_busy(guild_id):
+                        busy_again = True
+                        break
+                if not busy_again:
+                    break
+            text_ch_id = self._voice_text_channels.get(guild_id)
+            logger.info(
+                "[%s] Voice session idle for %ss after work finished (%s) — leaving",
+                self.name, self.VOICE_LINGER_SECONDS, reason,
+            )
+            await self.leave_voice_channel(guild_id)
+            if self._on_voice_disconnect and text_ch_id:
+                try:
+                    self._on_voice_disconnect(str(text_ch_id))
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            task = self._voice_linger_tasks.get(guild_id)
+            if task is asyncio.current_task():
+                self._voice_linger_tasks.pop(guild_id, None)
+
     async def _handle_designated_voice_state(self, before, after, member) -> None:
         """Auto-join the home voice channel when a human enters it and leave
         once no humans remain. Callers must filter out bot members."""
@@ -3013,6 +3120,7 @@ class DiscordAdapter(BasePlatformAdapter):
         exited = self._is_designated_channel(before.channel) and not self._is_designated_channel(after.channel)
 
         if entered:
+            self._cancel_deferred_voice_leave(after.channel.guild.id)
             await self._auto_join_designated_channel(
                 after.channel, reason=f"{member.display_name} joined"
             )
@@ -3025,17 +3133,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 and vc.channel.id == self._designated_voice_channel_id
                 and not self._channel_has_humans(before.channel)
             ):
-                logger.info(
-                    "[%s] Home voice channel %s is empty — leaving",
-                    self.name, before.channel.name,
+                # Don't leave right away: the session may still be mid-turn
+                # (tool calls, posts, TTS). Stay until the work drains, then
+                # linger a few minutes before disconnecting.
+                self._schedule_deferred_voice_leave(
+                    guild_id, f"{before.channel.name} emptied"
                 )
-                text_ch_id = self._voice_text_channels.get(guild_id)
-                await self.leave_voice_channel(guild_id)
-                if self._on_voice_disconnect and text_ch_id:
-                    try:
-                        self._on_voice_disconnect(str(text_ch_id))
-                    except Exception:
-                        pass
 
     async def _auto_join_designated_channel(self, channel, reason: str = "") -> None:
         """Join the home voice channel, preferring the runner hook (which also
@@ -3069,15 +3172,10 @@ class DiscordAdapter(BasePlatformAdapter):
             and not self._channel_has_humans(vc.channel)
         ):
             logger.info(
-                "[%s] Home voice channel emptied during join — leaving", self.name
+                "[%s] Home voice channel emptied during join — deferring leave",
+                self.name,
             )
-            text_ch_id = self._voice_text_channels.get(guild_id)
-            await self.leave_voice_channel(guild_id)
-            if self._on_voice_disconnect and text_ch_id:
-                try:
-                    self._on_voice_disconnect(str(text_ch_id))
-                except Exception:
-                    pass
+            self._schedule_deferred_voice_leave(guild_id, "emptied during join")
 
     async def _handle_voicehome_slash(self, interaction, channel, action: str) -> None:
         """Handle /voicehome — set/clear/show the home voice channel."""
@@ -3150,6 +3248,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
+        # A (re)join always cancels a pending deferred auto-leave.
+        self._cancel_deferred_voice_leave(guild_id)
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Already connected in this guild?
@@ -3190,6 +3290,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
+        # Cancel any pending deferred-leave watcher (unless WE are it).
+        linger = self._voice_linger_tasks.get(guild_id)
+        if linger and linger is not asyncio.current_task() and not linger.done():
+            self._voice_linger_tasks.pop(guild_id, None)
+            linger.cancel()
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
@@ -3368,6 +3473,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
             except Exception:
                 pass
+        # Never disconnect while the session still has work in flight
+        # (running agent turn, background tool processes, TTS playback).
+        # Re-arm the timer and check again later.
+        if self._voice_session_is_busy(guild_id):
+            self._reset_voice_timeout(guild_id)
+            return
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
