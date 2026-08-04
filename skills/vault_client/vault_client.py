@@ -121,6 +121,28 @@ class VaultClient:
             payload, timeout=int(timeout) + 15,
         )
 
+    def email(self, connection: str, action: str, **kwargs: Any) -> Dict[str, Any]:
+        """Use an email (IMAP/SMTP) connection through the vault.
+
+        Actions (the vault talks to the mail servers — you never see the
+        password):
+            "folders"                       -> {"folders": [...]}
+            "list"  (folder="INBOX", limit=10, unseen_only=False)
+            "read"  (uid=..., folder="INBOX")
+            "send"  (to=..., subject=..., body=..., cc=..., bcc=...)
+
+        Example:
+            vault.email("GMAIL_PERSONAL", "list", unseen_only=True)
+            vault.email("GMAIL_PERSONAL", "send", to="a@b.com",
+                        subject="Hi", body="...")
+        """
+        payload: Dict[str, Any] = {"action": action}
+        payload.update({k: v for k, v in kwargs.items() if v is not None})
+        return self._http(
+            "POST", f"/api/vault/email/{connection.strip().upper()}",
+            payload, timeout=75,
+        )
+
     def resolve(self, service: str) -> Dict[str, Any]:
         """STEP-ONE CHECK: does the vault have this service, and can I use it?
 

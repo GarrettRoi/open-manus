@@ -50,7 +50,7 @@ function vaultAgentName(profile: string, currentProfile: string): string {
 
 // Providers surfaced as one-click choices, in display order. Everything
 // else in the catalog is still reachable via "More…".
-const FEATURED = ["google", "outlook", "github", "railway", "custom", "custom_oauth"];
+const FEATURED = ["email", "google", "outlook", "github", "railway", "custom", "custom_oauth"];
 
 export default function AccountsPage() {
   const { profile, currentProfile } = useProfileScope();
@@ -465,6 +465,7 @@ function AddConnectionForm({
   onError: (msg: string) => void;
 }) {
   const isOAuth = entry.auth_kind === "oauth2";
+  const isEmail = entry.auth_kind === "email";
   const [name, setName] = useState("");
   const [fields, setFields] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -542,6 +543,15 @@ function AddConnectionForm({
               />
             </div>
           </>
+        ) : isEmail ? (
+          <div className="flex flex-col gap-1">
+            <Label>Password (or app password)</Label>
+            <Input
+              type="password"
+              value={fields.password ?? ""}
+              onChange={(e) => set("password", e.target.value)}
+            />
+          </div>
         ) : (
           <div className="flex flex-col gap-1">
             <Label>API key</Label>

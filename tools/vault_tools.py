@@ -239,7 +239,114 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
     }
 
 
-def _make_conn_handler(conn_id: str):
+def _email_call(conn_id: str, args: dict) -> str:
+    """Execute an email (IMAP/SMTP) action through the vault."""
+    action_map = {
+        "list_folders": "folders",
+        "list_messages": "list",
+        "read_message": "read",
+        "send": "send",
+    }
+    action = str(args.get("action") or "list_messages")
+    payload: Dict[str, Any] = {"action": action_map.get(action, action)}
+    for key in ("folder", "limit", "unseen_only", "uid", "to", "cc", "bcc",
+                "subject", "body", "reply_to", "in_reply_to"):
+        val = args.get(key)
+        if val not in (None, "", []):
+            payload[key] = val
+    try:
+        resp = _vault_http("POST", f"/api/vault/email/{conn_id}", payload,
+                           timeout=60)
+        return json.dumps(resp, ensure_ascii=False, default=str)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
+    except URLError as e:
+        return json.dumps({
+            "error": f"Cannot reach vault at {VAULT_URL}: {e.reason}. "
+                     "The vault service may be restarting — try again shortly.",
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Email action failed: {e}"})
+
+
+def _build_email_schema(conn: dict, tool_name: str) -> dict:
+    conn_id = conn["id"]
+    label = conn.get("label") or conn_id
+    address = conn.get("email_address") or ""
+    desc = (
+        f"Use the {label} mailbox"
+        + (f" ({address})" if address else "")
+        + " through the secure vault (classic IMAP/SMTP — the vault logs in "
+          "server-side; you never see the password). Actions: "
+          "list_messages (folder, limit, unseen_only), read_message (uid from "
+          "list_messages), send (to, subject, body, cc, bcc), list_folders."
+    )
+    for field in ("description", "skill_description"):
+        text = (conn.get(field) or "").strip()
+        if text:
+            desc += "\n" + text
+    if len(desc) > 2000:
+        desc = desc[:2000] + "…"
+    return {
+        "name": tool_name,
+        "description": desc,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list_messages", "read_message", "send",
+                             "list_folders"],
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "Mailbox folder (default INBOX).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max messages to list (default 10, max 50).",
+                },
+                "unseen_only": {
+                    "type": "boolean",
+                    "description": "List only unread messages.",
+                },
+                "uid": {
+                    "type": "string",
+                    "description": "Message uid (from list_messages) to read.",
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Recipient(s), comma-separated (send).",
+                },
+                "cc": {"type": "string", "description": "CC recipients (send)."},
+                "bcc": {"type": "string", "description": "BCC recipients (send)."},
+                "subject": {"type": "string", "description": "Subject (send)."},
+                "body": {"type": "string", "description": "Plain-text body (send)."},
+                "reply_to": {
+                    "type": "string",
+                    "description": "Reply-To address (send, optional).",
+                },
+            },
+            "required": ["action"],
+        },
+    }
+
+
+def _make_conn_handler(conn_id: str, auth_kind: str = ""):
+    if auth_kind == "email":
+        def _email_handler(args: dict, **_kw) -> str:
+            return _email_call(conn_id, args or {})
+        return _email_handler
+
     def _handler(args: dict, **_kw) -> str:
         return _proxy_call(conn_id, args or {})
     return _handler
@@ -283,7 +390,11 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                 )
                 continue
             claimed[tool_name] = conn_id
-            schema = _build_conn_schema(conn, tool_name)
+            auth_kind = str(conn.get("auth_kind") or "")
+            if auth_kind == "email":
+                schema = _build_email_schema(conn, tool_name)
+            else:
+                schema = _build_conn_schema(conn, tool_name)
             existing = registry.get_entry(tool_name)
             if conn_id in _registered and existing is not None:
                 if existing.schema == schema:
@@ -296,7 +407,7 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                     name=tool_name,
                     toolset=TOOLSET,
                     schema=schema,
-                    handler=_make_conn_handler(conn_id),
+                    handler=_make_conn_handler(conn_id, auth_kind),
                     description=f"Vault-proxied access to {conn.get('service') or conn_id}",
                     emoji="🔐",
                 )

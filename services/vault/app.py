@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+import email_ops
 from catalog import CATALOG, get_template
 from connections import (
     PFX_GRANT,
@@ -347,6 +348,9 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
                 datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat() if exp else ""
             )
             view["has_client"] = bool(secrets_d.get("client_id"))
+        elif view["auth_kind"] == "email":
+            view["connected"] = bool(secrets_d.get("password"))
+            view["email_address"] = secrets_d.get("username", "")
         else:
             view["connected"] = bool(secrets_d.get("api_key"))
     return view
@@ -505,6 +509,35 @@ def _validate_oauth_endpoint_url(label: str, url: str) -> str:
     return ""
 
 
+def _parse_email_form(form) -> tuple:
+    """Validate email (IMAP/SMTP) connection fields. Returns (secrets, error)."""
+    username = (form.get("username") or "").strip()
+    password = (form.get("password") or form.get("api_key") or "").strip()
+    imap_host = (form.get("imap_host") or "").strip()
+    smtp_host = (form.get("smtp_host") or "").strip()
+    if not username or "@" not in username:
+        return None, "A valid email address is required"
+    if not password:
+        return None, "The mailbox password (or app password) is required"
+    if not imap_host or not smtp_host:
+        return None, "IMAP and SMTP server hostnames are required"
+    try:
+        imap_port = int(form.get("imap_port") or 993)
+        smtp_port = int(form.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        return None, "Ports must be numbers"
+    if not (0 < imap_port < 65536 and 0 < smtp_port < 65536):
+        return None, "Ports must be between 1 and 65535"
+    return {
+        "username": username,
+        "password": password,
+        "imap_host": imap_host,
+        "imap_port": str(imap_port),
+        "smtp_host": smtp_host,
+        "smtp_port": str(smtp_port),
+    }, ""
+
+
 def _parse_custom_oauth_form(form) -> tuple:
     """Validate custom-OAuth fields from a form. Returns (oauth_cfg, error)."""
     authorize_url = (form.get("authorize_url") or "").strip()
@@ -561,6 +594,12 @@ async def add_service(request: Request):
             auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
+    elif auth["kind"] == "email":
+        secrets_d, err = _parse_email_form(form)
+        if err:
+            return RedirectResponse(
+                url=f"/services?error={err.replace(' ', '+')}", status_code=303)
+        base_url = ""
     else:
         api_key = (form.get("api_key") or "").strip()
         if not api_key:
@@ -597,6 +636,12 @@ async def update_service(request: Request):
     api_key = (form.get("api_key") or "").strip()
     if api_key:
         secrets_d["api_key"] = api_key
+    if (conn.get("auth") or {}).get("kind") == "email":
+        for fld in ("username", "password", "imap_host", "imap_port",
+                    "smtp_host", "smtp_port"):
+            val = (form.get(fld) or "").strip()
+            if val:
+                secrets_d[fld] = val
     client_id = (form.get("client_id") or "").strip()
     client_secret = (form.get("client_secret") or "").strip()
     if client_id:
@@ -837,11 +882,20 @@ async def list_connections(request: Request):
         view = _conn_view(conn, include_secret_state=False)
         view.pop("created_at", None)
         view.pop("updated_at", None)
-        view["how_to_call"] = (
-            f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
-            '{"method": "GET|POST|...", "path": "/...", "params": {...}, '
-            '"json": {...}, "headers": {...}}'
-        )
+        if view.get("auth_kind") == "email":
+            view["how_to_call"] = (
+                f"POST {{vault}}/api/vault/email/{cid} with JSON "
+                '{"action": "folders|list|read|send", ...} — e.g. '
+                '{"action": "list", "limit": 10, "unseen_only": true}, '
+                '{"action": "read", "uid": "..."}, or '
+                '{"action": "send", "to": "a@b.com", "subject": "...", "body": "..."}'
+            )
+        else:
+            view["how_to_call"] = (
+                f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
+                '{"method": "GET|POST|...", "path": "/...", "params": {...}, '
+                '"json": {...}, "headers": {...}}'
+            )
         available.append(view)
     # Agents' background tool-sync polls this every few minutes; keep those
     # out of the audit trail so real activity stays visible.
@@ -1051,6 +1105,16 @@ async def proxy_request(conn_id: str, request: Request):
     if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
         raise HTTPException(status_code=400, detail=f"Unsupported method: {method}")
 
+    if (conn.get("auth") or {}).get("kind") == "email":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{cid}' is an email (IMAP/SMTP) connection — use "
+                f"POST /api/vault/email/{cid} with "
+                '{"action": "folders|list|read|send", ...} instead of the HTTP proxy.'
+            ),
+        )
+
     path = str(body.get("path") or "/")
     base_url = (conn.get("base_url") or "").rstrip("/")
     if not base_url:
@@ -1144,6 +1208,65 @@ async def proxy_request(conn_id: str, request: Request):
     return JSONResponse(result, status_code=200)
 
 
+@app.post("/api/vault/email/{conn_id}")
+async def email_request(conn_id: str, request: Request):
+    """IMAP/SMTP actions for email-kind connections (agents never see the
+    password — the vault talks to the mail servers itself).
+
+    Body: {"action": "folders" | "list" | "read" | "send", ...}
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "email_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "email":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not an email connection — use the HTTP proxy instead.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    action = str(body.get("action") or "").strip().lower()
+
+    secrets_d = store.get_secrets(cid)
+    if not secrets_d.get("password"):
+        raise HTTPException(status_code=409,
+                            detail="No mailbox password stored — fix this connection in the dashboard")
+
+    import asyncio
+    try:
+        result = await asyncio.to_thread(email_ops.run_action, action, secrets_d, body)
+    except email_ops.EmailOpError as exc:
+        audit_log(agent_name, cid, f"email_{action or 'unknown'}_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Email action failed for %s", cid)
+        audit_log(agent_name, cid, f"email_{action or 'unknown'}_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=f"Email operation failed: {exc}")
+
+    detail = {"list": f"folder={body.get('folder') or 'INBOX'}",
+              "read": f"uid={body.get('uid')}",
+              "send": f"to={result.get('to')}"}.get(action, "")
+    audit_log(agent_name, cid, f"email_{action}", detail)
+    # Belt-and-braces scrub (the password should never appear in results).
+    pw = secrets_d.get("password", "")
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    if pw and len(pw) >= 8 and pw in text:
+        text = text.replace(pw, "***vault***")
+        result = json.loads(text)
+    return JSONResponse(result, status_code=200)
+
+
 # ---------------------------------------------------------------------------
 # Health & startup
 # ---------------------------------------------------------------------------
@@ -1232,6 +1355,11 @@ async def admin_add_connection(request: Request):
             auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
+    elif auth["kind"] == "email":
+        secrets_d, err = _parse_email_form(form)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        base_url = ""
     else:
         api_key = (form.get("api_key") or "").strip()
         if not api_key:

@@ -2044,6 +2044,12 @@ export interface VaultConnectionCreate {
   name: string;
   label?: string;
   api_key?: string;
+  username?: string;
+  password?: string;
+  imap_host?: string;
+  imap_port?: string;
+  smtp_host?: string;
+  smtp_port?: string;
   client_id?: string;
   client_secret?: string;
   base_url?: string;

@@ -77,3 +77,26 @@ vault.store("SENDGRID", "SG.xxxx", service="custom",
 
 OAuth services (Google, GitHub, Outlook) can only be added by the admin in
 the vault dashboard, because they require a browser login.
+
+## Email mailboxes (IMAP/SMTP connections)
+
+Some connections are classic mailboxes, not HTTP APIs. They show up as
+native tools too (e.g. `vault_gmail_personal`) with an `action` parameter:
+
+- `action="list_messages"` (folder, limit, unseen_only) — newest first
+- `action="read_message"` (uid from list_messages)
+- `action="send"` (to, subject, body, cc, bcc)
+- `action="list_folders"`
+
+Via the skill instead: `vault.email(CONNECTION, action, **kwargs)` maps to
+`POST /api/vault/email/{CONNECTION}` with `{"action": "folders|list|read|send", ...}`.
+The vault logs into the mail servers itself — you never see the password.
+Do NOT use `vault.request(...)`/the HTTP proxy on an email connection; it
+will refuse and point you here.
+
+## Your tool list is live
+
+Granted connections auto-appear as `vault_<name>` tools (re-synced every few
+minutes AND instantly when you call an unknown `vault_*` tool — the runtime
+pulls the vault list and registers it before failing). If something seems
+missing: `vault(action='refresh')` then `vault(action='list')`.
