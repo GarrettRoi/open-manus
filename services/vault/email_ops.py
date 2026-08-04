@@ -260,10 +260,22 @@ def _imap_date(value: str, label: str):
 
 
 def _quote_atom(value: str) -> str:
-    """Quote a search string for IMAP; reject CR/LF injection."""
+    """Quote a search string for IMAP; reject CR/LF injection and non-ASCII.
+
+    imaplib transmits command arguments as ASCII — non-ASCII text would
+    raise deep inside imaplib, so reject it here with a clear message.
+    (UTF-8 IMAP search is not supported yet; use ASCII terms.)
+    """
     s = str(value)
     if "\r" in s or "\n" in s:
         raise EmailOpError("Search text cannot contain line breaks")
+    try:
+        s.encode("ascii")
+    except UnicodeEncodeError:
+        raise EmailOpError(
+            "Search text with non-ASCII characters is not supported by the "
+            "mail search yet — use plain ASCII terms (e.g. a name fragment "
+            "or the email address instead of accented text).")
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -292,10 +304,19 @@ def _build_imap_criteria(f: Dict[str, Any]) -> str:
 
 
 def _build_gmail_query(f: Dict[str, Any]) -> str:
-    """Translate the same filters into Gmail X-GM-RAW search syntax."""
+    """Translate the same filters into Gmail X-GM-RAW search syntax.
+
+    Every user-supplied value is ALWAYS emitted as a quoted literal (with
+    backslash/quote escaping) so filter text can never be interpreted as a
+    Gmail operator (e.g. a text value of "in:trash" stays literal text).
+    Only the server-generated operators (from:, after:, has:attachment, ...)
+    come from this code.
+    """
     def q(v: str) -> str:
         v = str(v).strip()
-        return f'"{v}"' if (" " in v and '"' not in v) else v
+        if "\r" in v or "\n" in v:
+            raise EmailOpError("Search text cannot contain line breaks")
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
     parts: List[str] = []
     if f.get("from"):
         parts.append(f"from:{q(f['from'])}")
