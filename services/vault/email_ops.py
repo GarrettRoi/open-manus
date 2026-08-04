@@ -259,6 +259,19 @@ def _imap_date(value: str, label: str):
     raise EmailOpError(f"Invalid {label} date {s!r} — use YYYY-MM-DD")
 
 
+def _gmail_date(value: str, label: str) -> str:
+    """Strictly parse a date and emit a fixed Gmail YYYY/MM/DD token."""
+    from datetime import datetime as _dt
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            d = _dt.strptime(s, fmt)
+            return f"{d.year:04d}/{d.month:02d}/{d.day:02d}"
+        except ValueError:
+            continue
+    raise EmailOpError(f"Invalid {label} date {s!r} — use YYYY-MM-DD")
+
+
 def _quote_atom(value: str) -> str:
     """Quote a search string for IMAP; reject CR/LF injection and non-ASCII.
 
@@ -328,10 +341,12 @@ def _build_gmail_query(f: Dict[str, Any]) -> str:
         parts.append(f"subject:{q(f['subject'])}")
     if f.get("text"):
         parts.append(q(f["text"]))
+    # Dates are strictly parsed (rejecting arbitrary text) and re-emitted as
+    # fixed YYYY/MM/DD tokens so no caller-controlled text reaches the query.
     if f.get("since"):
-        parts.append("after:" + str(f["since"]).replace("-", "/"))
+        parts.append("after:" + _gmail_date(f["since"], "since"))
     if f.get("before"):
-        parts.append("before:" + str(f["before"]).replace("-", "/"))
+        parts.append("before:" + _gmail_date(f["before"], "before"))
     if f.get("unseen") is True:
         parts.append("is:unread")
     elif f.get("unseen") is False:
@@ -342,8 +357,10 @@ def _build_gmail_query(f: Dict[str, Any]) -> str:
         parts.append(f"larger:{int(float(f['min_size_kb']))}k")
     if f.get("max_size_kb"):
         parts.append(f"smaller:{int(float(f['max_size_kb']))}k")
-    if f.get("has_attachment"):
+    if f.get("has_attachment") is True:
         parts.append("has:attachment")
+    elif f.get("has_attachment") is False:
+        parts.append("-has:attachment")
     if f.get("attachment_name"):
         parts.append(f"filename:{q(f['attachment_name'])}")
     return " ".join(parts) or "in:anywhere"
