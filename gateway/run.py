@@ -7131,19 +7131,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # of a restart cycle (see _is_stale_restart_redelivery).
         if _restart_notification_pending() or planned_restart_notification_pending:
             self._booted_from_restart = True
-        await self._send_restart_notification()
+        restart_notify_target = await self._send_restart_notification()
 
         # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
-            try:
-                await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
-                )
-            finally:
+        # channels on every startup. The shutdown path broadcasts "gateway
+        # shutting down" to home channels on every SIGTERM (including external
+        # ones like a Railway redeploy), so the online half must be symmetric —
+        # previously it only fired for planned in-process restarts, which meant
+        # redeploys announced going down but never coming back. Chat-originated
+        # /restart already delivered a precise reply above; pass that target as
+        # a skip so the same chat isn't pinged twice. Per-platform opt-out via
+        # gateway_restart_notification=false is honored inside the helper.
+        try:
+            skip = {restart_notify_target} if restart_notify_target else None
+            await self._send_home_channel_startup_notifications(
+                skip_targets=skip,
+            )
+        finally:
+            if planned_restart_notification_pending:
                 _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the

@@ -765,6 +765,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # guild_id -> serialize voice PLAYBACK. Without this, concurrent
+        # play_in_voice_channel calls (multiple queued turns, chunked replies,
+        # tool-triggered TTS) collide: in the mixer path both clips are summed
+        # and play on top of each other (sounds like the reply being cut off /
+        # talked over), and in the legacy path a second caller can vc.stop()
+        # an in-flight clip on timeout. asyncio.Lock wakes waiters FIFO, so
+        # queued clips play in submission order, one at a time.
+        self._voice_play_locks: Dict[int, asyncio.Lock] = {}
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -3184,12 +3192,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            # NOTE: _voice_play_locks is intentionally NOT popped here. An
+            # in-flight play_in_voice_channel() may still hold the lock (with
+            # waiters queued on it); popping would hand new callers a fresh
+            # lock and break the one-at-a-time ordering guarantee across a
+            # leave/rejoin. Locks are tiny and per-guild, so keeping them for
+            # the adapter's lifetime is safe.
 
     # Maximum seconds to wait for voice playback before giving up
     PLAYBACK_TIMEOUT = 120
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
+
+        Playback is serialized per guild: concurrent callers (queued turns,
+        chunked replies, tool-triggered TTS) wait their turn in FIFO order
+        instead of overlapping in the mixer or stopping each other in the
+        legacy path — the cause of replies audibly cutting each other off.
+        """
+        lock = self._voice_play_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            return await self._play_in_voice_channel_now(guild_id, audio_path)
+
+    async def _play_in_voice_channel_now(self, guild_id: int, audio_path: str) -> bool:
+        """Play immediately (caller must hold the per-guild playback lock).
 
         When the continuous mixer is installed for this guild, the clip is
         decoded to PCM and layered over the ambient bed (ducking it) so the
