@@ -546,7 +546,7 @@ async def add_service(request: Request):
         status = "needs_login"
     elif auth["kind"] == "apple":
         apple_id = (form.get("apple_id") or "").strip()
-        app_password = (form.get("app_password") or "").strip()
+        app_password = (form.get("apple_app_password") or "").strip()
         if not apple_id or not app_password:
             return RedirectResponse(
                 url="/services?error=Apple+ID+and+app-specific+password+are+required",
@@ -560,7 +560,7 @@ async def add_service(request: Request):
         secrets_d = {"apple_id": apple_id, "app_password": app_password}
     elif auth["kind"] == "email":
         email_address = (form.get("email_address") or "").strip()
-        app_password = (form.get("app_password") or "").strip()
+        app_password = (form.get("email_app_password") or "").strip()
         if not email_address or not app_password:
             return RedirectResponse(
                 url="/services?error=Email+address+and+app-specific+password+are+required",
@@ -616,14 +616,14 @@ async def update_service(request: Request):
         secrets_d["client_secret"] = client_secret
     if (conn.get("auth") or {}).get("kind") == "apple":
         apple_id = (form.get("apple_id") or "").strip()
-        app_password = (form.get("app_password") or "").strip()
+        app_password = (form.get("apple_app_password") or "").strip()
         if apple_id:
             secrets_d["apple_id"] = apple_id
         if app_password:
             secrets_d["app_password"] = app_password
     if (conn.get("auth") or {}).get("kind") == "email":
         email_address = (form.get("email_address") or "").strip()
-        app_password = (form.get("app_password") or "").strip()
+        app_password = (form.get("email_app_password") or "").strip()
         if email_address:
             secrets_d["email_address"] = email_address
         if app_password:

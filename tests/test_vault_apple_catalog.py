@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from services.vault.catalog import CATALOG
 
@@ -22,6 +23,16 @@ class AppleCatalogTests(unittest.TestCase):
         template = CATALOG["bluebubbles"]
         self.assertEqual(template["auth"]["kind"], "header")
         self.assertIn("always-on Mac", template["setup_help"])
+
+    def test_dashboard_uses_distinct_apple_and_email_password_fields(self):
+        root = Path(__file__).parents[1]
+        template = (root / "services" / "vault" / "templates" / "services.html").read_text()
+        app = (root / "services" / "vault" / "app.py").read_text()
+        self.assertIn('name="apple_app_password"', template)
+        self.assertIn('name="email_app_password"', template)
+        self.assertNotIn('name="app_password"', template)
+        self.assertIn('form.get("apple_app_password")', app)
+        self.assertIn('form.get("email_app_password")', app)
 
 
 if __name__ == "__main__":
