@@ -31,7 +31,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from apple_ops import AppleOpsError, run_apple_operation
-from email_ops import EmailOpsError, run_email_operation
 
 import email_ops
 from catalog import CATALOG, get_template
@@ -1287,28 +1286,6 @@ async def apple_operation(conn_id: str, request: Request, body: AppleOperationRe
         audit_log(agent_name, cid, "apple_error", str(exc)[:200])
         raise HTTPException(status_code=502, detail=str(exc))
     audit_log(agent_name, cid, "apple_operation", body.operation[:100])
-    return {"ok": True, "operation": body.operation, "result": result}
-
-
-@app.post("/api/vault/email/{conn_id}")
-async def email_operation(conn_id: str, request: Request, body: EmailOperationRequest):
-    agent_name = require_agent(request)
-    cid = normalize_id(conn_id)
-    if not store.has_grant(agent_name, cid):
-        audit_log(agent_name, cid, "email_denied", "No grant")
-        raise HTTPException(status_code=403, detail=f"Agent '{agent_name}' does not have access to '{cid}'")
-    conn = store.get(cid)
-    if not conn or conn.get("service") != "email":
-        raise HTTPException(status_code=404, detail="Email connection not found")
-    secrets_d = store.get_secrets(cid)
-    try:
-        result = await run_email_operation(
-            secrets_d.get("email_address", ""), secrets_d.get("app_password", ""),
-            body.operation, body.args or {})
-    except (EmailOpsError, OSError) as exc:
-        audit_log(agent_name, cid, "email_error", str(exc)[:200])
-        raise HTTPException(status_code=502, detail=str(exc))
-    audit_log(agent_name, cid, "email_operation", body.operation[:100])
     return {"ok": True, "operation": body.operation, "result": result}
 
 

@@ -148,23 +148,6 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /me/messages",
     },
-    "email": {
-        "label": "Email / iCloud Mail",
-        "auth": {"kind": "email"},
-        "base_url": "https://imap.mail.me.com",
-        "allowed_hosts": ["imap.mail.me.com", "smtp.mail.me.com"],
-        "fields": [
-            {"name": "base_url", "label": "IMAP/SMTP provider",
-             "placeholder": "imap.mail.me.com / smtp.mail.me.com", "required": False},
-        ],
-        "setup_help": (
-            "Enter the mailbox address as the Email address and an app-specific "
-            "password as the password. For iCloud Mail use imap.mail.me.com and "
-            "smtp.mail.me.com; modern iCloud Notes are only partially visible "
-            "through an IMAP Notes folder, if Apple exposes it."
-        ),
-        "example_call": "Use the email tool for folders, search, read, and send",
-    },
     "apple": {
         "label": "Apple iCloud (Calendar / Reminders / Contacts)",
         "auth": {"kind": "apple"},
@@ -242,6 +225,8 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ],
         "setup_help": (
             "Connect any mailbox the classic way — no API or OAuth app needed. "
+            "For iCloud Mail use imap.mail.me.com / smtp.mail.me.com with an "
+            "app-specific password from appleid.apple.com. "
             "Enter the address, the IMAP/SMTP servers, and the password. "
             "Gmail: imap.gmail.com / smtp.gmail.com with an App Password "
             "(Google Account → Security → 2-Step Verification → App passwords). "
