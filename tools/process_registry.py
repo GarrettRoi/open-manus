@@ -1682,6 +1682,24 @@ class ProcessRegistry:
                 for s in self._running.values()
             )
 
+    def active_session_keys(self) -> list:
+        """Gateway session keys that still have a running process.
+
+        Used by the Discord voice linger logic to keep the bot in a voice
+        channel while background tool processes for the session are running.
+        """
+        with self._lock:
+            sessions = list(self._running.values())
+
+        for session in sessions:
+            self._refresh_detached_session(session)
+
+        with self._lock:
+            return sorted({
+                s.session_key for s in self._running.values()
+                if not s.exited and s.session_key
+            })
+
     def has_any_active(self) -> bool:
         """Whether ANY background process is still running (across all sessions).
 

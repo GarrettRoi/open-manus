@@ -364,10 +364,28 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
         if not key:
             raise AuthInjectionError("No API key stored for this connection")
         params[auth.get("param_name") or "api_key"] = key
-    elif kind in {"apple", "email"}:
+    elif kind == "apple":
         raise AuthInjectionError(
-            f"{kind} connections use their dedicated operation endpoint"
+            "This is an Apple (iCloud) connection — it cannot be used with "
+            "the HTTP proxy. Call POST /api/vault/apple/{connection} instead."
+        )
+    elif kind == "email":
+        raise AuthInjectionError(
+            "This is an email (IMAP/SMTP) connection — it cannot be used with "
+            "the HTTP proxy. Call POST /api/vault/email/{connection} instead "
+            '(e.g. {"action": "list"} or {"action": "send", ...}).'
         )
     else:
         raise AuthInjectionError(f"Unknown auth kind: {kind}")
+
+    # Extra static headers (custom API connections) — stored with the secrets
+    # because they may embed credentials; injected server-side like the key.
+    # The credential header always wins: an extra header can never override
+    # the auth header (defense in depth on top of save-time validation).
+    extra = secrets.get("extra_headers")
+    if isinstance(extra, dict):
+        auth_header_names = {h.lower() for h in headers}
+        for hname, hval in extra.items():
+            if isinstance(hname, str) and hname and hname.lower() not in auth_header_names:
+                headers[hname] = str(hval)
     return {"headers": headers, "params": params}

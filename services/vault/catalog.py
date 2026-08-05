@@ -223,6 +223,38 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /whatever/the/api/offers",
     },
+    "email": {
+        "label": "Email (IMAP/SMTP)",
+        "auth": {"kind": "email"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "username", "label": "Email address",
+             "placeholder": "you@gmail.com", "required": True},
+            {"name": "imap_host", "label": "IMAP server (incoming)",
+             "placeholder": "imap.gmail.com", "required": True},
+            {"name": "imap_port", "label": "IMAP port",
+             "placeholder": "993", "required": False},
+            {"name": "smtp_host", "label": "SMTP server (outgoing)",
+             "placeholder": "smtp.gmail.com", "required": True},
+            {"name": "smtp_port", "label": "SMTP port",
+             "placeholder": "587", "required": False},
+        ],
+        "setup_help": (
+            "Connect any mailbox the classic way — no API or OAuth app needed. "
+            "Enter the address, the IMAP/SMTP servers, and the password. "
+            "Gmail: imap.gmail.com / smtp.gmail.com with an App Password "
+            "(Google Account → Security → 2-Step Verification → App passwords). "
+            "Outlook/Hotmail: outlook.office365.com / smtp-mail.outlook.com. "
+            "Yahoo: imap.mail.yahoo.com / smtp.mail.yahoo.com (app password). "
+            "iCloud: imap.mail.me.com / smtp.mail.me.com (app-specific password). "
+            "Ports default to 993 (IMAP) and 587 (SMTP)."
+        ),
+        "example_call": (
+            'POST /api/vault/email/{conn} with {"action": "list", "limit": 10} '
+            "(actions: folders, list, read, send)"
+        ),
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},

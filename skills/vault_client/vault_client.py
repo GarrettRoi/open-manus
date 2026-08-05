@@ -121,6 +121,41 @@ class VaultClient:
             payload, timeout=int(timeout) + 15,
         )
 
+    def email(self, connection: str, action: str, **kwargs: Any) -> Dict[str, Any]:
+        """Use an email (IMAP/SMTP) connection through the vault.
+
+        Actions (the vault talks to the mail servers — you never see the
+        password):
+            "folders"                       -> {"folders": [...]}
+            "list"  (folder="INBOX", limit=10, unseen_only=False)
+            "search" (any of: from_, to, cc, subject, text, since/before
+                YYYY-MM-DD, last_days=N, unseen=True/False, flagged,
+                min_size_kb, max_size_kb, has_attachment,
+                attachment_name="contract" or "*.pdf", folder, limit)
+                -> {"total_matches", "messages": [{uid, from, to, subject,
+                    date, seen, attachments}], "more": bool}
+                NOTE: pass sender filter as from_=... (Python keyword);
+                it is sent as "from".
+            "read"  (uid=..., folder="INBOX")
+            "attachment" (uid=..., filename=... or index=0)
+                -> {"attachment": {filename, content_type, size, content_b64}}
+                (decode content_b64 and write it to a file yourself)
+            "send"  (to=..., subject=..., body=..., cc=..., bcc=...)
+
+        Example:
+            vault.email("GMAIL_PERSONAL", "list", unseen_only=True)
+            vault.email("GMAIL_PERSONAL", "send", to="a@b.com",
+                        subject="Hi", body="...")
+        """
+        payload: Dict[str, Any] = {"action": action}
+        if "from_" in kwargs:  # 'from' is a Python keyword
+            kwargs["from"] = kwargs.pop("from_")
+        payload.update({k: v for k, v in kwargs.items() if v is not None})
+        return self._http(
+            "POST", f"/api/vault/email/{connection.strip().upper()}",
+            payload, timeout=75,
+        )
+
     def resolve(self, service: str) -> Dict[str, Any]:
         """STEP-ONE CHECK: does the vault have this service, and can I use it?
 

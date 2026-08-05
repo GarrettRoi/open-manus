@@ -277,8 +277,27 @@ def set_voice(selector: str) -> Dict[str, Any]:
 
     # Legacy adapter path reads this env var per TTS call.
     os.environ["ELEVENLABS_VOICE_ID"] = vid
+    _persist_voice_to_redis(vid)
     logger.info("Voice swapped to %s (%s)", voice.get("name"), vid)
     return voice
+
+
+def _persist_voice_to_redis(vid: str) -> None:
+    """Mirror the chosen voice to Redis so it survives redeploys — the
+    entrypoint re-applies it via skills/hive_mind/apply_agent_settings.py
+    (config.yaml gets re-baked from the image on every deploy, so the file
+    write above alone is not durable). Best-effort: never fails the swap."""
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    agent = os.getenv("AGENT_NAME", "").strip().lower()
+    if not redis_url or not agent:
+        return
+    try:
+        import redis
+
+        r = redis.from_url(redis_url, decode_responses=True, socket_timeout=5)
+        r.set(f"agent:{agent}:settings:voice_id", vid)
+    except Exception as e:
+        logger.warning("Could not persist voice_id to Redis (will be lost on redeploy): %s", e)
 
 
 def format_voice_list() -> str:
