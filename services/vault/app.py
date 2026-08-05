@@ -1640,15 +1640,25 @@ async def replit_mcp_connect(request: Request):
 async def replit_mcp_callback(code: str = "", state: str = "", error: str = ""):
     # Like /oauth/callback: the single-use server-generated state token IS
     # the authorization (it only exists if an admin started the flow).
+    # No request-controlled text is ever reflected into the HTML.
+    import html as _html
     if error:
-        return HTMLResponse(f"<h3>Replit login denied: {error}</h3>", status_code=400)
+        # Consume the state (if any) so the link can't be replayed, then show
+        # a fixed message — the provider's error text is only logged.
+        if state:
+            replit_mcp._consume_pkce_state(state)
+        logger.warning("Replit MCP OAuth denied: %s", error[:200])
+        return HTMLResponse("<h3>Replit login was denied or cancelled.</h3>"
+                            "<p>You can close this tab and try again from the "
+                            "dashboard.</p>", status_code=400)
     if not code or not state:
         return HTMLResponse("<h3>Missing code/state.</h3>", status_code=400)
     try:
         await replit_mcp.handle_callback(code, state)
     except ReplitMCPError as exc:
         audit_log("admin", "REPLIT_MCP", "replit_mcp_connect_failed", str(exc)[:200])
-        return HTMLResponse(f"<h3>Replit connection failed</h3><p>{exc}</p>",
+        return HTMLResponse("<h3>Replit connection failed</h3><p>"
+                            f"{_html.escape(str(exc)[:300])}</p>",
                             status_code=502)
     audit_log("admin", "REPLIT_MCP", "replit_mcp_connected", "")
     return HTMLResponse(
@@ -1662,8 +1672,19 @@ async def replit_mcp_dispatch(req_id: str, request: Request):
     """Manually (re-)queue an approved dev request for dispatch."""
     require_admin_api(request)
     rid = re.sub(r"[^0-9A-Za-z_-]", "", req_id)[:32]
-    if not rid or not r.get(f"devreq:item:{rid}"):
+    raw = r.get(f"devreq:item:{rid}") if rid else None
+    if not raw:
         raise HTTPException(status_code=404, detail=f"Dev request '{rid}' not found")
+    try:
+        item = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Corrupt request record")
+    # Only owner-approved requests may be dispatched — the Discord approval
+    # is the trust boundary; this endpoint is retry-only.
+    if item.get("status") != "approved":
+        raise HTTPException(status_code=409,
+                            detail=f"Request '{rid}' is {item.get('status')!r}, "
+                                   "not approved — approve it in Discord first")
     r.lpush(replit_mcp_mod.DISPATCH_QUEUE, rid)
     audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
     return {"ok": True, "queued": rid}

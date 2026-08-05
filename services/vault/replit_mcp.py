@@ -139,7 +139,8 @@ class ReplitMCP:
             return meta
 
     async def _client_registration(self) -> Dict[str, Any]:
-        reg = self._get_json(K_CLIENT)
+        # Encrypted at rest: dynamic registration may include a client_secret.
+        reg = self._get_json(K_CLIENT, encrypted=True)
         if reg and reg.get("client_id") and reg.get("redirect_uri") == self.redirect_uri:
             return reg
         meta = await self._metadata()
@@ -161,7 +162,7 @@ class ReplitMCP:
                 f"Client registration failed ({resp.status_code}): {resp.text[:300]}")
         reg = resp.json()
         reg["redirect_uri"] = self.redirect_uri
-        self._set_json(K_CLIENT, reg)
+        self._set_json(K_CLIENT, reg, encrypted=True)
         return reg
 
     # -- OAuth flow -----------------------------------------------------------
@@ -190,13 +191,24 @@ class ReplitMCP:
             params["scope"] = " ".join(scopes)
         return f"{meta['authorization_endpoint']}?{urlencode(params)}"
 
-    async def handle_callback(self, code: str, state: str) -> None:
-        verifier = self.r.get(K_PKCE + state)
+    def _consume_pkce_state(self, state: str) -> Optional[str]:
+        """Atomically fetch-and-delete the PKCE verifier (single-use state)."""
+        key = K_PKCE + state
+        try:
+            verifier = self.r.getdel(key)  # Redis >= 6.2
+        except Exception:
+            pipe = self.r.pipeline(transaction=True)
+            pipe.get(key)
+            pipe.delete(key)
+            verifier = pipe.execute()[0]
         if isinstance(verifier, bytes):
             verifier = verifier.decode()
+        return verifier or None
+
+    async def handle_callback(self, code: str, state: str) -> None:
+        verifier = self._consume_pkce_state(state)
         if not verifier:
             raise ReplitMCPError("Login link expired or already used — start again")
-        self.r.delete(K_PKCE + state)
         meta = await self._metadata()
         reg = await self._client_registration()
         data = {
