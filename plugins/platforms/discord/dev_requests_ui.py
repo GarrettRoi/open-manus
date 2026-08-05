@@ -79,8 +79,8 @@ class DevRequestApprovalView(discord.ui.View):
         self.resolved = True
         for child in self.children:
             child.disabled = True
-        note = ("queued for the development team" if status == "approved"
-                else "closed")
+        note = ("approved — a Replit Agent build is being kicked off "
+                "automatically" if status == "approved" else "closed")
         await interaction.response.edit_message(
             content=f"{label} — request #{self.req_id} "
                     f"“{item.get('title', '')}” {note}.",

@@ -124,6 +124,9 @@ def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[
     if status == "approved":
         r.rpush("devreq:approved", req_id)
         r.ltrim("devreq:approved", -PENDING_MAX, -1)
+        # Auto-dispatch: the vault's Replit MCP bridge pops this queue and
+        # starts a Replit Agent run for the request — approve once, done.
+        r.lpush("devreq:dispatch", req_id)
     return item
 
 

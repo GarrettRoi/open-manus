@@ -43,6 +43,8 @@ from connections import (
 import oauth as oauth_mod
 from oauth import OAuthError
 import backup as vault_backup
+import replit_mcp as replit_mcp_mod
+from replit_mcp import ReplitMCPError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vault")
@@ -1604,6 +1606,69 @@ async def admin_set_grant(request: Request):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Replit MCP bridge — approve a dev request in Discord and a Replit Agent
+# run starts automatically on the Open Manus project.
+# ---------------------------------------------------------------------------
+replit_mcp = replit_mcp_mod.ReplitMCP(r, encrypt_value, decrypt_value, PUBLIC_URL)
+
+
+@app.get("/api/admin/replit-mcp/status")
+async def replit_mcp_status(request: Request):
+    require_admin_api(request)
+    return {"connected": replit_mcp.connected(),
+            "target_repl": replit_mcp.target_repl(),
+            "redirect_uri": replit_mcp.redirect_uri}
+
+
+@app.get("/admin/replit-mcp/connect")
+async def replit_mcp_connect(request: Request):
+    """Browser entry point: redirects the logged-in admin to Replit's
+    OAuth consent screen. One-time setup for the auto-dispatch bridge."""
+    if not verify_admin_api(request):
+        return RedirectResponse(url="/login?next=/admin/replit-mcp/connect",
+                                status_code=303)
+    try:
+        url = await replit_mcp.build_authorize_url()
+    except ReplitMCPError as exc:
+        return HTMLResponse(f"<h3>Could not start Replit login</h3><p>{exc}</p>",
+                            status_code=502)
+    return RedirectResponse(url=url, status_code=303)
+
+
+@app.get("/oauth/replit-mcp/callback")
+async def replit_mcp_callback(code: str = "", state: str = "", error: str = ""):
+    # Like /oauth/callback: the single-use server-generated state token IS
+    # the authorization (it only exists if an admin started the flow).
+    if error:
+        return HTMLResponse(f"<h3>Replit login denied: {error}</h3>", status_code=400)
+    if not code or not state:
+        return HTMLResponse("<h3>Missing code/state.</h3>", status_code=400)
+    try:
+        await replit_mcp.handle_callback(code, state)
+    except ReplitMCPError as exc:
+        audit_log("admin", "REPLIT_MCP", "replit_mcp_connect_failed", str(exc)[:200])
+        return HTMLResponse(f"<h3>Replit connection failed</h3><p>{exc}</p>",
+                            status_code=502)
+    audit_log("admin", "REPLIT_MCP", "replit_mcp_connected", "")
+    return HTMLResponse(
+        "<h3>Replit connected ✅</h3>"
+        "<p>Approved dev requests will now start Replit Agent runs "
+        "automatically. You can close this tab.</p>")
+
+
+@app.post("/api/admin/replit-mcp/dispatch/{req_id}")
+async def replit_mcp_dispatch(req_id: str, request: Request):
+    """Manually (re-)queue an approved dev request for dispatch."""
+    require_admin_api(request)
+    rid = re.sub(r"[^0-9A-Za-z_-]", "", req_id)[:32]
+    if not rid or not r.get(f"devreq:item:{rid}"):
+        raise HTTPException(status_code=404, detail=f"Dev request '{rid}' not found")
+    r.lpush(replit_mcp_mod.DISPATCH_QUEUE, rid)
+    audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
+    return {"ok": True, "queued": rid}
+
+
 @app.get("/health")
 async def health():
     try:
@@ -1625,6 +1690,8 @@ async def startup():
     # Nightly backups of all vault:* keys to local disk (Railway volume).
     import asyncio
     asyncio.create_task(vault_backup.backup_loop(r))
+    # Auto-dispatch approved dev requests to Replit Agent (MCP bridge).
+    asyncio.create_task(replit_mcp_mod.dispatch_loop(replit_mcp))
 
 
 # ---------------------------------------------------------------------------
