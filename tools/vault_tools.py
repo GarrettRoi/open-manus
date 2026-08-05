@@ -164,6 +164,36 @@ def _proxy_call(conn_id: str, args: dict) -> str:
         return json.dumps({"error": f"Vault call failed: {e}"})
 
 
+def _special_call(conn_id: str, service: str, args: dict) -> str:
+    """Call one of the vault's structured, credential-sensitive adapters."""
+    operation = str(args.get("operation") or "").strip()
+    if not operation:
+        return json.dumps({"error": "operation is required"})
+    payload = {
+        "operation": operation,
+        "args": args.get("args") if isinstance(args.get("args"), dict) else {},
+    }
+    try:
+        return json.dumps(
+            _vault_http("POST", f"/api/vault/{service}/{conn_id}", payload,
+                        timeout=125),
+            ensure_ascii=False, default=str,
+        )
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
+    except Exception as e:
+        return json.dumps({"error": f"Vault call failed: {e}"})
+
+
 # ---------------------------------------------------------------------------
 # Per-connection tool registration
 # ---------------------------------------------------------------------------
@@ -198,6 +228,65 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
     if len(description) > 2000:
         description = description[:2000] + "…"
 
+    if service == "apple":
+        return {
+            "name": tool_name,
+            "description": description + (
+                "\nOperations: calendar_list, calendar_search, calendar_create, "
+                "calendar_update, calendar_delete, reminders_list, reminders_create, "
+                "reminders_complete, contacts_search, contacts_read. Results are "
+                "structured and credentials stay in the vault."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "calendar_list", "calendar_search", "calendar_create",
+                            "calendar_update", "calendar_delete", "reminders_list",
+                            "reminders_create", "reminders_complete",
+                            "contacts_search", "contacts_read",
+                        ],
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation arguments. Search/list: limit, start, end, "
+                            "calendar_url. Create: summary, description, location, "
+                            "start/end or due. Update/delete/complete: href and "
+                            "optional etag. Contacts: query or href."
+                        ),
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
+    if service == "email":
+        return {
+            "name": tool_name,
+            "description": description + (
+                "\nOperations: folders, search, read, send. The Notes folder is "
+                "read-only and partial because modern iCloud Notes has no public API."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["folders", "search", "read", "send"],
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation arguments. Search/read: folder, query, "
+                            "limit. Send: to, subject, body."
+                        ),
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
     return {
         "name": tool_name,
         "description": description,
@@ -239,8 +328,10 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
     }
 
 
-def _make_conn_handler(conn_id: str):
+def _make_conn_handler(conn_id: str, service: str = ""):
     def _handler(args: dict, **_kw) -> str:
+        if service in {"apple", "email"}:
+            return _special_call(conn_id, service, args or {})
         return _proxy_call(conn_id, args or {})
     return _handler
 
@@ -296,7 +387,7 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                     name=tool_name,
                     toolset=TOOLSET,
                     schema=schema,
-                    handler=_make_conn_handler(conn_id),
+                    handler=_make_conn_handler(conn_id, conn.get("service") or ""),
                     description=f"Vault-proxied access to {conn.get('service') or conn_id}",
                     emoji="🔐",
                 )

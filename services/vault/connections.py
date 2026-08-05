@@ -364,6 +364,10 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
         if not key:
             raise AuthInjectionError("No API key stored for this connection")
         params[auth.get("param_name") or "api_key"] = key
+    elif kind in {"apple", "email"}:
+        raise AuthInjectionError(
+            f"{kind} connections use their dedicated operation endpoint"
+        )
     else:
         raise AuthInjectionError(f"Unknown auth kind: {kind}")
     return {"headers": headers, "params": params}

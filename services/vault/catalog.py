@@ -148,6 +148,57 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /me/messages",
     },
+    "email": {
+        "label": "Email / iCloud Mail",
+        "auth": {"kind": "email"},
+        "base_url": "https://imap.mail.me.com",
+        "allowed_hosts": ["imap.mail.me.com", "smtp.mail.me.com"],
+        "fields": [
+            {"name": "base_url", "label": "IMAP/SMTP provider",
+             "placeholder": "imap.mail.me.com / smtp.mail.me.com", "required": False},
+        ],
+        "setup_help": (
+            "Enter the mailbox address as the Email address and an app-specific "
+            "password as the password. For iCloud Mail use imap.mail.me.com and "
+            "smtp.mail.me.com; modern iCloud Notes are only partially visible "
+            "through an IMAP Notes folder, if Apple exposes it."
+        ),
+        "example_call": "Use the email tool for folders, search, read, and send",
+    },
+    "apple": {
+        "label": "Apple iCloud (Calendar / Reminders / Contacts)",
+        "auth": {"kind": "apple"},
+        "base_url": "https://caldav.icloud.com",
+        "allowed_hosts": ["caldav.icloud.com", "contacts.icloud.com"],
+        "fields": [
+            {"name": "apple_id", "label": "Apple ID email",
+             "placeholder": "you@example.com", "required": True},
+        ],
+        "setup_help": (
+            "Use your Apple ID email and an app-specific password. Generate the "
+            "password at https://appleid.apple.com/ under Sign-In and Security → "
+            "App-Specific Passwords. The password is stored encrypted and is never "
+            "shown to agents."
+        ),
+        "example_call": "Use the Apple tool for calendar, reminders, and contacts",
+    },
+    "bluebubbles": {
+        "label": "BlueBubbles iMessage bridge",
+        "auth": {"kind": "header", "header_name": "password", "prefix": ""},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "BlueBubbles server URL",
+             "placeholder": "https://your-mac.example.com", "required": True},
+        ],
+        "setup_help": (
+            "Optional iMessage bridge. Install BlueBubbles on an always-on Mac, "
+            "enable its API, then enter the server URL and API password. iMessage "
+            "cannot work without a Mac bridge; the vault only proxies BlueBubbles "
+            "HTTP calls and never stores message history."
+        ),
+        "example_call": "GET /api/v1/health",
+    },
     "custom_oauth": {
         "label": "Custom (any OAuth app)",
         "auth": {"kind": "oauth2"},

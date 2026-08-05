@@ -77,3 +77,30 @@ vault.store("SENDGRID", "SG.xxxx", service="custom",
 
 OAuth services (Google, GitHub, Outlook) can only be added by the admin in
 the vault dashboard, because they require a browser login.
+
+## Apple iCloud, mail, and iMessage
+
+When the vault grants an `APPLE` connection, use its native `vault_apple`
+tool instead of the generic HTTP proxy. It supports:
+
+- `calendar_list`, `calendar_search`, `calendar_create`, `calendar_update`,
+  and `calendar_delete`
+- `reminders_list`, `reminders_create`, and `reminders_complete`
+- `contacts_search` and `contacts_read`
+
+Pass operation-specific values in the tool's `args` object. Searches accept
+`limit`; calendar searches can also accept iCalendar `start` and `end` values.
+Create operations accept `summary`, `description`, `location`, `start`/`end`
+or `due`. Update/delete/complete operations use the returned `href` and may
+use the returned `etag`. The vault performs CalDAV/CardDAV calls and keeps
+the Apple ID and app-specific password private.
+
+An `EMAIL` connection supports `folders`, `search`, `read`, and `send`. For
+iCloud Mail use the `imap.mail.me.com` / `smtp.mail.me.com` preset. The IMAP
+`Notes` folder is exposed read-only only when Apple provides it; modern
+iCloud Notes are not available through a public API, so do not promise full
+Notes support.
+
+If the owner has an always-on Mac running BlueBubbles, a `BLUEBUBBLES`
+connection can proxy its HTTP API for reading and sending iMessages. Without
+that Mac bridge, iMessage is not available to agents.

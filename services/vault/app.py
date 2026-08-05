@@ -28,7 +28,9 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from apple_ops import AppleOpsError, run_apple_operation
+from email_ops import EmailOpsError, run_email_operation
 
 from catalog import CATALOG, get_template
 from connections import (
@@ -324,6 +326,10 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
                 datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat() if exp else ""
             )
             view["has_client"] = bool(secrets_d.get("client_id"))
+        elif view["auth_kind"] == "apple":
+            view["connected"] = bool(secrets_d.get("apple_id") and secrets_d.get("app_password"))
+        elif view["auth_kind"] == "email":
+            view["connected"] = bool(secrets_d.get("email_address") and secrets_d.get("app_password"))
         else:
             view["connected"] = bool(secrets_d.get("api_key"))
     return view
@@ -538,6 +544,34 @@ async def add_service(request: Request):
             auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
+    elif auth["kind"] == "apple":
+        apple_id = (form.get("apple_id") or "").strip()
+        app_password = (form.get("app_password") or "").strip()
+        if not apple_id or not app_password:
+            return RedirectResponse(
+                url="/services?error=Apple+ID+and+app-specific+password+are+required",
+                status_code=303)
+        try:
+            await run_apple_operation(apple_id, app_password, "calendar_list", {})
+        except AppleOpsError as exc:
+            return RedirectResponse(
+                url=f"/services?error=Apple+connection+failed:+{str(exc)[:120].replace(' ', '+')}",
+                status_code=303)
+        secrets_d = {"apple_id": apple_id, "app_password": app_password}
+    elif auth["kind"] == "email":
+        email_address = (form.get("email_address") or "").strip()
+        app_password = (form.get("app_password") or "").strip()
+        if not email_address or not app_password:
+            return RedirectResponse(
+                url="/services?error=Email+address+and+app-specific+password+are+required",
+                status_code=303)
+        try:
+            await run_email_operation(email_address, app_password, "folders", {})
+        except (EmailOpsError, OSError) as exc:
+            return RedirectResponse(
+                url=f"/services?error=Email+connection+failed:+{str(exc)[:120].replace(' ', '+')}",
+                status_code=303)
+        secrets_d = {"email_address": email_address, "app_password": app_password}
     else:
         api_key = (form.get("api_key") or "").strip()
         if not api_key:
@@ -580,6 +614,20 @@ async def update_service(request: Request):
         secrets_d["client_id"] = client_id
     if client_secret:
         secrets_d["client_secret"] = client_secret
+    if (conn.get("auth") or {}).get("kind") == "apple":
+        apple_id = (form.get("apple_id") or "").strip()
+        app_password = (form.get("app_password") or "").strip()
+        if apple_id:
+            secrets_d["apple_id"] = apple_id
+        if app_password:
+            secrets_d["app_password"] = app_password
+    if (conn.get("auth") or {}).get("kind") == "email":
+        email_address = (form.get("email_address") or "").strip()
+        app_password = (form.get("app_password") or "").strip()
+        if email_address:
+            secrets_d["email_address"] = email_address
+        if app_password:
+            secrets_d["app_password"] = app_password
 
     auth = conn.get("auth")
     # Custom OAuth connections can update their endpoint config too.
@@ -824,6 +872,11 @@ async def get_skill_description(conn_id: str, request: Request):
     conn = store.get(cid)
     if not conn:
         raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") in {"apple", "email"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Use the connection's dedicated Apple or email operation tool",
+        )
     view = _conn_view(conn, include_secret_state=False)
     return {
         "key_name": cid,
@@ -985,6 +1038,60 @@ async def store_key(request: Request, key_data: KeyStoreRequest):
     audit_log(agent_name, conn_id, "connection_created_via_api", f"Service: {service}")
     return {"success": True, "key_name": conn_id, "connection": conn_id,
             "message": f"Connection '{conn_id}' stored successfully"}
+
+
+class AppleOperationRequest(BaseModel):
+    operation: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EmailOperationRequest(BaseModel):
+    operation: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/vault/apple/{conn_id}")
+async def apple_operation(conn_id: str, request: Request, body: AppleOperationRequest):
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "apple_denied", "No grant")
+        raise HTTPException(status_code=403, detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn or conn.get("service") != "apple":
+        raise HTTPException(status_code=404, detail="Apple connection not found")
+    secrets_d = store.get_secrets(cid)
+    try:
+        result = await run_apple_operation(
+            secrets_d.get("apple_id", ""), secrets_d.get("app_password", ""),
+            body.operation, body.args or {})
+    except AppleOpsError as exc:
+        audit_log(agent_name, cid, "apple_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=str(exc))
+    audit_log(agent_name, cid, "apple_operation", body.operation[:100])
+    return {"ok": True, "operation": body.operation, "result": result}
+
+
+@app.post("/api/vault/email/{conn_id}")
+async def email_operation(conn_id: str, request: Request, body: EmailOperationRequest):
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "email_denied", "No grant")
+        raise HTTPException(status_code=403, detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn or conn.get("service") != "email":
+        raise HTTPException(status_code=404, detail="Email connection not found")
+    secrets_d = store.get_secrets(cid)
+    try:
+        result = await run_email_operation(
+            secrets_d.get("email_address", ""), secrets_d.get("app_password", ""),
+            body.operation, body.args or {})
+    except (EmailOpsError, OSError) as exc:
+        audit_log(agent_name, cid, "email_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=str(exc))
+    audit_log(agent_name, cid, "email_operation", body.operation[:100])
+    return {"ok": True, "operation": body.operation, "result": result}
 
 
 # ---------------------------------------------------------------------------

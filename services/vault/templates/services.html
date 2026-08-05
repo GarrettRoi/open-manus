@@ -113,6 +113,26 @@
             <label>API key</label>
             <input type="password" name="api_key" placeholder="paste the key — agents will never see it">
         </div>
+        <div id="grp_apple" class="form-row" style="display:none;">
+            <div class="form-group">
+                <label>Apple ID email</label>
+                <input type="email" name="apple_id" placeholder="your Apple ID email">
+            </div>
+            <div class="form-group">
+                <label>App-specific password</label>
+                <input type="password" name="app_password" placeholder="Generate at appleid.apple.com">
+            </div>
+        </div>
+        <div id="grp_email" class="form-row" style="display:none;">
+            <div class="form-group">
+                <label>Mailbox email address</label>
+                <input type="email" name="email_address" placeholder="you@icloud.com">
+            </div>
+            <div class="form-group">
+                <label>App-specific password</label>
+                <input type="password" name="app_password" placeholder="Generate at appleid.apple.com">
+            </div>
+        </div>
 
         <div id="grp_custom_oauth" style="display:none;">
             <div class="form-row">
@@ -166,7 +186,7 @@
                 <tr>
                     <td><strong>{{ c.id }}</strong><br><span style="font-size: 12px; color: var(--text-muted);">{{ c.base_url }}</span></td>
                     <td>{{ c.label }}</td>
-                    <td><span class="badge badge-muted">{{ 'login' if c.auth_kind == 'oauth2' else 'API key' }}</span></td>
+                    <td><span class="badge badge-muted">{% if c.auth_kind == 'oauth2' %}login{% elif c.auth_kind == 'apple' %}Apple ID{% elif c.auth_kind == 'email' %}mailbox{% else %}API key{% endif %}</span></td>
                     <td>
                         {% if c.auth_kind == 'oauth2' %}
                             {% if c.connected %}
@@ -216,6 +236,26 @@
             <div class="form-group" id="e_grp_key">
                 <label>New API key (leave blank to keep current)</label>
                 <input type="password" name="api_key">
+            </div>
+            <div id="e_grp_apple" class="form-row" style="display:none;">
+                <div class="form-group">
+                    <label>Apple ID email (leave blank to keep)</label>
+                    <input type="email" name="apple_id">
+                </div>
+                <div class="form-group">
+                    <label>New app-specific password (leave blank to keep)</label>
+                    <input type="password" name="app_password">
+                </div>
+            </div>
+            <div id="e_grp_email" class="form-row" style="display:none;">
+                <div class="form-group">
+                    <label>Mailbox address (leave blank to keep)</label>
+                    <input type="email" name="email_address">
+                </div>
+                <div class="form-group">
+                    <label>New app-specific password (leave blank to keep)</label>
+                    <input type="password" name="app_password">
+                </div>
             </div>
             <div id="e_grp_custom_oauth" style="display:none;">
                 <div class="form-group">
@@ -271,6 +311,9 @@ function onServiceChange() {
     const isOAuth = tpl.auth.kind === 'oauth2';
     document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
     document.getElementById('grp_api_key').style.display = isOAuth ? 'none' : '';
+    document.getElementById('grp_apple').style.display = sid === 'apple' ? '' : 'none';
+    document.getElementById('grp_email').style.display = sid === 'email' ? '' : 'none';
+    if (sid === 'apple' || sid === 'email') document.getElementById('grp_api_key').style.display = 'none';
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
 
@@ -307,6 +350,9 @@ function openEdit(c) {
     document.getElementById('e_skill').value = c.skill_description || '';
     const isOAuth = c.auth_kind === 'oauth2';
     document.getElementById('e_grp_key').style.display = isOAuth ? 'none' : '';
+    document.getElementById('e_grp_apple').style.display = c.auth_kind === 'apple' ? '' : 'none';
+    document.getElementById('e_grp_email').style.display = c.auth_kind === 'email' ? '' : 'none';
+    if (c.auth_kind === 'apple' || c.auth_kind === 'email') document.getElementById('e_grp_key').style.display = 'none';
     document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
     const co = c.custom_oauth;
     document.getElementById('e_grp_custom_oauth').style.display = co ? '' : 'none';
