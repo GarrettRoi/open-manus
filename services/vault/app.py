@@ -16,7 +16,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -31,7 +30,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-import email_ops
 from catalog import CATALOG, get_template
 from connections import (
     PFX_GRANT,
@@ -43,8 +41,6 @@ from connections import (
 import oauth as oauth_mod
 from oauth import OAuthError
 import backup as vault_backup
-import replit_mcp as replit_mcp_mod
-from replit_mcp import ReplitMCPError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vault")
@@ -65,9 +61,6 @@ logger = logging.getLogger("vault")
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ADMIN_PASSWORD = os.getenv("VAULT_ADMIN_PASSWORD", "changeme")
-# Shared secret for the JSON admin API (used by the fleet dashboard).
-# Falls back to VAULT_ADMIN_PASSWORD unless that is still the default.
-ADMIN_API_TOKEN = os.getenv("VAULT_ADMIN_TOKEN", "").strip()
 VAULT_PORT = int(os.getenv("PORT", "8080"))
 # Public URL of this vault (Railway domain) — required for OAuth callbacks.
 PUBLIC_URL = (os.getenv("VAULT_PUBLIC_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
@@ -280,26 +273,6 @@ def verify_admin_session(request: Request) -> bool:
     return bool(session_id) and SESSION_TOKENS.get(session_id, 0) > time.time()
 
 
-def verify_admin_api(request: Request) -> bool:
-    """Admin auth for the JSON API: browser session OR shared-secret header.
-
-    The header token is ``VAULT_ADMIN_TOKEN`` when set; otherwise the admin
-    password is accepted — but never while it is still the insecure default.
-    """
-    if verify_admin_session(request):
-        return True
-    supplied = (request.headers.get("X-Vault-Admin-Token") or "").strip()
-    if not supplied:
-        return False
-    expected = ADMIN_API_TOKEN or (ADMIN_PASSWORD if ADMIN_PASSWORD != "changeme" else "")
-    return bool(expected) and secrets.compare_digest(supplied, expected)
-
-
-def require_admin_api(request: Request) -> None:
-    if not verify_admin_api(request):
-        raise HTTPException(status_code=401, detail="Admin auth required")
-
-
 def verify_agent_token(token: str) -> Optional[str]:
     token_h = hash_token(token)
     for agent_name in r.zrange(PFX_AGENT_INDEX, 0, -1):
@@ -342,19 +315,8 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             "token_url": conn_oauth.get("token_url", ""),
             "scopes": " ".join(conn_oauth.get("scopes") or []),
         }
-    # Public key is public by definition (client-side/publishable keys) —
-    # safe to show to admins AND agents; the secret key never leaves the vault.
-    _pk_secrets = store.get_secrets(conn["id"])
-    if _pk_secrets.get("public_key"):
-        view["public_key"] = _pk_secrets["public_key"]
     if include_secret_state:
-        secrets_d = _pk_secrets
-        if isinstance(secrets_d.get("extra_headers"), dict):
-            # names only — values may embed credentials
-            view["extra_header_names"] = sorted(secrets_d["extra_headers"].keys())
-        if view["auth_kind"] == "header":
-            view["auth_header_name"] = (conn.get("auth") or {}).get("header_name", "")
-            view["auth_prefix"] = (conn.get("auth") or {}).get("prefix", "")
+        secrets_d = store.get_secrets(conn["id"])
         if view["auth_kind"] == "oauth2":
             view["connected"] = bool(secrets_d.get("access_token"))
             exp = secrets_d.get("expires_at")
@@ -362,9 +324,6 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
                 datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat() if exp else ""
             )
             view["has_client"] = bool(secrets_d.get("client_id"))
-        elif view["auth_kind"] == "email":
-            view["connected"] = bool(secrets_d.get("password"))
-            view["email_address"] = secrets_d.get("username", "")
         else:
             view["connected"] = bool(secrets_d.get("api_key"))
     return view
@@ -523,117 +482,6 @@ def _validate_oauth_endpoint_url(label: str, url: str) -> str:
     return ""
 
 
-def _validate_mail_host(label: str, host: str) -> str:
-    """SSRF guard for admin-supplied IMAP/SMTP hostnames. Returns an error
-    message, or '' if the host is safe (public hostname, resolves to global
-    IPs only — no IP literals, loopback, private ranges, or metadata IPs)."""
-    import ipaddress
-    import socket
-    if not host:
-        return f"{label} server is required"
-    if any(c in host for c in "/@:?#[] \t"):
-        return f"{label} server must be a bare hostname (no URL, port, or path)"
-    try:
-        ipaddress.ip_address(host)
-        return f"{label} server must be a hostname, not an IP address"
-    except ValueError:
-        pass
-    if "." not in host or host.endswith(".internal") or host.endswith(".local"):
-        return f"{label} server must be a public hostname"
-    try:
-        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
-    except socket.gaierror:
-        return f"{label} server hostname does not resolve"
-    for addr in addrs:
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        if not ip.is_global:
-            return f"{label} server must not point at a private or internal address"
-    return ""
-
-
-def _parse_email_form(form) -> tuple:
-    """Validate email (IMAP/SMTP) connection fields. Returns (secrets, error)."""
-    username = (form.get("username") or "").strip()
-    password = (form.get("password") or form.get("api_key") or "").strip()
-    imap_host = (form.get("imap_host") or "").strip().lower()
-    smtp_host = (form.get("smtp_host") or "").strip().lower()
-    if not username or "@" not in username:
-        return None, "A valid email address is required"
-    if not password:
-        return None, "The mailbox password (or app password) is required"
-    if not imap_host or not smtp_host:
-        return None, "IMAP and SMTP server hostnames are required"
-    for label, host in (("IMAP", imap_host), ("SMTP", smtp_host)):
-        if (err := _validate_mail_host(label, host)):
-            return None, err
-    try:
-        imap_port = int(form.get("imap_port") or 993)
-        smtp_port = int(form.get("smtp_port") or 587)
-    except (TypeError, ValueError):
-        return None, "Ports must be numbers"
-    if not (0 < imap_port < 65536 and 0 < smtp_port < 65536):
-        return None, "Ports must be between 1 and 65535"
-    return {
-        "username": username,
-        "password": password,
-        "imap_host": imap_host,
-        "imap_port": str(imap_port),
-        "smtp_host": smtp_host,
-        "smtp_port": str(smtp_port),
-    }, ""
-
-
-_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-_FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
-                      "cookie", "upgrade", "te", "trailer",
-                      # the vault injects auth itself — extras may never carry
-                      # or override the credential header
-                      "authorization", "proxy-authorization"}
-
-
-def _parse_extra_headers(form) -> tuple:
-    """Extra static headers for custom API connections.
-
-    Accepts either repeated form fields (extra_header_name / extra_header_value
-    — from the dashboard's add-row UI) or an ``extra_headers`` object (JSON
-    admin API). Returns (dict | None, error). None means "not provided".
-    """
-    pairs: list = []
-    if hasattr(form, "getlist"):
-        names = form.getlist("extra_header_name")
-        values = form.getlist("extra_header_value")
-        pairs = list(zip(names, values))
-    raw = form.get("extra_headers") if hasattr(form, "get") else None
-    if raw is not None and not pairs:
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except ValueError:
-                return None, "extra_headers must be a JSON object"
-        if not isinstance(raw, dict):
-            return None, "extra_headers must be an object of header name -> value"
-        pairs = list(raw.items())
-    if not pairs:
-        return None, ""
-    headers: Dict[str, str] = {}
-    for name, value in pairs:
-        name = str(name or "").strip()
-        value = str(value or "").strip()
-        if not name and not value:
-            continue  # empty row from the UI
-        if not _HEADER_NAME_RE.match(name):
-            return None, f"Invalid header name: {name!r}"
-        if name.lower() in _FORBIDDEN_HEADERS:
-            return None, f"Header {name!r} cannot be overridden"
-        if len(value) > 4096:
-            return None, f"Header {name!r} value is too long"
-        headers[name] = value
-    return headers, ""
-
-
 def _parse_custom_oauth_form(form) -> tuple:
     """Validate custom-OAuth fields from a form. Returns (oauth_cfg, error)."""
     authorize_url = (form.get("authorize_url") or "").strip()
@@ -690,25 +538,11 @@ async def add_service(request: Request):
             auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
-    elif auth["kind"] == "email":
-        secrets_d, err = _parse_email_form(form)
-        if err:
-            return RedirectResponse(
-                url=f"/services?error={err.replace(' ', '+')}", status_code=303)
-        base_url = ""
     else:
         api_key = (form.get("api_key") or "").strip()
         if not api_key:
             return RedirectResponse(url="/services?error=API+key+required", status_code=303)
         secrets_d = {"api_key": api_key}
-        public_key = (form.get("public_key") or "").strip()
-        if public_key:
-            secrets_d["public_key"] = public_key
-        extra_headers, err = _parse_extra_headers(form)
-        if err:
-            return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
-        if extra_headers:
-            secrets_d["extra_headers"] = extra_headers
         if not base_url:
             return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
 
@@ -740,49 +574,6 @@ async def update_service(request: Request):
     api_key = (form.get("api_key") or "").strip()
     if api_key:
         secrets_d["api_key"] = api_key
-    public_key = (form.get("public_key") or "").strip()
-    if public_key:
-        secrets_d["public_key"] = public_key
-    extra_headers, hdr_err = _parse_extra_headers(form)
-    if hdr_err:
-        return RedirectResponse(
-            url=f"/services?error={hdr_err.replace(' ', '+')}", status_code=303)
-    if extra_headers is not None:
-        # any non-empty rows replace the whole set; a single row with name
-        # "-" and empty value clears all extra headers
-        if extra_headers == {"-": ""} or list(extra_headers.keys()) == ["-"]:
-            secrets_d.pop("extra_headers", None)
-        elif extra_headers:
-            secrets_d["extra_headers"] = extra_headers
-    # auth header name / prefix edits for header-kind (custom) connections
-    _auth0 = conn.get("auth") or {}
-    if _auth0.get("kind") == "header":
-        changed = False
-        _auth0 = dict(_auth0)
-        if (form.get("header_name") or "").strip():
-            _auth0["header_name"] = form.get("header_name").strip()
-            changed = True
-        if form.get("prefix") is not None and str(form.get("prefix")) != "":
-            _auth0["prefix"] = str(form.get("prefix"))
-            changed = True
-        if changed:
-            conn["auth"] = _auth0
-    if (conn.get("auth") or {}).get("kind") == "email":
-        for fld in ("username", "password", "imap_host", "imap_port",
-                    "smtp_host", "smtp_port"):
-            val = (form.get(fld) or "").strip()
-            if not val:
-                continue
-            if fld in ("imap_host", "smtp_host"):
-                val = val.lower()
-                if (err := _validate_mail_host(fld.split("_")[0].upper(), val)):
-                    return RedirectResponse(
-                        url=f"/services?error={err.replace(' ', '+')}",
-                        status_code=303)
-            if fld in ("imap_port", "smtp_port") and not val.isdigit():
-                return RedirectResponse(
-                    url="/services?error=Ports+must+be+numbers", status_code=303)
-            secrets_d[fld] = val
     client_id = (form.get("client_id") or "").strip()
     client_secret = (form.get("client_secret") or "").strip()
     if client_id:
@@ -861,27 +652,18 @@ async def oauth_connect(request: Request, conn_id: str):
 
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    # Auth model: the single-use, server-generated OAuth state token IS the
-    # authorization for this callback (it can only exist if an admin — via
-    # the vault UI or the token-authed dashboard API — started the flow).
-    # Requiring a vault session here would break dashboard-initiated logins.
-    has_session = verify_admin_session(request)
+    if not verify_admin_session(request):
+        return RedirectResponse(url="/login", status_code=303)
     if error:
-        if has_session:
-            return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
-        return HTMLResponse(f"<h3>OAuth denied: {error}</h3><p>You can close this tab.</p>", status_code=400)
+        return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
     pending = store.pop_oauth_state(state) if state else None
     if not pending or not code:
-        if has_session:
-            return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
-        return HTMLResponse("<h3>Invalid or expired OAuth state.</h3><p>Go back to the dashboard and click Connect again.</p>", status_code=400)
+        return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
 
     conn_id = pending["conn_id"]
     conn = store.get(conn_id)
     if not conn:
-        if has_session:
-            return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
-        return HTMLResponse("<h3>Connection no longer exists.</h3>", status_code=404)
+        return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
     secrets_d = store.get_secrets(conn_id)
     try:
         tokens = await oauth_mod.exchange_code(
@@ -895,12 +677,7 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
     store.set_secrets(conn_id, secrets_d)
     r.hset(f"vault:conn:{conn_id}", "status", "ready")
     audit_log("admin", conn_id, "oauth_connected", f"Service: {pending['service']}")
-    if has_session:
-        return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
-    return HTMLResponse(
-        "<h3>Connected successfully ✅</h3>"
-        "<p>This account is now stored in the vault. You can close this tab "
-        "and return to the dashboard.</p>")
+    return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -1023,22 +800,11 @@ async def list_connections(request: Request):
         view = _conn_view(conn, include_secret_state=False)
         view.pop("created_at", None)
         view.pop("updated_at", None)
-        if view.get("auth_kind") == "email":
-            view["how_to_call"] = (
-                f"POST {{vault}}/api/vault/email/{cid} with JSON "
-                '{"action": "folders|list|search|read|send|attachment", ...} — e.g. '
-                '{"action": "list", "limit": 10, "unseen_only": true}, '
-                '{"action": "search", "from": "john", "last_days": 20, '
-                '"has_attachment": true}, '
-                '{"action": "read", "uid": "..."}, or '
-                '{"action": "send", "to": "a@b.com", "subject": "...", "body": "..."}'
-            )
-        else:
-            view["how_to_call"] = (
-                f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
-                '{"method": "GET|POST|...", "path": "/...", "params": {...}, '
-                '"json": {...}, "headers": {...}}'
-            )
+        view["how_to_call"] = (
+            f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
+            '{"method": "GET|POST|...", "path": "/...", "params": {...}, '
+            '"json": {...}, "headers": {...}}'
+        )
         available.append(view)
     # Agents' background tool-sync polls this every few minutes; keep those
     # out of the audit trail so real activity stays visible.
@@ -1248,16 +1014,6 @@ async def proxy_request(conn_id: str, request: Request):
     if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
         raise HTTPException(status_code=400, detail=f"Unsupported method: {method}")
 
-    if (conn.get("auth") or {}).get("kind") == "email":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"'{cid}' is an email (IMAP/SMTP) connection — use "
-                f"POST /api/vault/email/{cid} with "
-                '{"action": "folders|list|read|send", ...} instead of the HTTP proxy.'
-            ),
-        )
-
     path = str(body.get("path") or "/")
     base_url = (conn.get("base_url") or "").rstrip("/")
     if not base_url:
@@ -1289,9 +1045,6 @@ async def proxy_request(conn_id: str, request: Request):
     # Everything actually injected upstream must be scrubbed from responses —
     # including a freshly-refreshed OAuth token that isn't in secrets_d yet.
     scrub_values = [v for v in secrets_d.values() if isinstance(v, str)]
-    if isinstance(secrets_d.get("extra_headers"), dict):
-        scrub_values.extend(
-            str(v) for v in secrets_d["extra_headers"].values() if v)
     try:
         if auth_kind == "oauth2":
             access_token, _ = await oauth_mod.get_valid_access_token(
@@ -1354,342 +1107,9 @@ async def proxy_request(conn_id: str, request: Request):
     return JSONResponse(result, status_code=200)
 
 
-@app.post("/api/vault/email/{conn_id}")
-async def email_request(conn_id: str, request: Request):
-    """IMAP/SMTP actions for email-kind connections (agents never see the
-    password — the vault talks to the mail servers itself).
-
-    Body: {"action": "folders" | "list" | "read" | "send", ...}
-    """
-    agent_name = require_agent(request)
-    cid = normalize_id(conn_id)
-
-    if not store.has_grant(agent_name, cid):
-        audit_log(agent_name, cid, "email_denied", "No grant")
-        raise HTTPException(status_code=403,
-                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
-    conn = store.get(cid)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
-    if (conn.get("auth") or {}).get("kind") != "email":
-        raise HTTPException(
-            status_code=409,
-            detail=f"'{cid}' is not an email connection — use the HTTP proxy instead.")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Body must be JSON")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
-    action = str(body.get("action") or "").strip().lower()
-
-    secrets_d = store.get_secrets(cid)
-    if not secrets_d.get("password"):
-        raise HTTPException(status_code=409,
-                            detail="No mailbox password stored — fix this connection in the dashboard")
-
-    import asyncio
-    try:
-        result = await asyncio.to_thread(email_ops.run_action, action, secrets_d, body)
-    except email_ops.EmailOpError as exc:
-        audit_log(agent_name, cid, f"email_{action or 'unknown'}_error", str(exc)[:200])
-        raise HTTPException(status_code=502, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Email action failed for %s", cid)
-        audit_log(agent_name, cid, f"email_{action or 'unknown'}_error", str(exc)[:200])
-        raise HTTPException(status_code=502, detail=f"Email operation failed: {exc}")
-
-    detail = {"list": f"folder={body.get('folder') or 'INBOX'}",
-              "search": ("filters=" + ",".join(sorted(
-                  k for k in ("from", "to", "cc", "subject", "text", "query",
-                              "since", "before", "last_days", "unseen",
-                              "unseen_only", "flagged", "has_attachment",
-                              "attachment_name", "min_size_kb", "max_size_kb")
-                  if body.get(k) not in (None, "", False)))),
-              "read": f"uid={body.get('uid')}",
-              "attachment": f"uid={body.get('uid')} file={body.get('filename') or body.get('index')}",
-              "send": f"to={result.get('to')}"}.get(action, "")
-    audit_log(agent_name, cid, f"email_{action}", detail)
-    # Belt-and-braces scrub (the password should never appear in results).
-    pw = secrets_d.get("password", "")
-    text = json.dumps(result, ensure_ascii=False, default=str)
-    if pw and len(pw) >= 8 and pw in text:
-        text = text.replace(pw, "***vault***")
-        result = json.loads(text)
-    return JSONResponse(result, status_code=200)
-
-
 # ---------------------------------------------------------------------------
 # Health & startup
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# JSON admin API — used by the fleet dashboard (Lexi) to manage connections
-# and grants remotely. Auth: admin session cookie OR X-Vault-Admin-Token.
-# ---------------------------------------------------------------------------
-@app.get("/api/admin/overview")
-async def admin_overview(request: Request):
-    require_admin_api(request)
-    conns = [(_conn_view(c)) for cid in store.list_ids() if (c := store.get(cid))]
-    grants = {
-        agent: [cid for cid in store.list_ids() if store.has_grant(agent, cid)]
-        for agent in AGENT_NAMES
-    }
-    catalog_view = {
-        key: {
-            "label": tpl.get("label", key),
-            "auth_kind": tpl["auth"]["kind"],
-            "setup_help": tpl.get("setup_help", ""),
-            "fields": tpl.get("fields", []),
-            "base_url": tpl.get("base_url", ""),
-            "scopes": (tpl.get("oauth") or {}).get("scopes", []),
-        }
-        for key, tpl in CATALOG.items()
-    }
-    return {
-        "connections": conns,
-        "agents": AGENT_NAMES,
-        "grants": grants,
-        "catalog": catalog_view,
-        "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL) if PUBLIC_URL else "",
-        "public_url_missing": not PUBLIC_URL,
-    }
-
-
-def _form_like(body: Dict[str, Any]):
-    """Adapter so JSON bodies flow through the same form-parsing helpers."""
-    class _D(dict):
-        def get(self, k, d=None):
-            v = super().get(k, d)
-            return v if v is None else str(v)
-    return _D(body or {})
-
-
-@app.post("/api/admin/connections")
-async def admin_add_connection(request: Request):
-    require_admin_api(request)
-    _require_json_content_type(request)
-    body = await request.json()
-    form = _form_like(body)
-
-    service = (form.get("service") or "custom").strip().lower()
-    tpl = get_template(service)
-    if not tpl:
-        raise HTTPException(status_code=400, detail="Unknown service")
-    name = form.get("name") or service
-    conn_id = normalize_id(name)
-    if not conn_id:
-        raise HTTPException(status_code=400, detail="Name required")
-    if store.get(conn_id):
-        raise HTTPException(status_code=409, detail=f"A connection named '{conn_id}' already exists")
-
-    auth = dict(tpl["auth"])
-    base_url = (form.get("base_url") or tpl.get("base_url") or "").strip()
-    if auth["kind"] == "header":
-        if form.get("header_name"):
-            auth["header_name"] = form.get("header_name").strip()
-        if form.get("prefix") is not None and service == "custom":
-            auth["prefix"] = form.get("prefix")
-
-    secrets_d: Dict[str, Any] = {}
-    status = "ready"
-    if auth["kind"] == "oauth2":
-        client_id = (form.get("client_id") or "").strip()
-        client_secret = (form.get("client_secret") or "").strip()
-        if not client_id or not client_secret:
-            raise HTTPException(status_code=400,
-                                detail="Client ID and secret are required for OAuth services")
-        if tpl.get("custom_oauth"):
-            oauth_cfg, err = _parse_custom_oauth_form(form)
-            if err:
-                raise HTTPException(status_code=400, detail=err)
-            if not base_url:
-                raise HTTPException(status_code=400, detail="Base URL required")
-            auth["oauth"] = oauth_cfg
-        secrets_d = {"client_id": client_id, "client_secret": client_secret}
-        status = "needs_login"
-    elif auth["kind"] == "email":
-        secrets_d, err = _parse_email_form(form)
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        base_url = ""
-    else:
-        api_key = (form.get("api_key") or "").strip()
-        if not api_key:
-            raise HTTPException(status_code=400, detail="API key required")
-        if not base_url:
-            raise HTTPException(status_code=400, detail="Base URL required")
-        secrets_d = {"api_key": api_key}
-        public_key = (form.get("public_key") or "").strip()
-        if public_key:
-            secrets_d["public_key"] = public_key
-        extra_headers, hdr_err = _parse_extra_headers(body)
-        if hdr_err:
-            raise HTTPException(status_code=400, detail=hdr_err)
-        if extra_headers:
-            secrets_d["extra_headers"] = extra_headers
-
-    store.save(
-        conn_id, service=service, label=form.get("label") or tpl["label"],
-        base_url=base_url, auth=auth, secrets=secrets_d,
-        description=form.get("description") or "",
-        skill_description=form.get("skill_description") or "",
-        status=status,
-    )
-    audit_log("admin", conn_id, "connection_created", f"Service: {service} (via dashboard)")
-
-    # Optional immediate grants for one or more agents.
-    for agent in (body.get("grant_agents") or []):
-        if agent in AGENT_NAMES:
-            store.set_grant(agent, conn_id, True)
-            audit_log("admin", conn_id, "grant_added", f"Granted to {agent} (via dashboard)")
-
-    conn = store.get(conn_id)
-    return {"connection": _conn_view(conn), "needs_login": status == "needs_login"}
-
-
-@app.post("/api/admin/connections/{conn_id}/delete")
-async def admin_delete_connection(conn_id: str, request: Request):
-    require_admin_api(request)
-    cid = normalize_id(conn_id)
-    if not store.get(cid):
-        raise HTTPException(status_code=404, detail="Connection not found")
-    store.delete(cid, AGENT_NAMES)
-    audit_log("admin", cid, "connection_deleted", "(via dashboard)")
-    return {"ok": True}
-
-
-@app.post("/api/admin/connections/{conn_id}/connect-link")
-async def admin_connect_link(conn_id: str, request: Request):
-    """Return a provider authorize URL for an OAuth connection.
-
-    The dashboard opens this URL in the user's browser; the callback is
-    validated by the single-use OAuth state, so no vault session is needed.
-    """
-    require_admin_api(request)
-    conn = store.get(normalize_id(conn_id))
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found")
-    if (conn.get("auth") or {}).get("kind") != "oauth2":
-        raise HTTPException(status_code=400, detail="Not an OAuth service")
-    if not PUBLIC_URL:
-        raise HTTPException(status_code=503,
-                            detail="Set VAULT_PUBLIC_URL on the vault service to enable OAuth logins")
-    secrets_d = store.get_secrets(conn["id"])
-    if not secrets_d.get("client_id"):
-        raise HTTPException(status_code=400, detail="Add the OAuth client ID first")
-    try:
-        url = oauth_mod.build_authorize_url(
-            conn["service"], conn["id"], secrets_d["client_id"], PUBLIC_URL, store,
-            conn=conn)
-    except OAuthError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"url": url, "redirect_uri": oauth_mod.redirect_uri(PUBLIC_URL)}
-
-
-@app.post("/api/admin/grants")
-async def admin_set_grant(request: Request):
-    require_admin_api(request)
-    _require_json_content_type(request)
-    body = await request.json()
-    agent = (body.get("agent") or "").strip().lower()
-    cid = normalize_id(body.get("conn_id") or "")
-    granted = bool(body.get("granted"))
-    if agent not in AGENT_NAMES:
-        raise HTTPException(status_code=400, detail="Unknown agent")
-    if not store.get(cid):
-        raise HTTPException(status_code=404, detail="Connection not found")
-    if store.set_grant(agent, cid, granted):
-        audit_log("admin", cid,
-                  "grant_added" if granted else "grant_removed",
-                  f"{'Granted to' if granted else 'Revoked from'} {agent} (via dashboard)")
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
-# Replit MCP bridge — approve a dev request in Discord and a Replit Agent
-# run starts automatically on the Open Manus project.
-# ---------------------------------------------------------------------------
-replit_mcp = replit_mcp_mod.ReplitMCP(r, encrypt_value, decrypt_value, PUBLIC_URL)
-
-
-@app.get("/api/admin/replit-mcp/status")
-async def replit_mcp_status(request: Request):
-    require_admin_api(request)
-    return {"connected": replit_mcp.connected(),
-            "target_repl": replit_mcp.target_repl(),
-            "redirect_uri": replit_mcp.redirect_uri}
-
-
-@app.get("/admin/replit-mcp/connect")
-async def replit_mcp_connect(request: Request):
-    """Browser entry point: redirects the logged-in admin to Replit's
-    OAuth consent screen. One-time setup for the auto-dispatch bridge."""
-    if not verify_admin_api(request):
-        return RedirectResponse(url="/login?next=/admin/replit-mcp/connect",
-                                status_code=303)
-    try:
-        url = await replit_mcp.build_authorize_url()
-    except ReplitMCPError as exc:
-        return HTMLResponse(f"<h3>Could not start Replit login</h3><p>{exc}</p>",
-                            status_code=502)
-    return RedirectResponse(url=url, status_code=303)
-
-
-@app.get("/oauth/replit-mcp/callback")
-async def replit_mcp_callback(code: str = "", state: str = "", error: str = ""):
-    # Like /oauth/callback: the single-use server-generated state token IS
-    # the authorization (it only exists if an admin started the flow).
-    # No request-controlled text is ever reflected into the HTML.
-    import html as _html
-    if error:
-        # Consume the state (if any) so the link can't be replayed, then show
-        # a fixed message — the provider's error text is only logged.
-        if state:
-            replit_mcp._consume_pkce_state(state)
-        logger.warning("Replit MCP OAuth denied: %s", error[:200])
-        return HTMLResponse("<h3>Replit login was denied or cancelled.</h3>"
-                            "<p>You can close this tab and try again from the "
-                            "dashboard.</p>", status_code=400)
-    if not code or not state:
-        return HTMLResponse("<h3>Missing code/state.</h3>", status_code=400)
-    try:
-        await replit_mcp.handle_callback(code, state)
-    except ReplitMCPError as exc:
-        audit_log("admin", "REPLIT_MCP", "replit_mcp_connect_failed", str(exc)[:200])
-        return HTMLResponse("<h3>Replit connection failed</h3><p>"
-                            f"{_html.escape(str(exc)[:300])}</p>",
-                            status_code=502)
-    audit_log("admin", "REPLIT_MCP", "replit_mcp_connected", "")
-    return HTMLResponse(
-        "<h3>Replit connected ✅</h3>"
-        "<p>Approved dev requests will now start Replit Agent runs "
-        "automatically. You can close this tab.</p>")
-
-
-@app.post("/api/admin/replit-mcp/dispatch/{req_id}")
-async def replit_mcp_dispatch(req_id: str, request: Request):
-    """Manually (re-)queue an approved dev request for dispatch."""
-    require_admin_api(request)
-    rid = re.sub(r"[^0-9A-Za-z_-]", "", req_id)[:32]
-    raw = r.get(f"devreq:item:{rid}") if rid else None
-    if not raw:
-        raise HTTPException(status_code=404, detail=f"Dev request '{rid}' not found")
-    try:
-        item = json.loads(raw)
-    except ValueError:
-        raise HTTPException(status_code=500, detail="Corrupt request record")
-    # Only owner-approved requests may be dispatched — the Discord approval
-    # is the trust boundary; this endpoint is retry-only.
-    if item.get("status") != "approved":
-        raise HTTPException(status_code=409,
-                            detail=f"Request '{rid}' is {item.get('status')!r}, "
-                                   "not approved — approve it in Discord first")
-    r.lpush(replit_mcp_mod.DISPATCH_QUEUE, rid)
-    audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
-    return {"ok": True, "queued": rid}
-
-
 @app.get("/health")
 async def health():
     try:
@@ -1711,8 +1131,6 @@ async def startup():
     # Nightly backups of all vault:* keys to local disk (Railway volume).
     import asyncio
     asyncio.create_task(vault_backup.backup_loop(r))
-    # Auto-dispatch approved dev requests to Replit Agent (MCP bridge).
-    asyncio.create_task(replit_mcp_mod.dispatch_loop(replit_mcp))
 
 
 # ---------------------------------------------------------------------------

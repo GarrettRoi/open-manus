@@ -29,7 +29,6 @@ import logging
 import os
 import re
 import threading
-import time
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -240,260 +239,7 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
     }
 
 
-def _email_call(conn_id: str, args: dict) -> str:
-    """Execute an email (IMAP/SMTP) action through the vault."""
-    action_map = {
-        "list_folders": "folders",
-        "list_messages": "list",
-        "search_messages": "search",
-        "search": "search",
-        "read_message": "read",
-        "send": "send",
-        "download_attachment": "attachment",
-    }
-    action = str(args.get("action") or "list_messages")
-    payload: Dict[str, Any] = {"action": action_map.get(action, action)}
-    for key in ("folder", "limit", "unseen_only", "uid", "to", "cc", "bcc",
-                "subject", "body", "reply_to", "in_reply_to", "filename",
-                "index", "from", "text", "query", "since", "before",
-                "last_days", "unseen", "flagged", "has_attachment",
-                "attachment_name", "min_size_kb", "max_size_kb"):
-        val = args.get(key)
-        if val not in (None, "", []):
-            payload[key] = val
-    # booleans that are meaningful as False too (e.g. has_attachment: false)
-    for key in ("unseen", "has_attachment"):
-        if args.get(key) is False:
-            payload[key] = False
-    try:
-        resp = _vault_http("POST", f"/api/vault/email/{conn_id}", payload,
-                           timeout=120)
-        if payload["action"] == "attachment" and isinstance(resp, dict):
-            return _save_email_attachment(resp, args)
-        return json.dumps(resp, ensure_ascii=False, default=str)
-    except HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode() if e.fp else ""
-        except Exception:
-            pass
-        try:
-            detail = json.loads(body).get("detail", body)
-        except Exception:
-            detail = body
-        return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
-    except URLError as e:
-        return json.dumps({
-            "error": f"Cannot reach vault at {VAULT_URL}: {e.reason}. "
-                     "The vault service may be restarting — try again shortly.",
-        })
-    except Exception as e:
-        return json.dumps({"error": f"Email action failed: {e}"})
-
-
-def _save_email_attachment(resp: Dict[str, Any], args: dict) -> str:
-    """Decode a vault attachment response and write the file locally.
-
-    Returns JSON with the saved path so the agent can open/manipulate it.
-    """
-    import base64
-    import re as _re
-
-    att = resp.get("attachment") or {}
-    b64 = att.get("content_b64")
-    if not b64:
-        return json.dumps(resp, ensure_ascii=False, default=str)
-
-    # Sanitize the filename: basename only, printable chars, no traversal.
-    raw_name = str(att.get("filename") or "attachment.bin")
-    name = os.path.basename(raw_name.replace("\\", "/"))
-    name = _re.sub(r"[^\w.\- ()\[\]]", "_", name).strip(". ") or "attachment.bin"
-
-    save_dir = str(args.get("save_dir") or "").strip()
-    if save_dir:
-        save_dir = os.path.realpath(os.path.expanduser(save_dir))
-        home = os.path.realpath(os.path.expanduser("~"))
-        if not (save_dir == home or save_dir.startswith(home + os.sep)
-                or save_dir.startswith("/tmp/")):
-            save_dir = ""  # outside allowed roots — fall back to Downloads
-    if not save_dir:
-        save_dir = os.path.expanduser("~/Downloads")
-    os.makedirs(save_dir, exist_ok=True)
-
-    data = base64.b64decode(b64)
-    # Exclusive-create with a retrying suffix: never clobber an earlier
-    # download, even for same-second or concurrent saves.
-    stem, ext = os.path.splitext(name)
-    path = os.path.join(save_dir, name)
-    for attempt in range(1, 1000):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            break
-        except FileExistsError:
-            path = os.path.join(save_dir, f"{stem}_{attempt}{ext}")
-    else:
-        return json.dumps({"error": "Could not find a free filename to save the attachment."})
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-    return json.dumps({
-        "saved": True,
-        "path": path,
-        "filename": att.get("filename"),
-        "content_type": att.get("content_type"),
-        "size": len(data),
-        "note": "File saved locally — you can now read, process, or re-send it.",
-    }, ensure_ascii=False)
-
-
-def _build_email_schema(conn: dict, tool_name: str) -> dict:
-    conn_id = conn["id"]
-    label = conn.get("label") or conn_id
-    address = conn.get("email_address") or ""
-    desc = (
-        f"Use the {label} mailbox"
-        + (f" ({address})" if address else "")
-        + " through the secure vault (classic IMAP/SMTP — the vault logs in "
-          "server-side; you never see the password). Actions: "
-          "search_messages — powerful search combining any of: from, to, cc, "
-          "subject, text keywords, since/before dates or last_days, unseen, "
-          "flagged, size, has_attachment, attachment_name (substring or * "
-          "wildcard). Use minimal criteria, e.g. {from: 'john', last_days: "
-          "20} or {attachment_name: 'contract', has_attachment: true}. "
-          "Also: list_messages (newest first), read_message (uid), "
-          "download_attachment (uid + filename or index — saves the file to "
-          "~/Downloads), send (to, subject, body, cc, bcc), list_folders."
-    )
-    for field in ("description", "skill_description"):
-        text = (conn.get(field) or "").strip()
-        if text:
-            desc += "\n" + text
-    if len(desc) > 2000:
-        desc = desc[:2000] + "…"
-    return {
-        "name": tool_name,
-        "description": desc,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["search_messages", "list_messages",
-                             "read_message", "send", "list_folders",
-                             "download_attachment"],
-                },
-                "from": {
-                    "type": "string",
-                    "description": "Sender name or address contains this (search).",
-                },
-                "to": {
-                    "type": "string",
-                    "description": "Recipient filter (search) OR recipient "
-                                   "address(es), comma-separated (send).",
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Keywords to find in the message headers "
-                                   "and body (search).",
-                },
-                "since": {
-                    "type": "string",
-                    "description": "Only messages on/after this date, "
-                                   "YYYY-MM-DD (search).",
-                },
-                "before": {
-                    "type": "string",
-                    "description": "Only messages before this date, "
-                                   "YYYY-MM-DD (search).",
-                },
-                "last_days": {
-                    "type": "integer",
-                    "description": "Shortcut: only messages from the last N "
-                                   "days (search).",
-                },
-                "unseen": {
-                    "type": "boolean",
-                    "description": "true = unread only, false = read only "
-                                   "(search).",
-                },
-                "flagged": {
-                    "type": "boolean",
-                    "description": "Only flagged/starred messages (search).",
-                },
-                "has_attachment": {
-                    "type": "boolean",
-                    "description": "true = only messages with attachments, "
-                                   "false = only without (search).",
-                },
-                "attachment_name": {
-                    "type": "string",
-                    "description": "Attachment filename filter — substring "
-                                   "or * wildcard, e.g. 'contract' or "
-                                   "'*.pdf' (search).",
-                },
-                "min_size_kb": {
-                    "type": "number",
-                    "description": "Only messages larger than this many KB "
-                                   "(search).",
-                },
-                "max_size_kb": {
-                    "type": "number",
-                    "description": "Only messages smaller than this many KB "
-                                   "(search).",
-                },
-                "folder": {
-                    "type": "string",
-                    "description": "Mailbox folder (default INBOX).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max messages to list (default 10, max 50).",
-                },
-                "unseen_only": {
-                    "type": "boolean",
-                    "description": "List only unread messages.",
-                },
-                "uid": {
-                    "type": "string",
-                    "description": "Message uid (from list_messages) to read "
-                                   "or download an attachment from.",
-                },
-                "filename": {
-                    "type": "string",
-                    "description": "Attachment filename (from read_message) "
-                                   "to download.",
-                },
-                "index": {
-                    "type": "integer",
-                    "description": "0-based attachment index (alternative to "
-                                   "filename).",
-                },
-                "save_dir": {
-                    "type": "string",
-                    "description": "Directory to save the attachment "
-                                   "(default ~/Downloads).",
-                },
-                "cc": {"type": "string",
-                       "description": "CC filter (search) or CC recipients (send)."},
-                "bcc": {"type": "string", "description": "BCC recipients (send)."},
-                "subject": {"type": "string",
-                            "description": "Subject filter (search) or subject line (send)."},
-                "body": {"type": "string", "description": "Plain-text body (send)."},
-                "reply_to": {
-                    "type": "string",
-                    "description": "Reply-To address (send, optional).",
-                },
-            },
-            "required": ["action"],
-        },
-    }
-
-
-def _make_conn_handler(conn_id: str, auth_kind: str = ""):
-    if auth_kind == "email":
-        def _email_handler(args: dict, **_kw) -> str:
-            return _email_call(conn_id, args or {})
-        return _email_handler
-
+def _make_conn_handler(conn_id: str):
     def _handler(args: dict, **_kw) -> str:
         return _proxy_call(conn_id, args or {})
     return _handler
@@ -537,11 +283,7 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                 )
                 continue
             claimed[tool_name] = conn_id
-            auth_kind = str(conn.get("auth_kind") or "")
-            if auth_kind == "email":
-                schema = _build_email_schema(conn, tool_name)
-            else:
-                schema = _build_conn_schema(conn, tool_name)
+            schema = _build_conn_schema(conn, tool_name)
             existing = registry.get_entry(tool_name)
             if conn_id in _registered and existing is not None:
                 if existing.schema == schema:
@@ -554,7 +296,7 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                     name=tool_name,
                     toolset=TOOLSET,
                     schema=schema,
-                    handler=_make_conn_handler(conn_id, auth_kind),
+                    handler=_make_conn_handler(conn_id),
                     description=f"Vault-proxied access to {conn.get('service') or conn_id}",
                     emoji="🔐",
                 )

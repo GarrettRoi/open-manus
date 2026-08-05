@@ -69,17 +69,6 @@ if [ -n "$REDIS_URL" ]; then
     python3 /app/skills/hive_mind/workspace_sync.py --action restore --agent "${AGENT_NAME}" || true
 fi
 
-# ============================================================
-# RUNTIME SETTINGS RESTORE
-# Re-applies Redis-persisted runtime settings (voice character,
-# /voicehome channel) on top of the freshly-baked config files —
-# these are changed via slash commands and must survive redeploys.
-# ============================================================
-if [ -n "$REDIS_URL" ]; then
-    echo "[entrypoint] Applying persisted runtime settings for ${AGENT_NAME}..."
-    python3 /app/skills/hive_mind/apply_agent_settings.py --agent "${AGENT_NAME}" || true
-fi
-
 # Start background memory auto-save (every 5 minutes)
 if [ -n "$REDIS_URL" ]; then
     echo "[entrypoint] Starting background memory auto-save..."

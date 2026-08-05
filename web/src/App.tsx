@@ -34,7 +34,6 @@ import {
   Globe,
   Heart,
   KeyRound,
-  Link2,
   Menu,
   MessageSquare,
   Package,
@@ -91,7 +90,6 @@ import PluginsPage from "@/pages/PluginsPage";
 import McpPage from "@/pages/McpPage";
 import PairingPage from "@/pages/PairingPage";
 import ChannelsPage from "@/pages/ChannelsPage";
-import AccountsPage from "@/pages/AccountsPage";
 import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
@@ -148,7 +146,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/mcp": McpPage,
   "/pairing": PairingPage,
   "/channels": ChannelsPage,
-  "/accounts": AccountsPage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
   "/profiles": ProfilesPage,
@@ -193,7 +190,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
   { path: "/mcp", label: "MCP", icon: Plug },
   { path: "/channels", label: "Channels", icon: Radio },
-  { path: "/accounts", label: "Accounts", icon: Link2 },
   { path: "/webhooks", label: "Webhooks", icon: Webhook },
   { path: "/pairing", label: "Pairing", icon: ShieldCheck },
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
@@ -545,7 +541,6 @@ export default function App() {
       )}
 
       <PluginSlot name="header-banner" />
-      <AgentTabs />
       <ProfileScopeBanner />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14 lg:pt-0">
@@ -812,56 +807,6 @@ export default function App() {
 function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
   const { profile } = useProfileScope();
   return <div key={profile || "__own__"} className="contents">{children}</div>;
-}
-
-/**
- * Fleet agent tabs — one tab per agent profile, rendered as a horizontal
- * strip above the page content. Clicking a tab scopes every management
- * page (Config, Keys, Accounts, Skills…) to that agent, exactly like the
- * sidebar ProfileSwitcher, but with the always-visible "one dashboard,
- * one tab per agent" ergonomics the fleet operator asked for. Deep links
- * work via the existing `?profile=agent-<name>` projection.
- */
-function AgentTabs() {
-  const { profile, currentProfile, profiles, setProfile } = useProfileScope();
-  if (profiles.length < 2) return null;
-
-  const active = profile || currentProfile;
-  const display = (name: string) => name.replace(/^agent-/, "");
-  // Stable order: the dashboard's own profile first, then alphabetical.
-  const ordered = [...profiles].sort((a, b) => {
-    if (a === currentProfile) return -1;
-    if (b === currentProfile) return 1;
-    return display(a).localeCompare(display(b));
-  });
-
-  return (
-    <div
-      className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-current/10 bg-background-base px-3 py-1.5"
-      role="tablist"
-      aria-label="Agents"
-    >
-      {ordered.map((name) => {
-        const isActive = name === active;
-        return (
-          <button
-            key={name}
-            role="tab"
-            aria-selected={isActive}
-            onClick={() => setProfile(name === currentProfile ? "" : name)}
-            className={cn(
-              "shrink-0 rounded px-3 py-1 font-sans text-xs capitalize transition-colors",
-              isActive
-                ? "bg-midground/15 font-semibold text-midground"
-                : "text-text-secondary hover:bg-midground/5 hover:text-midground",
-            )}
-          >
-            {display(name)}
-          </button>
-        );
-      })}
-    </div>
-  );
 }
 
 function SidebarNavLink({

@@ -12525,10 +12525,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
-        # Let the adapter keep the bot in voice while the linked session still
-        # has work in flight (running agent turn / background tool processes).
-        if hasattr(adapter, "_voice_busy_checker"):
-            adapter._voice_busy_checker = self._voice_session_busy
 
         try:
             success = await adapter.join_voice_channel(voice_channel)
@@ -12619,8 +12615,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
-        if hasattr(adapter, "_voice_busy_checker"):
-            adapter._voice_busy_checker = self._voice_session_busy
 
         try:
             success = await adapter.join_voice_channel(voice_channel)
@@ -12675,39 +12669,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
         return "Left voice channel."
-
-    def _voice_session_busy(self, chat_id: str) -> bool:
-        """True while any session tied to this Discord chat still has work in
-        flight: a running (or queued) agent turn, or an active background tool
-        process. Used by the Discord adapter's voice linger logic so the bot
-        stays in voice until everything the session started has finished.
-
-        Session keys embed the chat_id (see gateway.session.build_session_key),
-        so a substring match covers per-user group sessions and threads under
-        the same channel.
-        """
-        cid = str(chat_id or "").strip()
-        if not cid:
-            return False
-
-        def _matches(session_key: str) -> bool:
-            # Exact segment match — session keys are colon-delimited and embed
-            # the raw chat_id as its own segment. A plain substring check
-            # would false-positive when one Discord ID is a substring of
-            # another (channel vs user/thread IDs).
-            return cid in session_key.split(":")
-
-        try:
-            for session_key in list(self._running_agents.keys()):
-                if _matches(session_key):
-                    return True
-            from tools.process_registry import process_registry
-            for session_key in process_registry.active_session_keys():
-                if _matches(session_key):
-                    return True
-        except Exception as e:
-            logger.debug("voice busy check failed for chat %s: %s", chat_id, e)
-        return False
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
         """Called by the adapter when a voice channel times out.

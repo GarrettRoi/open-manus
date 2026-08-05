@@ -4408,27 +4408,6 @@ def run_conversation(
                         logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
                 
                 # Validate tool call names - detect model hallucinations
-                # Live vault-tool discovery: an unknown vault_* tool usually
-                # means a connection was granted after this agent's tool
-                # snapshot was built (grants sync every few minutes). Pull the
-                # vault list NOW, register any new vault tools, and rebuild
-                # the snapshot so the call succeeds without a redeploy.
-                if any(
-                    tc.function.name not in agent.valid_tool_names
-                    and (tc.function.name or "").startswith("vault_")
-                    for tc in assistant_message.tool_calls
-                ):
-                    try:
-                        from tools.vault_tools import _sync_connection_tools
-                        from tools.mcp_tool import refresh_agent_mcp_tools
-                        if _sync_connection_tools() is not None:
-                            newly = refresh_agent_mcp_tools(agent)
-                            if newly and not agent.quiet_mode:
-                                agent._vprint(
-                                    f"{agent.log_prefix}🔐 Vault tools re-synced "
-                                    f"live: added {', '.join(sorted(newly))}")
-                    except Exception:
-                        logging.debug("Live vault tool resync failed", exc_info=True)
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
@@ -4489,17 +4468,6 @@ def run_conversation(
                                     "not re-emit it as a tool call. To call a "
                                     "tool, use a valid name from your tool list; "
                                     "otherwise reply in plain text."
-                                )
-                            elif _tc_name.startswith("vault_"):
-                                content = (
-                                    f"Tool '{_tc_name}' does not exist (even "
-                                    "after a live vault re-sync). Call "
-                                    "vault(action='list') to see your granted "
-                                    "connections and their exact tool names — "
-                                    "you may not have been granted this "
-                                    "connection; use vault(action="
-                                    "'request_access') to ask for it. "
-                                    f"Available tools: {available}"
                                 )
                             else:
                                 content = f"Tool '{_tc_name}' does not exist. Available tools: {available}"
