@@ -1,0 +1,9 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "hIiUseBKe2E6uT-m1_EP8"
+uri = "file://GOOGLE_WORKSPACE_VAULT_SKILL.md"
+type = "text"
+title = "Google Workspace Vault Skill"
+description = "Copyable Markdown skill instructions for agents using Gmail, Drive, Sheets, Docs, Slides, Forms, Tasks, Chat, People, and Calendar through the secure vault."
