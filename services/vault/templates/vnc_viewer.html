@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ label }} — Desktop Viewer</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#111;color:#eee;font-family:system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+  #toolbar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#1a1a2e;border-bottom:1px solid #333;flex-shrink:0;flex-wrap:wrap}
+  #toolbar h1{font-size:15px;font-weight:600;color:#a78bfa;margin-right:auto}
+  .btn{padding:5px 12px;border-radius:6px;border:1px solid #555;background:#222;color:#ddd;font-size:13px;cursor:pointer;transition:background .15s}
+  .btn:hover{background:#333}
+  .btn.danger{border-color:#7f1d1d;color:#fca5a5}
+  .btn.danger:hover{background:#7f1d1d}
+  #status{font-size:12px;padding:3px 10px;border-radius:10px;background:#374151;color:#9ca3af}
+  #status.connected{background:#064e3b;color:#6ee7b7}
+  #status.error{background:#7f1d1d;color:#fca5a5}
+  #screen-wrap{flex:1;overflow:hidden;position:relative;background:#000}
+  #screen{width:100%;height:100%}
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(0,0,0,.85)}
+  #overlay p{font-size:14px;color:#9ca3af;text-align:center;max-width:380px}
+  #overlay.hidden{display:none}
+  #fallback{padding:16px 20px;border-top:1px solid #333;font-size:13px;color:#6b7280;flex-shrink:0}
+  #fallback a{color:#a78bfa}
+  kbd{background:#2d2d2d;border:1px solid #555;border-radius:3px;padding:1px 5px;font-size:12px}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>🖥️ {{ label }}</h1>
+  <span id="status">Connecting…</span>
+  <button class="btn" onclick="sendCtrlAltDel()">Send Ctrl+Alt+Del</button>
+  <button class="btn" onclick="toggleClip()">Clipboard sync</button>
+  <button class="btn" onclick="rfb && rfb.scaleViewport ? (rfb.scaleViewport=!rfb.scaleViewport) : null">Toggle scale</button>
+  <button class="btn danger" onclick="disconnect()">Disconnect</button>
+</div>
+
+<div id="screen-wrap">
+  <div id="screen"></div>
+  <div id="overlay">
+    <div style="font-size:48px">🖥️</div>
+    <p id="overlay-msg">Connecting to <strong>{{ label }}</strong> desktop…</p>
+    <div id="spinner" style="width:28px;height:28px;border:3px solid #374151;border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+  </div>
+</div>
+
+<div id="fallback">
+  Can't connect?
+  VNC viewer apps: <a href="https://apps.apple.com/app/jump-desktop/id364876095" target="_blank">Jump Desktop (Mac/iOS)</a> ·
+  <a href="https://www.realvnc.com/en/connect/download/viewer/" target="_blank">RealVNC Viewer</a> ·
+  <a href="https://tigervnc.org/" target="_blank">TigerVNC</a>.
+  Connect to <kbd>{{ vnc_host }}</kbd> : <kbd>{{ vnc_port }}</kbd>.
+  &nbsp;·&nbsp; <a href="/services" target="_blank">Vault dashboard</a>
+</div>
+
+<style>
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+
+<script type="module">
+const WS_URL = "{{ ws_url }}";
+const VNC_PASSWORD = "{{ vnc_password }}";
+
+let rfb = null;
+const screen = document.getElementById("screen");
+const overlay = document.getElementById("overlay");
+const statusEl = document.getElementById("status");
+const overlayMsg = document.getElementById("overlay-msg");
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
+}
+
+function showOverlay(msg) {
+  overlayMsg.textContent = msg;
+  overlay.classList.remove("hidden");
+}
+
+function hideOverlay() {
+  overlay.classList.add("hidden");
+}
+
+async function connect() {
+  try {
+    const { default: RFB } = await import(
+      "https://cdn.jsdelivr.net/npm/@novnc/novnc@1.4.0/core/rfb.js"
+    );
+    rfb = new RFB(screen, WS_URL, {
+      credentials: { password: VNC_PASSWORD },
+      wsProtocols: ["binary", "base64"],
+    });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+
+    rfb.addEventListener("connect", () => {
+      setStatus("Connected", "connected");
+      hideOverlay();
+    });
+    rfb.addEventListener("disconnect", e => {
+      const clean = e.detail?.clean;
+      setStatus(clean ? "Disconnected" : "Connection lost", "error");
+      showOverlay(clean ? "Session ended." : "Connection lost — check the VNC proxy.");
+    });
+    rfb.addEventListener("credentialsrequired", () => {
+      rfb.sendCredentials({ password: VNC_PASSWORD });
+    });
+    rfb.addEventListener("securityfailure", () => {
+      setStatus("Auth failed", "error");
+      showOverlay("VNC authentication failed. Check the VNC password in the vault.");
+    });
+  } catch (err) {
+    setStatus("Load error", "error");
+    showOverlay("Could not load noVNC: " + err.message +
+      "\n\nTry a native VNC client with the connection details below.");
+  }
+}
+
+function sendCtrlAltDel() { rfb?.sendCtrlAltDel(); }
+
+function disconnect() {
+  rfb?.disconnect();
+  rfb = null;
+  setStatus("Disconnected");
+  showOverlay("Disconnected. Refresh to reconnect.");
+}
+
+let clipOpen = false;
+function toggleClip() {
+  if (!rfb) return;
+  const text = clipOpen ? null : prompt("Paste text to send to the Mac clipboard:");
+  if (text !== null) rfb.clipboardPasteFrom(text);
+  clipOpen = !clipOpen;
+}
+
+connect();
+</script>
+</body>
+</html>

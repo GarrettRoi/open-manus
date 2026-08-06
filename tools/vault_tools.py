@@ -231,6 +231,38 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
     if len(description) > 2000:
         description = description[:2000] + "…"
 
+    if service == "macincloud":
+        return {
+            "name": tool_name,
+            "description": description + (
+                "\nOperations: screenshot (capture desktop → returns image_b64), "
+                "run_command (shell cmd, returns output), open_browser (url), "
+                "applescript (script), list_apps, key_combo (keys e.g. 'command+c'), "
+                "type_text (text), focus_app (app name). "
+                "Credentials stay in the vault — agents never see them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["screenshot", "run_command", "open_browser",
+                                 "applescript", "list_apps", "key_combo",
+                                 "type_text", "focus_app"],
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation arguments. run_command: {command, allow_shell_ops, timeout}. "
+                            "open_browser: {url, app}. applescript: {script, allow_shell}. "
+                            "key_combo: {keys}. type_text: {text}. focus_app: {app}. "
+                            "screenshot: {cursor (bool)}."
+                        ),
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
     if service == "apple":
         return {
             "name": tool_name,
@@ -681,6 +713,10 @@ def _make_conn_handler(conn_id: str, auth_kind: str = "", service: str = ""):
         def _apple_handler(args: dict, **_kw) -> str:
             return _special_call(conn_id, "apple", args or {})
         return _apple_handler
+    if service == "macincloud" or auth_kind == "macincloud":
+        def _mac_handler(args: dict, **_kw) -> str:
+            return _special_call(conn_id, "mac", args or {})
+        return _mac_handler
 
     def _handler(args: dict, **_kw) -> str:
         if service in {"apple", "email"}:

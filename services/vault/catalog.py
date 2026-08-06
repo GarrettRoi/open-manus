@@ -218,6 +218,30 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /whatever/the/api/offers",
     },
+    "macincloud": {
+        "label": "MACinCloud (Mac desktop via SSH/VNC)",
+        "auth": {"kind": "macincloud"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "ssh_host", "label": "Hostname / IP",
+             "placeholder": "mXXX.macincloud.com or 1.2.3.4", "required": True},
+            {"name": "ssh_user", "label": "SSH username",
+             "placeholder": "your MACinCloud username", "required": True},
+            {"name": "vnc_port", "label": "VNC port",
+             "placeholder": "5900", "required": False},
+            {"name": "ssh_port", "label": "SSH port",
+             "placeholder": "22", "required": False},
+        ],
+        "setup_help": (
+            "Store your MACinCloud VM credentials. SSH username and password are used for "
+            "programmatic control (screenshots, commands, browser). VNC password is used "
+            "for the interactive desktop viewer (/vnc page). "
+            "Find your hostname in the MACinCloud dashboard (e.g. m100.macincloud.com). "
+            "All credentials are stored encrypted and agents never see them."
+        ),
+        "example_call": "Use the Mac tool for screenshot, open_browser, run_command, applescript",
+    },
     "email": {
         "label": "Email (IMAP/SMTP)",
         "auth": {"kind": "email"},

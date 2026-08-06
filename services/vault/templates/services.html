@@ -137,6 +137,39 @@
             </div>
         </div>
 
+        <div id="grp_mac" style="display:none;">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Hostname / IP</label>
+                    <input type="text" name="ssh_host" placeholder="mXXX.macincloud.com or 1.2.3.4">
+                </div>
+                <div class="form-group">
+                    <label>SSH username</label>
+                    <input type="text" name="ssh_user" placeholder="your MACinCloud username">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>SSH password</label>
+                    <input type="password" name="ssh_password" placeholder="agents will never see this">
+                </div>
+                <div class="form-group">
+                    <label>VNC password (for desktop viewer)</label>
+                    <input type="password" name="vnc_password" placeholder="VNC password (may differ from SSH)">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>SSH port (default 22)</label>
+                    <input type="text" name="ssh_port" placeholder="22" value="22">
+                </div>
+                <div class="form-group">
+                    <label>VNC port (default 5900)</label>
+                    <input type="text" name="vnc_port" placeholder="5900" value="5900">
+                </div>
+            </div>
+        </div>
+
         <div id="grp_email" style="display:none;">
             <div class="form-row">
                 <div class="form-group">
@@ -283,7 +316,43 @@
                     <input type="password" name="apple_app_password">
                 </div>
             </div>
-            
+
+            <div id="e_grp_mac" style="display:none;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Hostname / IP (leave blank to keep)</label>
+                        <input type="text" name="ssh_host" id="e_ssh_host" placeholder="mXXX.macincloud.com">
+                    </div>
+                    <div class="form-group">
+                        <label>SSH username (leave blank to keep)</label>
+                        <input type="text" name="ssh_user" id="e_ssh_user">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>New SSH password (leave blank to keep)</label>
+                        <input type="password" name="ssh_password">
+                    </div>
+                    <div class="form-group">
+                        <label>New VNC password (leave blank to keep)</label>
+                        <input type="password" name="vnc_password">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>SSH port</label>
+                        <input type="text" name="ssh_port" id="e_ssh_port" placeholder="22">
+                    </div>
+                    <div class="form-group">
+                        <label>VNC port</label>
+                        <input type="text" name="vnc_port" id="e_vnc_port" placeholder="5900">
+                    </div>
+                </div>
+                <p style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    🖥️ <a href="/vnc/{{ '{' }}{{ '}' }}" id="e_vnc_link" target="_blank">Open desktop viewer</a>
+                </p>
+            </div>
+
             <div id="e_grp_header" style="display:none;">
                 <div class="form-row">
                     <div class="form-group">
@@ -390,9 +459,11 @@ function onServiceChange() {
     const isEmail = tpl.auth.kind === 'email';
     document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
     document.getElementById('grp_api_key').style.display = (isOAuth || isEmail) ? 'none' : '';
+    const isMac = sid === 'macincloud';
     document.getElementById('grp_apple').style.display = sid === 'apple' ? '' : 'none';
+    document.getElementById('grp_mac').style.display = isMac ? '' : 'none';
     document.getElementById('grp_email').style.display = isEmail ? '' : 'none';
-    if (sid === 'apple') document.getElementById('grp_api_key').style.display = 'none';
+    if (sid === 'apple' || isMac) document.getElementById('grp_api_key').style.display = 'none';
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
 
@@ -401,7 +472,7 @@ function onServiceChange() {
     document.getElementById('grp_custom_oauth').style.display = isCustomOAuth ? '' : 'none';
 
     // base URL field: needed when template has no default
-    const needsBase = !tpl.base_url && !isEmail && (!isOAuth || isCustomOAuth);
+    const needsBase = !tpl.base_url && !isEmail && !isMac && (!isOAuth || isCustomOAuth);
     document.getElementById('grp_base_url').style.display = needsBase ? '' : 'none';
     const fields = tpl.fields || [];
     const baseField = fields.find(f => f.name === 'base_url');
@@ -457,9 +528,19 @@ function openEdit(c) {
     const isEmail = c.auth_kind === 'email';
     const isHeader = c.auth_kind === 'header';
     const isApple = c.auth_kind === 'apple';
-    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple) ? 'none' : '';
+    const isMac = c.auth_kind === 'macincloud';
+    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac) ? 'none' : '';
     document.getElementById('e_grp_apple').style.display = isApple ? '' : 'none';
+    document.getElementById('e_grp_mac').style.display = isMac ? '' : 'none';
     document.getElementById('e_grp_email').style.display = isEmail ? '' : 'none';
+    if (isMac) {
+        document.getElementById('e_ssh_host').value = c.ssh_host || '';
+        document.getElementById('e_ssh_user').value = c.ssh_user || '';
+        document.getElementById('e_ssh_port').value = c.ssh_port || '22';
+        document.getElementById('e_vnc_port').value = c.vnc_port || '5900';
+        const vlink = document.getElementById('e_vnc_link');
+        if (vlink) vlink.href = '/vnc/' + c.id;
+    }
     document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
     document.getElementById('e_grp_header').style.display = isHeader ? '' : 'none';
     document.getElementById('e_public_key').value = '';

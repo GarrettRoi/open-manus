@@ -26,7 +26,7 @@ import httpx
 import redis
 import uvicorn
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -34,6 +34,7 @@ from apple_ops import AppleOpsError, run_apple_operation
 
 import email_ops
 import google_ops
+import mac_ops
 from catalog import CATALOG, get_template
 from connections import (
     PFX_GRANT,
@@ -366,6 +367,13 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             view["has_client"] = bool(secrets_d.get("client_id"))
         elif view["auth_kind"] == "apple":
             view["connected"] = bool(secrets_d.get("apple_id") and secrets_d.get("app_password"))
+        elif view["auth_kind"] == "macincloud":
+            view["connected"] = bool(secrets_d.get("ssh_host") and secrets_d.get("ssh_password"))
+            # Expose non-secret fields to the edit form JS (ssh_host, user, ports)
+            view["ssh_host"] = secrets_d.get("ssh_host", "")
+            view["ssh_user"] = secrets_d.get("ssh_user", "")
+            view["ssh_port"] = secrets_d.get("ssh_port", "22")
+            view["vnc_port"] = secrets_d.get("vnc_port", "5900")
         elif view["auth_kind"] == "email":
             view["connected"] = bool(secrets_d.get("password"))
             view["email_address"] = secrets_d.get("username", "")
@@ -713,6 +721,22 @@ async def add_service(request: Request):
                 url=f"/services?error=Apple+connection+failed:+{str(exc)[:120].replace(' ', '+')}",
                 status_code=303)
         secrets_d = {"apple_id": apple_id, "app_password": app_password}
+    elif auth["kind"] == "macincloud":
+        ssh_host = (form.get("ssh_host") or "").strip()
+        ssh_user = (form.get("ssh_user") or "").strip()
+        ssh_password = (form.get("ssh_password") or "").strip()
+        vnc_password = (form.get("vnc_password") or "").strip()
+        if not ssh_host or not ssh_user or not ssh_password:
+            return RedirectResponse(
+                url="/services?error=Hostname,+username,+and+SSH+password+are+required",
+                status_code=303)
+        secrets_d = {
+            "ssh_host": ssh_host, "ssh_user": ssh_user, "ssh_password": ssh_password,
+            "ssh_port": (form.get("ssh_port") or "22").strip() or "22",
+            "vnc_password": vnc_password,
+            "vnc_port": (form.get("vnc_port") or "5900").strip() or "5900",
+        }
+        base_url = ""
     elif auth["kind"] == "email":
         secrets_d, err = _parse_email_form(form)
         if err:
@@ -826,6 +850,15 @@ async def update_service(request: Request):
             secrets_d["apple_id"] = apple_id
         if app_password:
             secrets_d["app_password"] = app_password
+    if (conn.get("auth") or {}).get("kind") == "macincloud":
+        for fld in ("ssh_host", "ssh_user", "ssh_port", "vnc_port"):
+            val = (form.get(fld) or "").strip()
+            if val:
+                secrets_d[fld] = val
+        for secret_fld in ("ssh_password", "vnc_password"):
+            val = (form.get(secret_fld) or "").strip()
+            if val:
+                secrets_d[secret_fld] = val
     if (conn.get("auth") or {}).get("kind") == "email":
         email_address = (form.get("email_address") or "").strip()
         app_password = (form.get("email_app_password") or "").strip()
@@ -1302,6 +1335,134 @@ async def apple_operation(conn_id: str, request: Request, body: AppleOperationRe
     return {"ok": True, "operation": body.operation, "result": result}
 
 
+class MacOperationRequest(BaseModel):
+    operation: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/vault/mac/{conn_id}")
+async def mac_operation(conn_id: str, request: Request, body: MacOperationRequest):
+    """SSH/AppleScript operations for MACinCloud connections.
+
+    Body: {"operation": "screenshot|run_command|open_browser|applescript|list_apps|key_combo|type_text|focus_app",
+           "args": {...}}
+    Credentials stay in the vault — agents never see them.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "mac_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "macincloud":
+        raise HTTPException(status_code=409,
+                            detail=f"'{cid}' is not a MACinCloud connection.")
+    secrets_d = store.get_secrets(cid)
+    try:
+        result = await mac_ops.run_mac_operation(secrets_d, body.operation, body.args or {})
+    except mac_ops.MacOpsError as exc:
+        audit_log(agent_name, cid, "mac_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=str(exc))
+    audit_log(agent_name, cid, "mac_operation", body.operation[:100])
+    return {"ok": True, "operation": body.operation, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# noVNC desktop viewer (admin-only browser page + WebSocket VNC proxy)
+# ---------------------------------------------------------------------------
+
+@app.get("/vnc/{conn_id}")
+async def vnc_viewer(conn_id: str, request: Request):
+    """Serve the interactive noVNC desktop viewer for a MACinCloud connection."""
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    cid = normalize_id(conn_id)
+    conn = store.get(cid)
+    if not conn or (conn.get("auth") or {}).get("kind") != "macincloud":
+        raise HTTPException(status_code=404, detail="MACinCloud connection not found")
+    secrets_d = store.get_secrets(cid)
+    label = conn.get("label") or cid
+    vnc_host = secrets_d.get("ssh_host") or ""
+    vnc_port = secrets_d.get("vnc_port") or "5900"
+    vnc_password = secrets_d.get("vnc_password") or ""
+
+    # WebSocket VNC proxy endpoint (same vault, same host)
+    base = str(request.base_url).rstrip("/")
+    ws_url = base.replace("https://", "wss://").replace("http://", "ws://")
+    ws_url = f"{ws_url}/vnc-ws/{cid}"
+
+    templates = _get_templates()
+    return templates.TemplateResponse("vnc_viewer.html", {
+        "request": request,
+        "label": label,
+        "vnc_host": vnc_host,
+        "vnc_port": vnc_port,
+        "vnc_password": vnc_password,
+        "ws_url": ws_url,
+        "conn_id": cid,
+    })
+
+
+@app.websocket("/vnc-ws/{conn_id}")
+async def vnc_websocket_proxy(conn_id: str, websocket: WebSocket):
+    """WebSocket → TCP VNC relay (websockify-lite) for the noVNC viewer."""
+    from fastapi import WebSocket as _WS  # already imported above
+    import asyncio as _asyncio
+
+    cid = normalize_id(conn_id)
+    conn = store.get(cid)
+    if not conn or (conn.get("auth") or {}).get("kind") != "macincloud":
+        await websocket.close(code=4004)
+        return
+    secrets_d = store.get_secrets(cid)
+    vnc_host = (secrets_d.get("ssh_host") or "").strip()
+    vnc_port = int(secrets_d.get("vnc_port") or 5900)
+    if not vnc_host:
+        await websocket.close(code=4004)
+        return
+
+    await websocket.accept(subprotocol="binary")
+    try:
+        reader, writer = await _asyncio.open_connection(vnc_host, vnc_port)
+    except (OSError, ConnectionRefusedError) as exc:
+        await websocket.close(code=4011)
+        return
+
+    async def ws_to_tcp():
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            writer.close()
+
+    async def tcp_to_ws():
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                await websocket.send_bytes(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    await _asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 class GoogleOperationRequest(BaseModel):
     product: str
     operation: str
@@ -1686,6 +1847,21 @@ async def admin_add_connection(request: Request):
             auth["oauth"] = oauth_cfg
         secrets_d = {"client_id": client_id, "client_secret": client_secret}
         status = "needs_login"
+    elif auth["kind"] == "macincloud":
+        ssh_host = (body.get("ssh_host") or "").strip()
+        ssh_user = (body.get("ssh_user") or "").strip()
+        ssh_password = (body.get("ssh_password") or "").strip()
+        vnc_password = (body.get("vnc_password") or "").strip()
+        if not ssh_host or not ssh_user or not ssh_password:
+            raise HTTPException(status_code=400,
+                                detail="ssh_host, ssh_user, and ssh_password are required")
+        secrets_d = {
+            "ssh_host": ssh_host, "ssh_user": ssh_user, "ssh_password": ssh_password,
+            "ssh_port": (body.get("ssh_port") or "22") or "22",
+            "vnc_password": vnc_password,
+            "vnc_port": (body.get("vnc_port") or "5900") or "5900",
+        }
+        base_url = ""
     elif auth["kind"] == "email":
         secrets_d, err = _parse_email_form(form)
         if err:

@@ -382,6 +382,13 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
             "the HTTP proxy. Call POST /api/vault/email/{connection} instead "
             '(e.g. {"action": "list"} or {"action": "send", ...}).'
         )
+    elif kind == "macincloud":
+        raise AuthInjectionError(
+            "This is a MACinCloud (Mac desktop) connection — it cannot be used with "
+            "the HTTP proxy. Call POST /api/vault/mac/{connection} instead "
+            '(e.g. {"operation": "screenshot"} or {"operation": "run_command", "args": {"command": "..."}}). '
+            "Visit /vnc/{connection} for the interactive desktop viewer."
+        )
     else:
         raise AuthInjectionError(f"Unknown auth kind: {kind}")
 
