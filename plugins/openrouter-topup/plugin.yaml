@@ -1,0 +1,5 @@
+name: openrouter-topup
+version: 1.0.0
+description: "/topup slash command: shows the live OpenRouter credit balance (via the account-level key, no agent involved) and a direct checkout link to buy more credits."
+author: "local"
+hooks: []
