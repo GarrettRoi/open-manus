@@ -16,7 +16,8 @@ from __future__ import annotations
 import base64
 from email.message import EmailMessage
 from typing import Any, Dict, List
-from urllib.parse import quote
+import re as _re
+from urllib.parse import quote, unquote
 
 
 class GoogleOpsError(Exception):
@@ -51,14 +52,23 @@ def _need(args: Dict[str, Any], *keys: str) -> List[Any]:
     return out
 
 
+_SAFE_ID = _re.compile(r"^[A-Za-z0-9@_=-]+(\.[A-Za-z0-9@_=-]+)*$")
+
+
 def _seg(value: Any, label: str) -> str:
     """URL-encode a single path segment; refuse separators/traversal."""
     s = str(value).strip()
     if not s:
         raise GoogleOpsError(f"'{label}' is required")
-    if "/" in s and not (s.startswith("spaces/") or s.startswith("people/")):
-        raise GoogleOpsError(f"'{label}' must not contain '/'")
-    return quote(s, safe="/" if ("/" in s) else "")
+    if s.startswith(("spaces/", "people/")):
+        prefix, _, rest = s.partition("/")
+        if not _SAFE_ID.match(rest):
+            raise GoogleOpsError(
+                f"'{label}' must be exactly '{prefix}/<id>' with a plain id")
+        return f"{prefix}/{quote(rest, safe='')}"
+    if "/" in s or "%" in s or ".." in s:
+        raise GoogleOpsError(f"'{label}' must be a plain identifier")
+    return quote(s, safe="")
 
 
 def _limit(args: Dict[str, Any], default: int = 25, cap: int = 100) -> int:
@@ -87,8 +97,21 @@ def _raw_request(product: str, args: Dict[str, Any]) -> Dict[str, Any]:
     path = str(path)
     if not path.startswith("/"):
         path = "/" + path
-    if ".." in path or "//" in path:
+    # Canonicalize before any prefix decision: repeatedly percent-decode so
+    # encoded traversal (%2e%2e, double-encoding) cannot smuggle dot segments
+    # past the product pinning, then reject dot segments and empty segments.
+    decoded = path
+    for _ in range(5):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    segments = decoded.split("/")
+    if any(seg in {".", ".."} for seg in segments) or "//" in decoded or "\\" in decoded:
         raise GoogleOpsError("Invalid path")
+    if path != decoded:
+        # No percent-encoding tricks in raw paths — require literal paths.
+        raise GoogleOpsError("Percent-encoded characters are not allowed in 'path'")
     if not path.startswith(info["prefix"].rstrip("/")):
         raise GoogleOpsError(
             f"For the {product} tool, 'path' must start with {info['prefix']}")

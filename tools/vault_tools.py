@@ -649,7 +649,7 @@ def _build_google_schema(conn: dict, tool_name: str, product: str) -> dict:
             f"json) pinned to the {product} API for anything not listed. "
             "Pass operation-specific values inside `args`."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "operation": {
@@ -715,49 +715,69 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
         # this sync so two connection ids that normalize to the same tool
         # name (e.g. "MY-API" and "MY_API") can't overwrite each other's
         # handler or cause the wrong tool to be deregistered on revoke.
+        # One shared claim namespace covers base tools AND google suite
+        # tools so e.g. connection "FOO_SHEETS"'s base tool can't collide
+        # silently with connection "FOO"'s vault_foo_sheets suite tool.
         claimed = {name: cid for cid, name in _registered.items()
                    if cid in seen}
+        for cid, names in _registered_suite.items():
+            if cid in seen:
+                for name in names:
+                    claimed.setdefault(name, cid)
         for conn_id, conn in sorted(seen.items()):
             tool_name = _tool_name_for(conn_id)
-            owner = claimed.get(tool_name)
-            if owner is not None and owner != conn_id:
+            auth_kind = str(conn.get("auth_kind") or "")
+            is_google = ((conn.get("service") or "").lower() == "google"
+                         and auth_kind == "oauth2")
+            wanted_names = [tool_name]
+            if is_google:
+                wanted_names += [f"{tool_name}_{p}" for p in GOOGLE_PRODUCTS]
+            collision = next(
+                (n for n in wanted_names
+                 if claimed.get(n) not in (None, conn_id)), None)
+            if collision:
                 logger.warning(
                     "Vault tool name collision: connections %r and %r both "
-                    "normalize to tool %r — skipping %r. Rename one "
-                    "connection in the vault dashboard.",
-                    owner, conn_id, tool_name, conn_id,
+                    "claim tool %r — skipping %r. Rename one connection in "
+                    "the vault dashboard.",
+                    claimed[collision], conn_id, collision, conn_id,
                 )
                 continue
-            claimed[tool_name] = conn_id
-            auth_kind = str(conn.get("auth_kind") or "")
+            for n in wanted_names:
+                claimed[n] = conn_id
+
             if auth_kind == "email":
                 schema = _build_email_schema(conn, tool_name)
             else:
                 schema = _build_conn_schema(conn, tool_name)
             existing = registry.get_entry(tool_name)
-            if conn_id in _registered and existing is not None:
-                if existing.schema == schema:
-                    continue
-                updated += 1
+            base_ok = True
+            if (conn_id in _registered and existing is not None
+                    and existing.schema == schema):
+                pass  # base tool unchanged
             else:
-                added += 1
-            try:
-                registry.register(
-                    name=tool_name,
-                    toolset=TOOLSET,
-                    schema=schema,
-                    handler=_make_conn_handler(conn_id, auth_kind, conn.get("service") or ""),
-                    description=f"Vault-proxied access to {conn.get('service') or conn_id}",
-                    emoji="🔐",
-                )
-                _registered[conn_id] = tool_name
-            except Exception:
-                logger.exception("Failed to register vault tool for %s", conn_id)
-                continue
+                if conn_id in _registered and existing is not None:
+                    updated += 1
+                else:
+                    added += 1
+                try:
+                    registry.register(
+                        name=tool_name,
+                        toolset=TOOLSET,
+                        schema=schema,
+                        handler=_make_conn_handler(conn_id, auth_kind, conn.get("service") or ""),
+                        description=f"Vault-proxied access to {conn.get('service') or conn_id}",
+                        emoji="🔐",
+                    )
+                    _registered[conn_id] = tool_name
+                except Exception:
+                    logger.exception("Failed to register vault tool for %s", conn_id)
+                    base_ok = False
 
-            # Google connections additionally get one dedicated tool per
-            # Workspace product (vault_<name>_sheets, _gmail, _tasks, ...).
-            if (conn.get("service") or "").lower() == "google" and auth_kind == "oauth2":
+            # Google suite tools are reconciled on EVERY sync — independent
+            # of whether the base tool changed — so failed registrations are
+            # retried and auth-kind changes drop stale product tools.
+            if is_google and base_ok:
                 suite: List[str] = []
                 for product in GOOGLE_PRODUCTS:
                     pname = f"{tool_name}_{product}"
@@ -785,13 +805,14 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                         logger.exception(
                             "Failed to register google %s tool for %s", product, conn_id)
                 _registered_suite[conn_id] = suite
-            elif conn_id in _registered_suite:
+            elif not is_google and conn_id in _registered_suite:
                 # No longer a google oauth connection — drop stale suite tools.
                 for name in _registered_suite.pop(conn_id):
                     try:
                         registry.deregister(name)
                     except Exception:
                         logger.exception("Failed to deregister stale tool %s", name)
+                    removed += 1
 
     if added or removed or updated:
         logger.info(
