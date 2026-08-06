@@ -4867,7 +4867,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Native commands above are registered first and are the highest
         # priority, so they always survive the 100-command cap. Reserve one
         # slot for the consolidated ``/skill`` group registered further below.
-        slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
+        slot_cap = _DISCORD_MAX_APP_COMMANDS - 2  # -1 for /skill, -1 for /vault
         dropped_over_cap = 0
         try:
             from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
@@ -4945,6 +4945,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
         self._register_skill_group(tree)
+
+        # Register /vault owner-only admin group (1 top-level slot).
+        try:
+            self._register_vault_group(tree)
+        except Exception as _vault_reg_err:
+            logger.warning(
+                "[Discord] /vault group registration failed: %s", _vault_reg_err
+            )
 
         if dropped_over_cap:
             # Staying under the cap keeps the whole sync succeeding; without
@@ -5144,6 +5152,213 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
+
+    def _register_vault_group(self, tree) -> None:
+        """Register the ``/vault`` command group for owner-only vault management.
+
+        All subcommands route through ``handle_vault_*`` functions in
+        ``vault_ui.py``.  Nothing is routed through ``_handle_message``,
+        ``_build_slash_event``, or ``MessageEvent`` — vault interactions call
+        the vault admin JSON API directly.
+
+        Authorization uses the same fail-closed owner check as
+        ``_vault_owner_gate``: only the user whose Discord ID matches
+        ``DISCORD_OWNER_ID`` (or the hardcoded fallback) may see autocomplete
+        suggestions.  ``_evaluate_slash_authorization`` is intentionally NOT
+        used here — it checks the allowlist which must never authorize vault
+        admin access.
+        """
+        import discord
+
+        adapter_self = self
+
+        # ------------------------------------------------------------------
+        # Owner check used by autocomplete — same source as _vault_owner_gate;
+        # returns [] for non-owners without sending an ephemeral message
+        # (Discord calls autocomplete on every keystroke).
+        # ------------------------------------------------------------------
+
+        def _is_vault_owner(interaction: discord.Interaction) -> bool:
+            try:
+                try:
+                    from vault_ui import _resolve_vault_owner_id as _resolve
+                except ImportError:
+                    from .vault_ui import _resolve_vault_owner_id as _resolve
+                owner_id = _resolve()
+                if not owner_id:
+                    return False
+                user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+                return user_id == owner_id
+            except Exception:
+                return False
+
+        # ------------------------------------------------------------------
+        # Autocomplete callbacks — must respond within 3 seconds; use cached
+        # vault client overview (30-second TTL) to stay fast.
+        # ------------------------------------------------------------------
+
+        async def _conn_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list:
+            if not _is_vault_owner(interaction):
+                return []
+            try:
+                try:
+                    from vault_ui import _get_vault_client as _gvc
+                except ImportError:
+                    from .vault_ui import _get_vault_client as _gvc
+                ids = await _gvc().connection_ids()
+            except Exception:
+                return []
+            cur = (current or "").lower()
+            return [
+                discord.app_commands.Choice(name=cid, value=cid)
+                for cid in ids
+                if not cur or cur in cid.lower()
+            ][:25]
+
+        async def _agent_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list:
+            if not _is_vault_owner(interaction):
+                return []
+            try:
+                try:
+                    from vault_ui import _get_vault_client as _gvc
+                except ImportError:
+                    from .vault_ui import _get_vault_client as _gvc
+                names = await _gvc().agent_names()
+            except Exception:
+                return []
+            cur = (current or "").lower()
+            return [
+                discord.app_commands.Choice(name=n, value=n)
+                for n in names
+                if not cur or cur in n.lower()
+            ][:25]
+
+        # ------------------------------------------------------------------
+        # Handler dispatch helper
+        # ------------------------------------------------------------------
+
+        async def _call_vault_handler(fn_name: str, *args, **kwargs) -> None:
+            """Import vault_ui and call a handler function by name."""
+            try:
+                try:
+                    import vault_ui as _vui
+                except ImportError:
+                    from plugins.platforms.discord import vault_ui as _vui
+                await getattr(_vui, fn_name)(*args, **kwargs)
+            except Exception as _exc:
+                logger.exception("[Discord] /vault %s failed", fn_name)
+                # Best-effort ephemeral error reply.
+                _ia = args[1] if len(args) > 1 else None
+                if _ia:
+                    try:
+                        await _ia.response.send_message(
+                            f"❌ /vault command failed: {_exc}", ephemeral=True
+                        )
+                    except Exception:
+                        try:
+                            await _ia.followup.send(
+                                f"❌ /vault command failed: {_exc}", ephemeral=True
+                            )
+                        except Exception:
+                            pass
+
+        # ------------------------------------------------------------------
+        # Build the group and subcommands
+        # ------------------------------------------------------------------
+
+        vault_group = discord.app_commands.Group(
+            name="vault",
+            description="Manage vault connections — restricted to owner",
+        )
+
+        @vault_group.command(name="list", description="List vault connections and grants")
+        async def vault_list(interaction: discord.Interaction):
+            await _call_vault_handler("handle_vault_list", adapter_self, interaction)
+
+        @vault_group.command(
+            name="add",
+            description="Add a new vault connection via form (bearer / OAuth2 / header)",
+        )
+        async def vault_add(interaction: discord.Interaction):
+            await _call_vault_handler("handle_vault_add", adapter_self, interaction)
+
+        @vault_group.command(
+            name="edit",
+            description="Edit a vault connection — blank fields keep existing values",
+        )
+        @discord.app_commands.describe(connection="Connection ID to edit")
+        @discord.app_commands.autocomplete(connection=_conn_autocomplete)
+        async def vault_edit(interaction: discord.Interaction, connection: str = ""):
+            await _call_vault_handler(
+                "handle_vault_edit", adapter_self, interaction, connection
+            )
+
+        @vault_group.command(
+            name="delete",
+            description="Delete a vault connection (shows a confirmation prompt)",
+        )
+        @discord.app_commands.describe(connection="Connection ID to delete")
+        @discord.app_commands.autocomplete(connection=_conn_autocomplete)
+        async def vault_delete(interaction: discord.Interaction, connection: str = ""):
+            await _call_vault_handler(
+                "handle_vault_delete", adapter_self, interaction, connection
+            )
+
+        @vault_group.command(
+            name="grant",
+            description="Grant an agent access to a vault connection",
+        )
+        @discord.app_commands.describe(
+            agent="Agent name to grant access to",
+            connection="Connection ID to grant",
+        )
+        @discord.app_commands.autocomplete(
+            agent=_agent_autocomplete, connection=_conn_autocomplete
+        )
+        async def vault_grant(
+            interaction: discord.Interaction, agent: str = "", connection: str = ""
+        ):
+            await _call_vault_handler(
+                "handle_vault_grant", adapter_self, interaction, agent, connection
+            )
+
+        @vault_group.command(
+            name="revoke",
+            description="Revoke an agent's access to a vault connection",
+        )
+        @discord.app_commands.describe(
+            agent="Agent name to revoke",
+            connection="Connection ID to revoke",
+        )
+        @discord.app_commands.autocomplete(
+            agent=_agent_autocomplete, connection=_conn_autocomplete
+        )
+        async def vault_revoke(
+            interaction: discord.Interaction, agent: str = "", connection: str = ""
+        ):
+            await _call_vault_handler(
+                "handle_vault_revoke", adapter_self, interaction, agent, connection
+            )
+
+        @vault_group.command(
+            name="connect",
+            description="Get the OAuth authorization URL for a connection",
+        )
+        @discord.app_commands.describe(connection="Connection ID to authorize")
+        @discord.app_commands.autocomplete(connection=_conn_autocomplete)
+        async def vault_connect(
+            interaction: discord.Interaction, connection: str = ""
+        ):
+            await _call_vault_handler(
+                "handle_vault_connect", adapter_self, interaction, connection
+            )
+
+        tree.add_command(vault_group)
+        logger.debug("[Discord] /vault command group registered (%d subcommands)", 7)
 
     def _refresh_skill_catalog_state(self) -> None:
         """Re-scan disk for skills and repopulate ``self._skill_entries``.
@@ -8146,6 +8361,18 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    # Vault admin UI — lives in vault_ui.py so it survives upstream syncs.
+    try:
+        try:
+            from vault_ui import define_vault_ui_classes as _define_vault_ui
+        except ImportError:
+            from .vault_ui import define_vault_ui_classes as _define_vault_ui
+        _define_vault_ui()
+    except Exception as _vault_ui_err:
+        logger.debug(
+            "[Discord] vault_ui.define_vault_ui_classes skipped: %s", _vault_ui_err
+        )
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 

@@ -178,12 +178,6 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
-    discord_mod.ui = SimpleNamespace(
-        View=_FakeView,
-        Select=_FakeSelect,
-        Button=_FakeButton,
-        button=lambda *a, **k: (lambda fn: fn),
-    )
     discord_mod.ButtonStyle = SimpleNamespace(
         success=1, primary=2, secondary=2, danger=3,
         green=1, grey=2, blurple=2, red=3,
@@ -206,6 +200,15 @@ def _ensure_discord_mock() -> None:
         def add_command(self, cmd):
             self._children[cmd.name] = cmd
 
+        def command(self, *, name, description):
+            """Decorator factory: register a subcommand on this group."""
+            def decorator(fn):
+                self._children[name] = _FakeCommand(
+                    name=name, description=description, callback=fn, parent=self,
+                )
+                return fn
+            return decorator
+
     class _FakeCommand:
         def __init__(self, *, name, description, callback, parent=None):
             self.name = name
@@ -213,12 +216,50 @@ def _ensure_discord_mock() -> None:
             self.callback = callback
             self.parent = parent
 
+    # Modal: supports `title` as a class-definition keyword argument (discord.py pattern).
+    class _FakeModal:
+        def __init_subclass__(cls, *, title=None, **kwargs):
+            cls._title = title
+            super().__init_subclass__(**kwargs)
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _FakeTextInput:
+        """Stand-in for discord.ui.TextInput — the descriptor that captures modal input."""
+        def __init__(
+            self, *, label=None, placeholder=None, default=None,
+            required=True, style=None, min_length=0, max_length=4000,
+            row=None, **_
+        ):
+            self.label = label
+            self.placeholder = placeholder
+            self.default = default
+            self.value = default or ""
+            self.required = required
+            self.style = style
+            self.min_length = min_length
+            self.max_length = max_length
+
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
         choices=lambda **kwargs: (lambda fn: fn),
+        autocomplete=lambda **kwargs: (lambda fn: fn),
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
         Group=_FakeGroup,
         Command=_FakeCommand,
+    )
+
+    # TextStyle: discord.TextStyle.short / .paragraph / .long
+    discord_mod.TextStyle = SimpleNamespace(short=1, paragraph=2, long=2)
+
+    discord_mod.ui = SimpleNamespace(
+        View=_FakeView,
+        Select=_FakeSelect,
+        Button=_FakeButton,
+        Modal=_FakeModal,
+        TextInput=_FakeTextInput,
+        button=lambda *a, **k: (lambda fn: fn),
     )
 
     ext_mod = MagicMock()

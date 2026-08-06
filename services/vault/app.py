@@ -1737,6 +1737,191 @@ async def admin_delete_connection(conn_id: str, request: Request):
     return {"ok": True}
 
 
+def _apply_connection_update(
+    conn: Dict[str, Any],
+    secrets_d: Dict[str, Any],
+    body: Dict[str, Any],
+) -> tuple:
+    """Apply a partial JSON update to (conn, secrets_d); return (conn, secrets_d, error).
+
+    Blank-keeps-existing semantics (mirrors the HTML POST /services/update route):
+    any field that is absent or blank in *body* is left unchanged in the result.
+    *conn* and *secrets_d* are never mutated — copies are returned.
+    *error* is None on success or a short human-readable message on validation failure.
+
+    Secret-safety: this function never logs credential values.
+    """
+    conn = dict(conn)
+    secrets_d = dict(secrets_d)
+
+    # ── API key / public key — blank keeps existing ────────────────────────────
+    api_key = (str(body.get("api_key") or "")).strip()
+    if api_key:
+        secrets_d["api_key"] = api_key
+
+    public_key = (str(body.get("public_key") or "")).strip()
+    if public_key:
+        secrets_d["public_key"] = public_key
+
+    # ── OAuth client credentials — blank keeps existing ────────────────────────
+    client_id = (str(body.get("client_id") or "")).strip()
+    if client_id:
+        secrets_d["client_id"] = client_id
+
+    client_secret = (str(body.get("client_secret") or "")).strip()
+    if client_secret:
+        secrets_d["client_secret"] = client_secret
+
+    # ── Extra static headers (custom connections) ──────────────────────────────
+    extra_headers, hdr_err = _parse_extra_headers(body)
+    if hdr_err:
+        return conn, secrets_d, hdr_err
+    if extra_headers is not None:
+        # A single row with name "-" (or {"-": ""}) clears all extra headers.
+        if extra_headers == {"-": ""} or list(extra_headers.keys()) == ["-"]:
+            secrets_d.pop("extra_headers", None)
+        elif extra_headers:
+            secrets_d["extra_headers"] = extra_headers
+
+    # ── header-kind auth: header_name and prefix ───────────────────────────────
+    # Semantics: key absent from body → unchanged; key present (even blank) → apply.
+    # header_name blank → store "Authorization" explicitly.
+    # prefix blank → store "" (raw key, e.g. Alpaca-style).
+    # Do NOT strip prefix: trailing space in "Bearer " is intentional.
+    _auth0 = conn.get("auth") or {}
+    if _auth0.get("kind") == "header":
+        _auth0 = dict(_auth0)
+        changed = False
+        _raw_name = body.get("header_name")   # None if key absent
+        _raw_pfx = body.get("prefix")          # None if key absent
+        if _raw_name is not None:
+            _auth0["header_name"] = str(_raw_name).strip() or "Authorization"
+            changed = True
+        if _raw_pfx is not None:
+            _auth0["prefix"] = str(_raw_pfx)
+            changed = True
+        if changed:
+            conn["auth"] = _auth0
+
+    # ── oauth2 custom-app endpoint config ─────────────────────────────────────
+    auth = conn.get("auth") or {}
+    if (auth.get("kind") == "oauth2"
+            and auth.get("oauth") is not None
+            and (body.get("authorize_url") or body.get("token_url") or body.get("scopes"))):
+        merged_oauth = dict(auth.get("oauth") or {})
+        if body.get("authorize_url"):
+            url = str(body["authorize_url"]).strip()
+            if (err := _validate_oauth_endpoint_url("Authorization URL", url)):
+                return conn, secrets_d, err
+            merged_oauth["authorize_url"] = url
+        if body.get("token_url"):
+            url = str(body["token_url"]).strip()
+            if (err := _validate_oauth_endpoint_url("Token URL", url)):
+                return conn, secrets_d, err
+            merged_oauth["token_url"] = url
+        if body.get("scopes"):
+            merged_oauth["scopes"] = [
+                s for s in str(body["scopes"]).replace(",", " ").split() if s
+            ]
+        auth = dict(auth)
+        auth["oauth"] = merged_oauth
+        conn["auth"] = auth
+
+    # ── apple-kind credentials ─────────────────────────────────────────────────
+    if (conn.get("auth") or {}).get("kind") == "apple":
+        apple_id = (str(body.get("apple_id") or "")).strip()
+        if apple_id:
+            secrets_d["apple_id"] = apple_id
+        app_password = (str(body.get("apple_app_password") or body.get("app_password") or "")).strip()
+        if app_password:
+            secrets_d["app_password"] = app_password
+
+    # ── email-kind fields (with SSRF validation on hostnames) ─────────────────
+    if (conn.get("auth") or {}).get("kind") == "email":
+        for fld in ("username", "password", "imap_host", "imap_port",
+                    "smtp_host", "smtp_port"):
+            val = (str(body.get(fld) or "")).strip()
+            if not val:
+                continue
+            if fld in ("imap_host", "smtp_host"):
+                val = val.lower()
+                if (err := _validate_mail_host(fld.split("_")[0].upper(), val)):
+                    return conn, secrets_d, err
+            if fld in ("imap_port", "smtp_port") and not val.isdigit():
+                return conn, secrets_d, "Ports must be numbers"
+            secrets_d[fld] = val
+
+    return conn, secrets_d, None
+
+
+@app.post("/api/admin/connections/{conn_id}/update")
+async def admin_update_connection(conn_id: str, request: Request):
+    """Partial-update a vault connection (blank/absent fields keep existing values).
+
+    Mirrors the HTML POST /services/update merge semantics so callers only
+    send the fields they want to change.  Secrets are updated only when the
+    body value is non-blank; omitting a secret field never clears the stored
+    credential.
+
+    Supported body fields (all optional):
+      api_key, public_key, client_id, client_secret,
+      label, base_url, description, skill_description,
+      header_name, prefix  (header-kind connections)
+      authorize_url, token_url, scopes  (custom-oauth connections)
+      apple_id, apple_app_password  (apple-kind)
+      username, password, imap_host, imap_port,
+      smtp_host, smtp_port  (email-kind)
+      extra_headers  (JSON object of header name → value)
+
+    Auth: admin session cookie OR X-Vault-Admin-Token header.
+    """
+    require_admin_api(request)
+    _require_json_content_type(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    cid = normalize_id(conn_id)
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    secrets_d = store.get_secrets(cid)
+    conn_upd, secrets_upd, err = _apply_connection_update(conn, secrets_d, body)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    # label / base_url / description: blank-or-absent keeps existing
+    new_label = (str(body.get("label") or "")).strip()
+    new_base_url = (str(body.get("base_url") or "")).strip().rstrip("/")
+    # description/skill_description: key-present-with-empty-string means "clear";
+    # key absent means "keep existing" — matches form semantics where the field
+    # is always submitted (even if empty) and an empty submission is valid.
+    if "description" in body and body["description"] is not None:
+        new_description = str(body["description"]).strip()
+    else:
+        new_description = conn.get("description", "")
+    if "skill_description" in body and body["skill_description"] is not None:
+        new_skill_description = str(body["skill_description"]).strip()
+    else:
+        new_skill_description = conn.get("skill_description", "")
+
+    store.save(
+        cid,
+        service=conn["service"],
+        label=new_label or conn.get("label", ""),
+        base_url=new_base_url or conn.get("base_url", "").rstrip("/"),
+        auth=conn_upd.get("auth"),
+        secrets=secrets_upd,
+        description=new_description,
+        skill_description=new_skill_description,
+        status=conn.get("status", "ready"),
+    )
+    audit_log("admin", cid, "connection_updated", "(via Discord)")
+    updated = store.get(cid)
+    return {"connection": _conn_view(updated)}
+
+
 @app.post("/api/admin/connections/{conn_id}/connect-link")
 async def admin_connect_link(conn_id: str, request: Request):
     """Return a provider authorize URL for an OAuth connection.
