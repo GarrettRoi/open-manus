@@ -78,6 +78,35 @@ vault.store("SENDGRID", "SG.xxxx", service="custom",
 OAuth services (Google, GitHub, Outlook) can only be added by the admin in
 the vault dashboard, because they require a browser login.
 
+## Google Workspace — dedicated per-product tools
+
+A granted Google connection surfaces as ONE tool per product:
+`vault_<name>_gmail`, `_drive`, `_sheets`, `_docs`, `_slides`, `_forms`,
+`_tasks`, `_chat`, `_people`, and `_calendar`. Each takes an `operation`
+plus an `args` object; the vault attaches the OAuth token itself.
+
+Highlights (see each tool's description for the full operation list):
+
+- sheets: `create`, `meta`, `get`/`update`/`append` (spreadsheet_id, range,
+  values), `batch_get`
+- gmail: `search` (q, limit), `read` (id), `send` (to, subject, body),
+  `modify` labels, `labels`
+- drive: `search`, `get`, `download`, `export`, `create_folder`, `delete`
+- docs / slides / forms: `create`, `get`, `insert_text` (docs),
+  `batch_update`, `responses` (forms)
+- tasks: `lists`, `list`, `create`, `complete`, `delete`
+- chat: `spaces`, `messages`, `send`
+- people: `contacts`, `search`, `get`
+- calendar: `calendars`, `events`, `create_event`, `update_event`,
+  `delete_event`
+
+Every product also accepts `operation="request"` with
+`args={method, path, params, json}` — pinned to that product's
+googleapis host — for anything not covered.
+
+Via the skill: `vault.google(CONNECTION, product, operation, **args)` maps
+to `POST /api/vault/google/{CONNECTION}`.
+
 ## Apple iCloud, mail, and iMessage
 
 When the vault grants an `APPLE` connection, use its native `vault_apple`

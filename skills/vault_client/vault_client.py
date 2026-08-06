@@ -121,6 +121,29 @@ class VaultClient:
             payload, timeout=int(timeout) + 15,
         )
 
+    def google(self, connection: str, product: str, operation: str,
+               **kwargs: Any) -> Dict[str, Any]:
+        """Structured Google Workspace call through the vault.
+
+        Args:
+            connection: the Google connection name (e.g. "GOOGLE_LEXI")
+            product: one of gmail, drive, sheets, docs, slides, forms,
+                tasks, chat, people, calendar
+            operation: product operation, e.g. sheets: get/update/append,
+                gmail: search/read/send, tasks: list/create/complete —
+                or "request" (method, path, params, json) pinned to the
+                product's API host.
+            **kwargs: operation-specific args (sent as the "args" object)
+
+        Returns: {"ok": bool, "status": int, "result": ... }
+        The OAuth token stays inside the vault.
+        """
+        return self._http(
+            "POST", f"/api/vault/google/{connection.strip().upper()}",
+            {"product": product, "operation": operation, "args": kwargs},
+            timeout=95,
+        )
+
     def email(self, connection: str, action: str, **kwargs: Any) -> Dict[str, Any]:
         """Use an email (IMAP/SMTP) connection through the vault.
 

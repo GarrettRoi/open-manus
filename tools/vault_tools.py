@@ -58,6 +58,8 @@ _REFRESH_SECONDS = _parse_refresh_seconds()
 
 # connection id (vault-side, e.g. "OPENAI") -> registered tool name
 _registered: Dict[str, str] = {}
+# connection id -> extra per-product tool names (Google Workspace suites)
+_registered_suite: Dict[str, List[str]] = {}
 _registered_lock = threading.Lock()
 _refresh_thread: Optional[threading.Thread] = None
 _warned_unreachable = False
@@ -577,6 +579,99 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
     }
 
 
+GOOGLE_PRODUCTS = ["gmail", "drive", "sheets", "docs", "slides", "forms",
+                   "tasks", "chat", "people", "calendar"]
+
+GOOGLE_OPERATIONS: Dict[str, str] = {
+    "gmail": "search (q, limit), read (id), send (to, subject, body, cc, bcc), "
+             "modify (id, add_labels, remove_labels), labels",
+    "drive": "search (q or name_contains, limit), get (file_id), download (file_id), "
+             "export (file_id, mime_type), create_folder (name, parent_id), delete (file_id)",
+    "sheets": "create (title), meta (spreadsheet_id), get (spreadsheet_id, range), "
+              "update (spreadsheet_id, range, values), append (spreadsheet_id, range, values), "
+              "batch_get (spreadsheet_id, ranges)",
+    "docs": "create (title), get (document_id), insert_text (document_id, text, index), "
+            "batch_update (document_id, requests)",
+    "slides": "create (title), get (presentation_id), batch_update (presentation_id, requests)",
+    "forms": "create (title), get (form_id), responses (form_id), batch_update (form_id, requests)",
+    "tasks": "lists, list (tasklist, show_completed, limit), create (title, notes, due, tasklist), "
+             "complete (task_id, tasklist), delete (task_id, tasklist)",
+    "chat": "spaces (limit), messages (space, limit), send (space, text)",
+    "people": "contacts (limit), search (query), get (resource_name)",
+    "calendar": "calendars, events (calendar_id, time_min, time_max, q, limit), "
+                "create_event (summary, start, end, description, location, attendees), "
+                "update_event (event_id, patch, calendar_id), delete_event (event_id, calendar_id)",
+}
+
+
+def _google_call(conn_id: str, product: str, args: dict) -> str:
+    """Execute a structured Google Workspace operation through the vault."""
+    operation = str((args or {}).get("operation") or "").strip()
+    if not operation:
+        return json.dumps({"error": "operation is required",
+                           "operations": GOOGLE_OPERATIONS.get(product, "")})
+    payload = {
+        "product": product,
+        "operation": operation,
+        "args": args.get("args") if isinstance(args.get("args"), dict) else {},
+    }
+    try:
+        return json.dumps(
+            _vault_http("POST", f"/api/vault/google/{conn_id}", payload, timeout=90),
+            ensure_ascii=False, default=str,
+        )
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
+    except Exception as e:
+        return json.dumps({"error": f"Vault call failed: {e}"})
+
+
+def _build_google_schema(conn: dict, tool_name: str, product: str) -> dict:
+    conn_id = conn["id"]
+    label = conn.get("label") or conn_id
+    return {
+        "name": tool_name,
+        "description": (
+            f"Google {product.capitalize()} for the '{label}' account, via the "
+            "secure vault (OAuth token attached server-side — never handle "
+            "credentials).\n"
+            f"Operations: {GOOGLE_OPERATIONS[product]}.\n"
+            "Also supports operation='request' with args (method, path, params, "
+            f"json) pinned to the {product} API for anything not listed. "
+            "Pass operation-specific values inside `args`."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "description": f"One of: {GOOGLE_OPERATIONS[product]} — or 'request'.",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Operation-specific arguments (see operation list).",
+                },
+            },
+            "required": ["operation"],
+        },
+    }
+
+
+def _make_google_handler(conn_id: str, product: str):
+    def _handler(args: dict, **_kw) -> str:
+        return _google_call(conn_id, product, args or {})
+    return _handler
+
+
 def _make_conn_handler(conn_id: str, auth_kind: str = "", service: str = ""):
     if auth_kind == "email" or service == "email":
         def _email_handler(args: dict, **_kw) -> str:
@@ -605,14 +700,16 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
         seen: Dict[str, dict] = {}
         for conn in conns:
             seen[conn["id"]] = conn
-        # Deregister revoked connections
+        # Deregister revoked connections (base tool + any Google suite tools)
         for conn_id in list(_registered):
             if conn_id not in seen:
-                try:
-                    registry.deregister(_registered[conn_id])
-                except Exception:
-                    logger.exception("Failed to deregister vault tool for %s", conn_id)
+                for name in [_registered[conn_id]] + _registered_suite.get(conn_id, []):
+                    try:
+                        registry.deregister(name)
+                    except Exception:
+                        logger.exception("Failed to deregister vault tool %s for %s", name, conn_id)
                 del _registered[conn_id]
+                _registered_suite.pop(conn_id, None)
                 removed += 1
         # Register new / re-register changed. Track tool-name claims within
         # this sync so two connection ids that normalize to the same tool
@@ -656,6 +753,45 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
                 _registered[conn_id] = tool_name
             except Exception:
                 logger.exception("Failed to register vault tool for %s", conn_id)
+                continue
+
+            # Google connections additionally get one dedicated tool per
+            # Workspace product (vault_<name>_sheets, _gmail, _tasks, ...).
+            if (conn.get("service") or "").lower() == "google" and auth_kind == "oauth2":
+                suite: List[str] = []
+                for product in GOOGLE_PRODUCTS:
+                    pname = f"{tool_name}_{product}"
+                    pschema = _build_google_schema(conn, pname, product)
+                    pexisting = registry.get_entry(pname)
+                    already = pname in _registered_suite.get(conn_id, [])
+                    if already and pexisting is not None and pexisting.schema == pschema:
+                        suite.append(pname)
+                        continue
+                    try:
+                        registry.register(
+                            name=pname,
+                            toolset=TOOLSET,
+                            schema=pschema,
+                            handler=_make_google_handler(conn_id, product),
+                            description=f"Google {product} via vault connection {conn_id}",
+                            emoji="🔐",
+                        )
+                        suite.append(pname)
+                        if already:
+                            updated += 1
+                        else:
+                            added += 1
+                    except Exception:
+                        logger.exception(
+                            "Failed to register google %s tool for %s", product, conn_id)
+                _registered_suite[conn_id] = suite
+            elif conn_id in _registered_suite:
+                # No longer a google oauth connection — drop stale suite tools.
+                for name in _registered_suite.pop(conn_id):
+                    try:
+                        registry.deregister(name)
+                    except Exception:
+                        logger.exception("Failed to deregister stale tool %s", name)
 
     if added or removed or updated:
         logger.info(

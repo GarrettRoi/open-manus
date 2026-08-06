@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from apple_ops import AppleOpsError, run_apple_operation
 
 import email_ops
+import google_ops
 from catalog import CATALOG, get_template
 from connections import (
     PFX_GRANT,
@@ -1287,6 +1288,103 @@ async def apple_operation(conn_id: str, request: Request, body: AppleOperationRe
         raise HTTPException(status_code=502, detail=str(exc))
     audit_log(agent_name, cid, "apple_operation", body.operation[:100])
     return {"ok": True, "operation": body.operation, "result": result}
+
+
+class GoogleOperationRequest(BaseModel):
+    product: str
+    operation: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/vault/google/{conn_id}")
+async def google_operation(conn_id: str, request: Request, body: GoogleOperationRequest):
+    """Structured per-product Google Workspace operations.
+
+    Body: {"product": "sheets|gmail|drive|docs|slides|forms|tasks|chat|people|calendar",
+           "operation": "...", "args": {...}}
+    The vault attaches the connection's OAuth token itself — agents never
+    see it. All requests are pinned to the product's googleapis host.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "google_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if conn.get("service") != "google" or (conn.get("auth") or {}).get("kind") != "oauth2":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not a Google OAuth connection — use the HTTP proxy instead.")
+
+    try:
+        spec = google_ops.build_request(body.product, body.operation, body.args)
+    except google_ops.GoogleOpsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    host = httpx.URL(spec["url"]).host
+    if host not in store.allowed_hosts(conn):
+        audit_log(agent_name, cid, "google_blocked_host", host or "?")
+        raise HTTPException(status_code=403,
+                            detail=f"Host '{host}' is not allowed for connection '{cid}'")
+
+    secrets_d = store.get_secrets(cid)
+    scrub_values = [v for v in secrets_d.values() if isinstance(v, str)]
+    try:
+        access_token, _ = await oauth_mod.get_valid_access_token(
+            conn["service"], cid, store, conn=conn)
+        scrub_values.append(access_token)
+    except OAuthError as exc:
+        audit_log(agent_name, cid, "google_auth_error", str(exc)[:200])
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    kwargs: Dict[str, Any] = {
+        "headers": {"Authorization": f"Bearer {access_token}"},
+        "params": spec["params"] or None,
+        "timeout": 60,
+    }
+    if spec["json"] is not None:
+        kwargs["json"] = spec["json"]
+    try:
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            upstream = await client.request(spec["method"], spec["url"], **kwargs)
+    except httpx.RequestError as exc:
+        audit_log(agent_name, cid, "google_upstream_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}")
+
+    raw = upstream.content[:PROXY_BODY_MAX]
+    truncated = len(upstream.content) > PROXY_BODY_MAX
+    content_type = upstream.headers.get("content-type", "")
+
+    def _scrub(text: str) -> str:
+        for sv in scrub_values:
+            if len(sv) >= 8 and sv in text:
+                text = text.replace(sv, "***vault***")
+        return text
+
+    result: Dict[str, Any] = {
+        "ok": upstream.status_code < 400,
+        "status": upstream.status_code,
+        "product": body.product,
+        "operation": body.operation,
+        "truncated": truncated,
+    }
+    if "application/json" in content_type:
+        try:
+            result["result"] = json.loads(_scrub(raw.decode(upstream.encoding or "utf-8", "replace")))
+        except ValueError:
+            result["text"] = _scrub(raw.decode(upstream.encoding or "utf-8", "replace"))
+    elif content_type.startswith("text/") or "xml" in content_type or not raw:
+        result["text"] = _scrub(raw.decode(upstream.encoding or "utf-8", "replace"))
+    else:
+        import base64 as _b64
+        result["body_base64"] = _b64.b64encode(raw).decode()
+
+    audit_log(agent_name, cid, "google_operation",
+              f"{body.product}.{body.operation} -> {upstream.status_code}")
+    return JSONResponse(result, status_code=200)
 
 
 # ---------------------------------------------------------------------------
