@@ -103,10 +103,12 @@
                 <div class="form-group">
                     <label>Auth header name</label>
                     <input type="text" name="header_name" placeholder="Authorization">
+                    <small style="color:var(--text-muted);">Leave blank to use <code>Authorization</code>. Use a custom name (e.g. <code>APCA-API-KEY-ID</code>) to send the key in a different header with no <code>Authorization</code> header emitted.</small>
                 </div>
                 <div class="form-group">
-                    <label>Value prefix (e.g. "Bearer ")</label>
+                    <label>Value prefix (e.g. <code>Bearer </code>)</label>
                     <input type="text" name="prefix" placeholder="Bearer ">
+                    <small style="color:var(--text-muted);">Text prepended to the key. Leave blank to send the raw key with no prefix (e.g. Alpaca-style). Include trailing space when needed (e.g. <code>Bearer </code>).</small>
                 </div>
             </div>
             <div class="form-group">
@@ -285,12 +287,14 @@
             <div id="e_grp_header" style="display:none;">
                 <div class="form-row">
                     <div class="form-group">
-                        <label>Auth header name (blank to keep)</label>
+                        <label>Auth header name</label>
                         <input type="text" name="header_name" id="e_header_name">
+                        <small style="color:var(--text-muted);">Blank resets to <code>Authorization</code>. Change to a custom name (e.g. <code>APCA-API-KEY-ID</code>) to suppress the default <code>Authorization</code> header entirely.</small>
                     </div>
                     <div class="form-group">
-                        <label>Value prefix (blank to keep)</label>
+                        <label>Value prefix</label>
                         <input type="text" name="prefix" id="e_prefix">
+                        <small style="color:var(--text-muted);">Blank = raw key, no prefix (e.g. Alpaca-style). Include trailing space when needed (e.g. <code>Bearer </code>).</small>
                     </div>
                 </div>
                 <div class="form-group">
@@ -458,18 +462,23 @@ function openEdit(c) {
     document.getElementById('e_grp_email').style.display = isEmail ? '' : 'none';
     document.getElementById('e_grp_oauth').style.display = isOAuth ? '' : 'none';
     document.getElementById('e_grp_header').style.display = isHeader ? '' : 'none';
-    document.getElementById('e_header_name').value = '';
-    document.getElementById('e_prefix').value = '';
     document.getElementById('e_public_key').value = '';
     document.getElementById('e_extra_headers_rows').innerHTML = '';
     if (isHeader) {
-        document.getElementById('e_header_name').placeholder = c.auth_header_name || 'Authorization';
-        document.getElementById('e_prefix').placeholder = c.auth_prefix || '';
+        // Pre-fill with stored values so the user sees what is currently set.
+        // Blank on submit = explicit intent (header_name → Authorization; prefix → raw key).
+        document.getElementById('e_header_name').value = c.auth_header_name || 'Authorization';
+        document.getElementById('e_prefix').value = (c.auth_prefix !== undefined && c.auth_prefix !== null) ? c.auth_prefix : '';
+        document.getElementById('e_header_name').placeholder = '';
+        document.getElementById('e_prefix').placeholder = '';
         document.getElementById('e_public_key').placeholder = c.public_key || '';
         const names = c.extra_header_names || [];
         document.getElementById('e_current_headers').textContent = names.length
             ? ('Current extra headers: ' + names.join(', ') + ' (values hidden)')
             : 'No extra headers set.';
+    } else {
+        document.getElementById('e_header_name').value = '';
+        document.getElementById('e_prefix').value = '';
     }
     const co = c.custom_oauth;
     document.getElementById('e_grp_custom_oauth').style.display = co ? '' : 'none';

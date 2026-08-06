@@ -358,7 +358,14 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
         key = secrets.get("api_key")
         if not key:
             raise AuthInjectionError("No API key stored for this connection")
-        headers[auth.get("header_name") or "Authorization"] = f"{auth.get('prefix', '')}{key}"
+        # header_name: stored value is always explicit ("Authorization" or a
+        # custom name); fall back to "Authorization" only for legacy records
+        # that pre-date explicit storage.
+        hdr_name = (auth.get("header_name") or "").strip() or "Authorization"
+        # prefix: "" is intentional (raw key / Alpaca-style); no strip so that
+        # "Bearer " (trailing space) is preserved correctly for existing conns.
+        prefix = auth.get("prefix") if auth.get("prefix") is not None else ""
+        headers[hdr_name] = f"{prefix}{key}"
     elif kind == "query":
         key = secrets.get("api_key")
         if not key:

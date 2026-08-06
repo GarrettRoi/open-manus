@@ -17,3 +17,4 @@ timeoutMs = 180000
 
 [nix]
 packages = ["gitFull", "libxcrypt", "libyaml", "playwright-driver"]
+channel = "stable-25_05"

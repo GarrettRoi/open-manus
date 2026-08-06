@@ -671,10 +671,15 @@ async def add_service(request: Request):
     base_url = (form.get("base_url") or tpl.get("base_url") or "").strip()
     if auth["kind"] == "header":
         # allow custom-template header overrides
-        if form.get("header_name"):
-            auth["header_name"] = form.get("header_name").strip()
+        # None = field absent (keep default); "" = intentionally blank
+        _raw_name = form.get("header_name")
+        if _raw_name is not None:
+            # blank means "use Authorization" — store explicitly
+            auth["header_name"] = _raw_name.strip() or "Authorization"
         if form.get("prefix") is not None and service == "custom":
-            auth["prefix"] = form.get("prefix")
+            # blank means "no prefix / raw key" — preserve as-is (no strip:
+            # trailing space in "Bearer " is intentional)
+            auth["prefix"] = str(form.get("prefix"))
 
     secrets_d: Dict[str, Any] = {}
     status = "ready"
@@ -773,15 +778,22 @@ async def update_service(request: Request):
         elif extra_headers:
             secrets_d["extra_headers"] = extra_headers
     # auth header name / prefix edits for header-kind (custom) connections
+    # Semantics: None (field absent from POST) = unchanged; "" = explicit clear.
+    # header_name blank → store "Authorization" explicitly (cleaner than relying
+    # on the builder's `or` fallback).
+    # prefix blank → store "" (raw key, no prefix — e.g. Alpaca-style).
+    # Do NOT strip prefix: trailing space in "Bearer " is intentional.
     _auth0 = conn.get("auth") or {}
     if _auth0.get("kind") == "header":
         changed = False
         _auth0 = dict(_auth0)
-        if (form.get("header_name") or "").strip():
-            _auth0["header_name"] = form.get("header_name").strip()
+        _raw_name = form.get("header_name")   # None if field not in POST body
+        _raw_pfx  = form.get("prefix")        # None if field not in POST body
+        if _raw_name is not None:
+            _auth0["header_name"] = _raw_name.strip() or "Authorization"
             changed = True
-        if form.get("prefix") is not None and str(form.get("prefix")) != "":
-            _auth0["prefix"] = str(form.get("prefix"))
+        if _raw_pfx is not None:
+            _auth0["prefix"] = str(_raw_pfx)
             changed = True
         if changed:
             conn["auth"] = _auth0
