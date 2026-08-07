@@ -2502,6 +2502,32 @@ async def replit_mcp_sweep(request: Request):
     return {"ok": True, "requeued": requeued, "count": len(requeued)}
 
 
+class ReplitMCPConfigBody(BaseModel):
+    target_repl: str = Field("", max_length=128)
+
+
+@app.post("/api/admin/replit-mcp/config")
+async def replit_mcp_config(body: ReplitMCPConfigBody, request: Request):
+    """Set the target Replit project ID (replitmcp:target_repl).
+
+    This is the replId of the Open Manus Replit project that Replit Agent
+    runs will be started on when approved dev requests are dispatched.
+    """
+    require_admin_api(request)
+    repl_id = body.target_repl.strip()
+    # Basic sanity check: Replit replIds are alphanumeric with hyphens.
+    if repl_id and not re.match(r'^[A-Za-z0-9_-]+$', repl_id):
+        raise HTTPException(status_code=422,
+                            detail="target_repl must be alphanumeric (hyphens/underscores allowed)")
+    if repl_id:
+        r.set(replit_mcp_mod.K_TARGET, repl_id)
+        audit_log("admin", "REPLIT_MCP", "replit_mcp_set_target", f"target_repl={repl_id}")
+    else:
+        r.delete(replit_mcp_mod.K_TARGET)
+        audit_log("admin", "REPLIT_MCP", "replit_mcp_clear_target", "")
+    return {"ok": True, "target_repl": repl_id}
+
+
 @app.post("/api/admin/replit-mcp/dispatch/{req_id}")
 async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False):
     """Manually (re-)queue an approved dev request for dispatch.

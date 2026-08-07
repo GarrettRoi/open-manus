@@ -75,6 +75,44 @@
     {% endif %}
 </div>
 
+<div class="card" id="replit-mcp-card">
+    <h3>&#128640; Dev Request Dispatch</h3>
+    <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
+        Approved dev modification requests (from Discord <code>/devrequests</code>) launch Replit Agent runs automatically once Replit is connected.
+    </p>
+
+    <div id="replit-mcp-status" style="margin-bottom: 16px;">
+        <span style="color: var(--text-muted); font-size: 13px;">Checking connection&#8230;</span>
+    </div>
+
+    <div style="margin-bottom: 16px;">
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">
+            <strong style="color: var(--text);">Target Replit project ID</strong>
+            — the <code>replId</code> of the Open Manus repl that Agent runs will be launched on.
+            Required before dispatch can start.
+        </p>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+            <input id="target-repl-input" type="text"
+                   placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000"
+                   style="flex: 1; min-width: 260px; background: var(--bg); border: 1px solid var(--border);
+                          border-radius: var(--radius); color: var(--text); padding: 8px 12px; font-size: 13px;"
+                   maxlength="128">
+            <button class="btn btn-sm" style="background: var(--accent); color: #fff;"
+                    onclick="saveTargetRepl(this)">Save</button>
+        </div>
+        <div id="target-repl-result" style="margin-top: 6px; font-size: 13px;"></div>
+    </div>
+
+    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+        <a href="/admin/replit-mcp/connect" class="btn btn-primary btn-sm" id="replit-connect-btn">
+            &#128279; Connect Replit
+        </a>
+        <button class="btn btn-sm" style="background: var(--surface-hover); color: var(--text);"
+                onclick="triggerSweep(this)">&#8635; Re-sweep Backlog</button>
+    </div>
+    <div id="replit-sweep-result" style="margin-top: 10px; font-size: 13px;"></div>
+</div>
+
 <div class="card">
     <h3>&#129302; Agent Access Summary</h3>
     <div class="table-responsive">
@@ -111,4 +149,134 @@
         </table>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function mkEl(tag, attrs, text) {
+    var el = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function(k) { el.setAttribute(k, attrs[k]); });
+    if (text != null) el.textContent = text;
+    return el;
+}
+
+function mkBadge(cssClass, text) {
+    return mkEl('span', { class: 'badge ' + cssClass }, text);
+}
+
+(async function loadReplitStatus() {
+    var statusEl = document.getElementById('replit-mcp-status');
+    var connectBtn = document.getElementById('replit-connect-btn');
+    var targetInput = document.getElementById('target-repl-input');
+    try {
+        var resp = await fetch('/api/admin/replit-mcp/status');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var d = await resp.json();
+
+        // Populate target repl input with current value (safe — goes to value, not innerHTML)
+        if (targetInput && d.target_repl) targetInput.value = d.target_repl;
+
+        statusEl.innerHTML = '';
+
+        // Row 1: connection + dispatcher badges
+        var row1 = mkEl('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;' });
+        row1.appendChild(mkBadge(d.connected ? 'badge-success' : 'badge-warning',
+            d.connected ? '\u2713 Connected' : '\u26A0 Not connected'));
+        row1.appendChild(mkBadge(d.loop_alive ? 'badge-success' : 'badge-warning',
+            d.loop_alive ? '\u2713 Dispatcher running' : '\u26A0 Dispatcher offline'));
+        if (d.loop_heartbeat_age_seconds != null) {
+            var hb = mkEl('span', { style: 'color:var(--text-muted);font-size:12px;' },
+                '(heartbeat ' + d.loop_heartbeat_age_seconds + 's ago)');
+            row1.appendChild(hb);
+        }
+        statusEl.appendChild(row1);
+
+        // Missing target repl warning — blocks dispatch
+        if (!d.target_repl) {
+            var warn = mkEl('div', { style: 'background:rgba(239,68,68,0.1);border:1px solid var(--danger);border-radius:6px;padding:10px 12px;margin-bottom:10px;font-size:13px;color:var(--danger);' },
+                '\u26A0 Target Replit project not configured. Dispatch is blocked until you set the Replit project ID below.');
+            statusEl.appendChild(warn);
+        }
+
+        // Row 2: dispatch stats (all safe integers)
+        var row2 = mkEl('div', { style: 'display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--text-muted);' });
+        var statsMap = [
+            { label: '\uD83D\uDCDD Approved', val: d.approved_count, color: 'var(--text)' },
+            { label: '\u25B6 Started',  val: d.started_count, color: 'var(--success)' },
+            { label: '\u274C Failed',   val: d.failed_dispatch_count, color: d.failed_dispatch_count > 0 ? 'var(--danger)' : 'var(--text)' },
+            { label: 'Queue',           val: d.dispatch_queue_depth, color: 'var(--text)' },
+        ];
+        statsMap.forEach(function(s) {
+            var sp = mkEl('span');
+            sp.textContent = s.label + ': ';
+            var strong = mkEl('strong', { style: 'color:' + s.color }, String(s.val));
+            sp.appendChild(strong);
+            row2.appendChild(sp);
+        });
+        statusEl.appendChild(row2);
+
+        if (d.connected) {
+            connectBtn.textContent = '\uD83D\uDD17 Reconnect Replit';
+            connectBtn.style.background = 'var(--surface-hover)';
+            connectBtn.style.color = 'var(--text)';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Could not load status: ' + e.message;
+        statusEl.style.color = 'var(--danger)';
+        statusEl.style.fontSize = '13px';
+    }
+})();
+
+async function triggerSweep(btn) {
+    var resultEl = document.getElementById('replit-sweep-result');
+    btn.disabled = true;
+    btn.textContent = 'Sweeping\u2026';
+    resultEl.textContent = '';
+    try {
+        var resp = await fetch('/api/admin/replit-mcp/sweep', { method: 'POST' });
+        var d = await resp.json();
+        if (d.count > 0) {
+            resultEl.style.color = 'var(--success)';
+            resultEl.textContent = 'Re-queued ' + d.count + ' request(s): ' + d.requeued.join(', ');
+        } else {
+            resultEl.style.color = 'var(--text-muted)';
+            resultEl.textContent = 'No backlogged requests to re-queue.';
+        }
+    } catch (e) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.textContent = 'Sweep failed: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '\u21BA Re-sweep Backlog';
+    }
+}
+
+async function saveTargetRepl(btn) {
+    var input = document.getElementById('target-repl-input');
+    var resultEl = document.getElementById('target-repl-result');
+    var val = input.value.trim();
+    btn.disabled = true;
+    btn.textContent = 'Saving\u2026';
+    resultEl.textContent = '';
+    try {
+        var resp = await fetch('/api/admin/replit-mcp/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_repl: val }),
+        });
+        var d = await resp.json();
+        if (!resp.ok) throw new Error(d.detail || 'Error ' + resp.status);
+        resultEl.style.color = 'var(--success)';
+        resultEl.textContent = val ? 'Target repl set to: ' + d.target_repl : 'Target repl cleared.';
+        // Reload status badges
+        setTimeout(function() { location.reload(); }, 800);
+    } catch (e) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.textContent = 'Failed: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save';
+    }
+}
+</script>
 {% endblock %}
