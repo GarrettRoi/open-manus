@@ -54,12 +54,25 @@ def _esc_ical(value: Any) -> str:
 
 
 def _ical_time(value: Any) -> str:
-    """Accept iCalendar basic values or common ISO-8601 timestamps."""
+    """Accept iCalendar basic values or common ISO-8601 timestamps and return
+    a UTC compact iCal datetime string (YYYYMMDDTHHMMSSZ).
+
+    Handles:
+    * Already-compact UTC:        20260807T090000Z  → 20260807T090000Z
+    * Compact without Z:          20260807T090000   → 20260807T090000Z (treat as UTC)
+    * Date-only (all-day):        20260807          → 20260807T000000Z
+    * ISO datetime:               2026-08-07T09:00  → 20260807T090000Z
+    * ISO date:                   2026-08-07        → 20260807T000000Z
+    """
     text = str(value or "").strip()
     if not text:
         return ""
+    # Already compact iCal datetime (with or without Z)
     if re.fullmatch(r"\d{8}T\d{6}Z?", text):
-        return text
+        return text if text.endswith("Z") else text + "Z"
+    # Date-only compact iCal (all-day events)
+    if re.fullmatch(r"\d{8}", text):
+        return text + "T000000Z"
     try:
         parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -67,6 +80,27 @@ def _ical_time(value: Any) -> str:
         return parsed.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     except ValueError:
         return text
+
+
+def _event_overlaps(event: Dict[str, Any], utc_start: str, utc_end: str) -> bool:
+    """Return True if the event overlaps the half-open interval [utc_start, utc_end).
+
+    Strings are compared lexicographically; all values must already be in the
+    YYYYMMDDTHHMMSSZ format produced by _ical_time so the comparison is valid.
+    An absent utc_start/end means the interval is open on that side.
+    """
+    es = _ical_time(event.get("dtstart", ""))
+    # Use dtend, due, or fall back to start (point-in-time event)
+    ee_raw = event.get("dtend") or event.get("due") or ""
+    ee = _ical_time(ee_raw) if ee_raw else es
+    if not es:
+        return True  # unparseable — include it rather than silently drop
+    # Overlap condition: event_start < range_end  AND  event_end > range_start
+    if utc_end and es >= utc_end:
+        return False
+    if utc_start and ee <= utc_start:
+        return False
+    return True
 
 
 def _unesc_ical(value: str) -> str:
@@ -236,13 +270,16 @@ class AppleOps:
             raise AppleOpsError("No iCloud calendars were found")
         return calendars[0]["url"]
 
-    async def _calendar_report(self, calendar_url: str, component: str, start: str = "", end: str = "") -> List[Dict[str, Any]]:
+    async def _calendar_report(self, calendar_url: str, component: str, start: str = "", end: str = "",
+                               _client_filter: bool = False) -> List[Dict[str, Any]]:
         # Normalise start/end to iCalendar UTC format expected by Apple's server.
         utc_start = _ical_time(start) if start else ""
         utc_end = _ical_time(end) if end else ""
 
+        # If the caller explicitly requested client-side filtering (e.g. 412 fallback),
+        # skip the time-range in the REPORT body entirely.
         time_filter = ""
-        if utc_start or utc_end:
+        if not _client_filter and (utc_start or utc_end):
             attrs = (f' start="{utc_start}"' if utc_start else "") + (f' end="{utc_end}"' if utc_end else "")
             time_filter = f'<c:time-range{attrs}/>'
 
@@ -252,11 +289,23 @@ class AppleOps:
 <c:comp-filter name="{component}">{time_filter}</c:comp-filter>
 </c:comp-filter></c:filter></c:calendar-query>"""
 
-        query_resp = await self._request(
-            "REPORT", calendar_url,
-            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-            content=query_body, expected=(207,),
-        )
+        try:
+            query_resp = await self._request(
+                "REPORT", calendar_url,
+                headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                content=query_body, expected=(207,),
+            )
+        except AppleOpsError as exc:
+            # Apple's iCloud CalDAV returns HTTP 412 when a <time-range> filter is
+            # present, even though the request is RFC 4791-compliant. This is a
+            # known Apple server limitation. Fall back to fetching all events and
+            # applying the date filter client-side.
+            if "412" in str(exc) and time_filter:
+                all_events = await self._calendar_report(
+                    calendar_url, component, _client_filter=True
+                )
+                return [e for e in all_events if _event_overlaps(e, utc_start, utc_end)]
+            raise
         parsed = _xml(query_resp.text)
 
         # Phase 1 — collect hrefs + any inline calendar-data from the query response.
