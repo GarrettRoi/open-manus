@@ -1065,12 +1065,13 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
             return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         if extra_headers:
             secrets_d["extra_headers"] = extra_headers
-        # Services with extra_secret (e.g. Alpaca) need a second encrypted header.
+        # Services with extra_secret (e.g. Alpaca, Plaid) need a second
+        # encrypted header; the header name comes from the catalog template.
         if tpl.get("extra_secret"):
             api_secret = (form.get("api_secret") or "").strip()
             if api_secret:
                 eh = dict(secrets_d.get("extra_headers") or {})
-                eh["APCA-API-SECRET-KEY"] = api_secret
+                eh[tpl.get("extra_secret_header", "APCA-API-SECRET-KEY")] = api_secret
                 secrets_d["extra_headers"] = eh
         if not base_url:
             return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
@@ -1144,13 +1145,14 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
             secrets_d.pop("extra_headers", None)
         elif extra_headers:
             secrets_d["extra_headers"] = extra_headers
-    # Services with extra_secret (e.g. Alpaca): rotate the second encrypted header.
+    # Services with extra_secret (e.g. Alpaca, Plaid): rotate the second
+    # encrypted header; the header name comes from the catalog template.
     _conn_tpl = get_template(conn.get("service", "")) or {}
     if _conn_tpl.get("extra_secret"):
         api_secret = (form.get("api_secret") or "").strip()
         if api_secret:
             eh = dict(secrets_d.get("extra_headers") or {})
-            eh["APCA-API-SECRET-KEY"] = api_secret
+            eh[_conn_tpl.get("extra_secret_header", "APCA-API-SECRET-KEY")] = api_secret
             secrets_d["extra_headers"] = eh
     # auth header name / prefix edits for header-kind (custom) connections
     # Semantics: None (field absent from POST) = unchanged; "" = explicit clear.
@@ -2859,16 +2861,16 @@ def _apply_connection_update(
         if new_token:
             secrets_d["api_key"] = new_token
 
-    # ── Alpaca (and any future extra_secret service): api_secret → extra header ─
+    # ── Alpaca/Plaid (any extra_secret service): api_secret → extra header ─
     # The HTML form path has the same logic; mirror it here so the JSON admin API
-    # can also rotate the Alpaca Secret Key without touching the extra_headers
+    # can also rotate the second secret without touching the extra_headers
     # field directly (which requires knowing the internal header name).
     _conn_tpl = get_template(conn.get("service", "")) or {}
     if _conn_tpl.get("extra_secret"):
         api_secret = (str(body.get("api_secret") or "")).strip()
         if api_secret:
             eh = dict(secrets_d.get("extra_headers") or {})
-            eh["APCA-API-SECRET-KEY"] = api_secret
+            eh[_conn_tpl.get("extra_secret_header", "APCA-API-SECRET-KEY")] = api_secret
             secrets_d["extra_headers"] = eh
 
     return conn, secrets_d, None

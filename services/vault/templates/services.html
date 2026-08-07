@@ -127,9 +127,9 @@
             <input type="password" name="api_key" placeholder="paste the key — agents will never see it">
         </div>
         <div id="grp_alpaca_secret" class="form-group" style="display:none;">
-            <label>API Secret Key (private — never shown to agents)</label>
+            <label id="lbl_api_secret">API Secret Key (private — never shown to agents)</label>
             <input type="password" name="api_secret" placeholder="paste the secret key">
-            <small style="color:var(--text-muted);">Get both keys from <a href="https://app.alpaca.markets/paper-trading/overview" target="_blank" rel="noopener">Alpaca → Paper Trading → API Keys</a>.</small>
+            <small id="hint_api_secret" style="color:var(--text-muted);">Both values are stored encrypted and injected server-side.</small>
         </div>
         <div id="grp_apple" class="form-row" style="display:none;">
             <div class="form-group">
@@ -355,9 +355,9 @@
                 <input type="password" name="api_key">
             </div>
             <div class="form-group" id="e_grp_alpaca_secret" style="display:none;">
-                <label>New API Secret Key (leave blank to keep current)</label>
+                <label>New API secret (leave blank to keep current)</label>
                 <input type="password" name="api_secret">
-                <small style="color:var(--text-muted);">Rotate the Alpaca secret key here. The current value is never shown.</small>
+                <small style="color:var(--text-muted);">Rotate the second secret (e.g. Alpaca Secret Key, Plaid secret) here. The current value is never shown.</small>
             </div>
             <div class="form-group" id="e_grp_alpaca_env" style="display:none;">
                 <label>Environment</label>
@@ -523,13 +523,18 @@ function onServiceChange() {
     document.getElementById('grp_api_key').style.display = (isOAuth || isEmail || isMcp) ? 'none' : '';
     document.getElementById('grp_mcp_bearer').style.display = isMcp ? '' : 'none';
     const isMac = sid === 'macincloud';
-    const isAlpaca = !!tpl.extra_secret;
+    const hasExtraSecret = !!tpl.extra_secret;
+    const isAlpaca = sid === 'alpaca';
     document.getElementById('grp_apple').style.display = sid === 'apple' ? '' : 'none';
     document.getElementById('grp_mac').style.display = isMac ? '' : 'none';
     document.getElementById('grp_email').style.display = isEmail ? '' : 'none';
-    document.getElementById('grp_alpaca_secret').style.display = isAlpaca ? '' : 'none';
+    document.getElementById('grp_alpaca_secret').style.display = hasExtraSecret ? '' : 'none';
+    // Environment selector is Alpaca-specific (Paper vs Live hosts).
     document.getElementById('grp_alpaca_env').style.display = isAlpaca ? '' : 'none';
-    document.getElementById('lbl_api_key').textContent = isAlpaca ? 'API Key ID (never shown to agents)' : 'API key';
+    document.getElementById('lbl_api_key').textContent =
+        tpl.api_key_label || (hasExtraSecret ? 'API Key ID (never shown to agents)' : 'API key');
+    document.getElementById('lbl_api_secret').textContent =
+        tpl.extra_secret_label || 'API Secret Key (private — never shown to agents)';
     if (sid === 'apple' || isMac) document.getElementById('grp_api_key').style.display = 'none';
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
@@ -598,7 +603,9 @@ function openEdit(c) {
     const isApple = c.auth_kind === 'apple';
     const isMac = c.auth_kind === 'macincloud';
     const isMcp = c.auth_kind === 'mcp_bearer';
-    const isAlpacaEdit = !!(CATALOG[c.service] && CATALOG[c.service].extra_secret);
+    const _editTpl = CATALOG[c.service] || {};
+    const hasExtraSecretEdit = !!_editTpl.extra_secret;
+    const isAlpacaEdit = c.service === 'alpaca';
     document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac) ? 'none' : '';
     // MCP connections reuse the e_grp_key field with a different label.
     if (isMcp) {
@@ -606,10 +613,12 @@ function openEdit(c) {
         const lbl = document.getElementById('e_lbl_api_key');
         if (lbl) lbl.textContent = 'New bearer token (leave blank to keep current)';
     }
-    if (isAlpacaEdit) {
-        document.getElementById('e_lbl_api_key').textContent = 'New API Key ID (leave blank to keep)';
+    if (hasExtraSecretEdit) {
+        document.getElementById('e_lbl_api_key').textContent =
+            _editTpl.api_key_label ? ('New ' + _editTpl.api_key_label + ' (leave blank to keep)')
+                                   : 'New API Key ID (leave blank to keep)';
     }
-    document.getElementById('e_grp_alpaca_secret').style.display = isAlpacaEdit ? '' : 'none';
+    document.getElementById('e_grp_alpaca_secret').style.display = hasExtraSecretEdit ? '' : 'none';
     // Alpaca env selector: derive paper/live from stored base_url; hide raw base_url.
     document.getElementById('e_grp_alpaca_env').style.display = isAlpacaEdit ? '' : 'none';
     document.getElementById('e_base_url').closest('.form-group').style.display = isAlpacaEdit ? 'none' : '';

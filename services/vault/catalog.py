@@ -551,6 +551,47 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "GET /v2/account",
         "test_probe": {"method": "GET", "path": "/v2/account"},
     },
+    "stripe": {
+        "label": "Stripe",
+        "auth": {"kind": "bearer"},
+        "base_url": "https://api.stripe.com",
+        "allowed_hosts": ["api.stripe.com"],
+        "setup_help": (
+            "Paste a secret key from https://dashboard.stripe.com/apikeys "
+            "(starts with sk_live_ for real payments or sk_test_ for test mode). "
+            "The key is stored encrypted; agents call Stripe through the vault "
+            "proxy and never see it."
+        ),
+        "example_call": "GET /v1/balance",
+        "test_probe": {"method": "GET", "path": "/v1/balance"},
+    },
+    "plaid": {
+        "label": "Plaid (bank & card monitoring)",
+        "auth": {"kind": "header", "header_name": "PLAID-CLIENT-ID", "prefix": ""},
+        "base_url": "https://production.plaid.com",
+        "allowed_hosts": ["production.plaid.com", "sandbox.plaid.com"],
+        "extra_secret": True,
+        "extra_secret_header": "PLAID-SECRET",
+        "extra_secret_label": "Plaid secret (never shown to agents)",
+        "api_key_label": "Plaid client ID (never shown to agents)",
+        "setup_help": (
+            "Paste your Plaid client_id and secret from "
+            "https://dashboard.plaid.com/developers/keys. "
+            "Use the Production secret for real bank/card data or the Sandbox "
+            "secret (with base URL https://sandbox.plaid.com) for testing. "
+            "Both values are stored encrypted and injected as headers "
+            "(PLAID-CLIENT-ID / PLAID-SECRET) by the vault proxy — you can omit "
+            "them from request bodies."
+        ),
+        "example_call": (
+            'POST /accounts/balance/get with {"access_token": "<item access token>"}'
+        ),
+        "test_probe": {
+            "method": "POST",
+            "path": "/institutions/get",
+            "json": {"count": 1, "offset": 0, "country_codes": ["US"]},
+        },
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},
