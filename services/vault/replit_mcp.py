@@ -549,11 +549,18 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
             kwargs = {"ex": ttl} if ttl and ttl > 0 else {}
             await asyncio.to_thread(
                 mcp.r.set, f"devreq:item:{req_id}", json.dumps(item), **kwargs)
-            # On failure: release claim so the next sweep can retry.
-            # On success: claim key is left to expire naturally — sweep skips
-            # items with dispatch_status=="started" before touching the claim.
-            if item.get("dispatch_status") != "started":
-                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
+            # Claim handling after dispatch attempt:
+            #
+            # SUCCESS (started): leave the claim to expire via TTL. The primary
+            # guard is dispatch_status=="started"; the claim is redundant but
+            # harmless extra protection.
+            #
+            # FAILURE: do NOT delete the claim — let it expire via CLAIM_TTL
+            # (300 s). Deleting immediately would open a window for a concurrent
+            # sweep that is mid-iteration to re-queue the same item (confirmed
+            # duplicate in production parallel-sweep test). After CLAIM_TTL the
+            # item becomes retry-able again naturally. Manual /dispatch bypasses
+            # this by force-clearing the claim before enqueuing.
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -174,16 +174,37 @@ class TestSweepDispatchBacklog:
         assert "15" not in requeued
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
 
-    def test_claim_released_on_failure_lets_sweep_retry(self):
+    def test_claim_retained_on_failure_blocks_sweep_during_ttl(self):
+        """On failure the dispatcher leaves the claim; sweep cannot re-queue until TTL expires."""
         r = _r()
         _seed_approved(r, "16", dispatch_status="failed")
         replit_mcp.enqueue_if_unclaimed(r, "16")
-        # Loop processes item — fails — releases claim, updates status
+        # Loop processes item — fails — does NOT release claim (just updates status)
         r.brpop(replit_mcp.DISPATCH_QUEUE, 0)
-        r.delete(replit_mcp.K_CLAIM + "16")
-        # Item still shows "failed" in Redis
+        # Claim still present → sweep must skip
+        raw = r.get("devreq:item:16")
+        item = json.loads(raw)
+        item["dispatch_status"] = "failed"
+        r.set("devreq:item:16", json.dumps(item))
+        # Claim still alive — sweep must skip (claim not deleted on failure)
         requeued = replit_mcp.sweep_dispatch_backlog(r)
-        assert "16" in requeued
+        assert "16" not in requeued
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 0
+
+    def test_claim_expired_on_failure_lets_sweep_retry(self):
+        """After CLAIM_TTL expires, sweep can re-queue a failed item."""
+        r = _r()
+        _seed_approved(r, "16b", dispatch_status="failed")
+        replit_mcp.enqueue_if_unclaimed(r, "16b")
+        r.brpop(replit_mcp.DISPATCH_QUEUE, 0)
+        # Simulate claim TTL expiry by deleting manually
+        r.delete(replit_mcp.K_CLAIM + "16b")
+        raw = r.get("devreq:item:16b")
+        item = json.loads(raw)
+        item["dispatch_status"] = "failed"
+        r.set("devreq:item:16b", json.dumps(item))
+        requeued = replit_mcp.sweep_dispatch_backlog(r)
+        assert "16b" in requeued
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
 
     def test_started_status_prevents_requeue_even_without_claim(self):
@@ -222,10 +243,9 @@ class TestDispatcherGuard:
         assert item.get("dispatch_status") != "started"  # loop would proceed
 
     def test_claim_not_deleted_after_start(self):
-        """After a successful start the loop leaves the claim; sweep must rely on status."""
+        """After a successful start the loop leaves the claim; sweep skips on dispatch_status."""
         r = _r()
         _seed_approved(r, "23", dispatch_status="failed")
-        # Enqueue
         replit_mcp.enqueue_if_unclaimed(r, "23")
         r.brpop(replit_mcp.DISPATCH_QUEUE, 0)
         # Simulate successful start: update status, leave claim in place
@@ -233,9 +253,26 @@ class TestDispatcherGuard:
         item = json.loads(raw)
         item["dispatch_status"] = "started"
         r.set("devreq:item:23", json.dumps(item))
-        # Claim still present; sweep should skip due to dispatch_status=started
+        # Sweep must skip — dispatch_status=started is the primary guard
         requeued = replit_mcp.sweep_dispatch_backlog(r)
         assert "23" not in requeued
+
+    def test_claim_not_deleted_after_failure(self):
+        """After failure the dispatcher leaves the claim to prevent concurrent-sweep race."""
+        r = _r()
+        _seed_approved(r, "24", dispatch_status="failed")
+        replit_mcp.enqueue_if_unclaimed(r, "24")
+        r.brpop(replit_mcp.DISPATCH_QUEUE, 0)
+        # Dispatcher fails — does NOT delete claim (TTL expiry handles cooldown)
+        raw = r.get("devreq:item:24")
+        item = json.loads(raw)
+        item["dispatch_status"] = "failed"
+        r.set("devreq:item:24", json.dumps(item))
+        # Claim still alive → sweep must skip
+        assert r.exists(replit_mcp.K_CLAIM + "24")
+        requeued = replit_mcp.sweep_dispatch_backlog(r)
+        assert "24" not in requeued
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +315,9 @@ class TestSetStatusAtomicEnqueue:
         with patch.object(dr, "_redis", return_value=r):
             dr.set_status("30", "approved", "owner")
         # Seed into approved list so sweep can see it
-        raw = r.get("devreq:item:30")
-        item = json.loads(raw)
         if not r.lpos("devreq:approved", "30"):
             r.rpush("devreq:approved", "30")
+        # Claim set by approval — sweep must skip
         requeued = replit_mcp.sweep_dispatch_backlog(r)
         assert "30" not in requeued
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1

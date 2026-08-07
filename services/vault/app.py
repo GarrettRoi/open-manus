@@ -2520,13 +2520,18 @@ async def replit_mcp_dispatch(req_id: str, request: Request):
         raise HTTPException(status_code=409,
                             detail=f"Request '{rid}' is {item.get('status')!r}, "
                                    "not approved — approve it in Discord first")
-    # Atomic claim+LPUSH — same helper used by approval and sweep so all three
-    # producers can't race each other into a double-queue.
+    # Force-clear any existing claim then atomically claim+LPUSH.
+    # Manual /dispatch is an explicit admin retry — it should always work
+    # regardless of whether the claim from a prior failure is still alive.
+    # Sweep and approval use enqueue_if_unclaimed without force so they respect
+    # the claim-TTL cooldown after failure.
     import asyncio as _asyncio
+    await _asyncio.to_thread(r.delete, replit_mcp_mod.K_CLAIM + rid)
     queued = await _asyncio.to_thread(replit_mcp_mod.enqueue_if_unclaimed, r, rid)
     if not queued:
+        # Should not happen after force-delete, but guard anyway.
         return {"ok": False, "queued": False, "rid": rid,
-                "detail": "already queued or in flight — claim key exists"}
+                "detail": "enqueue failed unexpectedly after claim clear"}
     audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
     return {"ok": True, "queued": rid}
 
