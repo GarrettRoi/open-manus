@@ -2018,6 +2018,16 @@ async def admin_add_connection(request: Request):
             "vnc_port": (body.get("vnc_port") or "5900") or "5900",
         }
         base_url = ""
+    elif auth["kind"] == "mcp_bearer":
+        api_key = (form.get("api_key") or str(body.get("bearer_token") or "")).strip()
+        if not api_key:
+            raise HTTPException(status_code=400,
+                                detail="Bearer token required for MCP connections (field: api_key or bearer_token)")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="MCP server URL required (field: base_url)")
+        if not base_url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="MCP server URL must use HTTPS")
+        secrets_d = {"api_key": api_key}
     elif auth["kind"] == "email":
         secrets_d, err = _parse_email_form(form)
         if err:
@@ -2047,6 +2057,15 @@ async def admin_add_connection(request: Request):
         status=status,
     )
     audit_log("admin", conn_id, "connection_created", f"Service: {service} (via dashboard)")
+
+    # For MCP connections: eagerly sync the tool manifest from the remote server.
+    if auth["kind"] == "mcp_bearer":
+        try:
+            tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
+            r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            logger.info("Synced %d MCP tools for connection %s (admin API)", len(tools), conn_id)
+        except Exception as exc:
+            logger.warning("MCP tool sync failed for %s (admin API): %s", conn_id, exc)
 
     # Optional immediate grants for one or more agents.
     for agent in (body.get("grant_agents") or []):
@@ -2183,6 +2202,16 @@ def _apply_connection_update(
                 return conn, secrets_d, "Ports must be numbers"
             secrets_d[fld] = val
 
+    # ── mcp_bearer: HTTPS guard on URL edits; bearer token already handled above ─
+    if (conn.get("auth") or {}).get("kind") == "mcp_bearer":
+        new_url = (str(body.get("base_url") or "")).strip()
+        if new_url and not new_url.startswith("https://"):
+            return conn, secrets_d, "MCP server URL must use HTTPS"
+        # accept bearer_token as an alias for api_key for programmatic callers
+        new_token = (str(body.get("bearer_token") or "")).strip()
+        if new_token:
+            secrets_d["api_key"] = new_token
+
     return conn, secrets_d, None
 
 
@@ -2250,6 +2279,23 @@ async def admin_update_connection(conn_id: str, request: Request):
         status=conn.get("status", "ready"),
     )
     audit_log("admin", cid, "connection_updated", "(via Discord)")
+
+    # MCP bearer connections: re-sync the tool manifest whenever the URL or
+    # token changes so the cached manifest stays accurate without a manual Sync.
+    if (conn_upd.get("auth") or {}).get("kind") == "mcp_bearer":
+        _url_changed = new_base_url and new_base_url != conn.get("base_url", "").rstrip("/")
+        _tok_changed = bool((str(body.get("api_key") or body.get("bearer_token") or "")).strip())
+        if _url_changed or _tok_changed:
+            _mcp_url = new_base_url or conn.get("base_url", "")
+            _mcp_tok = secrets_upd.get("api_key", "")
+            if _mcp_url and _mcp_tok:
+                try:
+                    _tools = await custom_mcp.list_tools(_mcp_url, _mcp_tok)
+                    r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(_tools))
+                    logger.info("Re-synced %d MCP tools for %s after update", len(_tools), cid)
+                except Exception as exc:
+                    logger.warning("MCP tool re-sync failed for %s after update: %s", cid, exc)
+
     updated = store.get(cid)
     return {"connection": _conn_view(updated)}
 
