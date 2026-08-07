@@ -281,7 +281,9 @@ def define_vault_ui_classes() -> None:
 
             await interaction.response.defer(ephemeral=True)
 
-            body: dict = {"name": name_val, "service": service_val}
+            # Use the connection name as the human-readable label too.
+            # The user can update the label separately in the dashboard.
+            body: dict = {"name": name_val, "label": name_val, "service": service_val}
             if secret_val:
                 # OAuth2: client_id + client_secret
                 body["client_id"] = credential_val
@@ -303,7 +305,13 @@ def define_vault_ui_classes() -> None:
                 conn_id = conn.get("id", name_val.upper())
                 needs_login = (result or {}).get("needs_login", False)
                 auth_kind = conn.get("auth_kind", "")
-                msg = f"✅ Connection **{conn_id}** created."
+                msg = (
+                    f"✅ Connection **{conn_id}** created.\n\n"
+                    f"Agents with a grant will see it after their next sync "
+                    f"(within 5 min), or immediately if they run "
+                    f"`vault(action='refresh')`.  Use `/vault grant <agent> {conn_id}` "
+                    f"to give an agent access."
+                )
                 if needs_login:
                     msg += (
                         f"\n\nThis service requires OAuth authorization. "
