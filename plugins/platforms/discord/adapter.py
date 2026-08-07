@@ -26,6 +26,13 @@ from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Rejection reason for slash commands invoked in channels this bot cannot
+# view (i.e. the agent is not "in" that chat). Discord shows every guild
+# bot's commands in the picker regardless of channel access, so this gate
+# turns those stray invocations into a friendly ephemeral instead of an
+# unauthorized-attempt alert.
+REASON_NOT_IN_CHANNEL = "agent not in this channel"
+
 
 class _Snowflake:
     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
@@ -3835,6 +3842,25 @@ class DiscordAdapter(BasePlatformAdapter):
         chan_obj = getattr(interaction, "channel", None)
         in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
 
+        # ── Channel membership gate ──
+        # Discord surfaces every guild bot's slash commands in the picker
+        # regardless of channel access, so an interaction can arrive for a
+        # channel this bot cannot even see. Treat "can view the channel" as
+        # membership: agents that are not in the chat refuse the command
+        # with a friendly ephemeral instead of acting from outside it.
+        if not in_dm and chan_obj is not None:
+            guild = getattr(interaction, "guild", None)
+            me = getattr(guild, "me", None)
+            if me is not None:
+                try:
+                    perms = chan_obj.permissions_for(me)
+                    if not getattr(perms, "view_channel", True):
+                        return (False, REASON_NOT_IN_CHANNEL)
+                except Exception:
+                    # Unresolvable permissions (partial objects, etc.) —
+                    # fall through to the existing gates.
+                    pass
+
         channel_ids: set = set()
         channel_keys: set = set()
         # ── Channel scope (mirrors on_message lines 3374-3388) ──
@@ -3957,15 +3983,29 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         guild_id = getattr(interaction, "guild_id", None)
 
-        logger.warning(
-            "[Discord] Unauthorized slash attempt: user=%s id=%s channel=%s "
-            "guild=%s cmd=%r reason=%r",
-            user_name, user_id, chan_id, guild_id, command_text, reason,
-        )
+        # "Not in this channel" is an expected everyday miss (Discord lists
+        # every guild bot's commands everywhere), not a security event:
+        # friendlier ephemeral, info-level log, and no admin alert spam.
+        not_in_channel = reason == REASON_NOT_IN_CHANNEL
+
+        if not_in_channel:
+            logger.info(
+                "[Discord] Slash command in non-member channel: user=%s id=%s "
+                "channel=%s guild=%s cmd=%r",
+                user_name, user_id, chan_id, guild_id, command_text,
+            )
+        else:
+            logger.warning(
+                "[Discord] Unauthorized slash attempt: user=%s id=%s channel=%s "
+                "guild=%s cmd=%r reason=%r",
+                user_name, user_id, chan_id, guild_id, command_text, reason,
+            )
 
         try:
             await interaction.response.send_message(
-                "You're not authorized to use this command.",
+                "I'm not in this chat — try one of my channels instead."
+                if not_in_channel
+                else "You're not authorized to use this command.",
                 ephemeral=True,
             )
         except Exception as e:
@@ -3974,12 +4014,14 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[Discord] Could not send unauthorized ephemeral: %s", e)
 
         # Fire-and-forget: don't block the interaction handler on Telegram I/O.
-        try:
-            asyncio.create_task(self._notify_unauthorized_slash(
-                user_name, user_id, chan_id, guild_id, command_text, reason,
-            ))
-        except Exception as e:
-            logger.debug("[Discord] Could not schedule admin notify task: %s", e)
+        # Skip the cross-platform admin alert for routine non-member misses.
+        if not not_in_channel:
+            try:
+                asyncio.create_task(self._notify_unauthorized_slash(
+                    user_name, user_id, chan_id, guild_id, command_text, reason,
+                ))
+            except Exception as e:
+                logger.debug("[Discord] Could not schedule admin notify task: %s", e)
 
         return False
 
