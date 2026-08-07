@@ -268,7 +268,7 @@
     <div class="table-responsive">
         <table>
             <thead>
-                <tr><th>Name</th><th>Service</th><th>Auth</th><th>Status</th><th>Actions</th></tr>
+                <tr><th>Name</th><th>Service</th><th>Auth</th><th>Status</th><th>Last Test</th><th>Actions</th></tr>
             </thead>
             <tbody>
                 {% for c in connections %}
@@ -301,6 +301,21 @@
                             <span class="badge badge-warning">no key</span>
                         {% endif %}
                     </td>
+                    <td id="test_cell_{{ c.id }}" style="white-space: nowrap;">
+                        {% if c.last_test_ok == '1' %}
+                            <span class="badge badge-success" title="{{ c.last_test_reason }}{% if c.last_test_ms %} · {{ c.last_test_ms }}ms{% endif %}">&#10003; pass</span>
+                        {% elif c.last_test_ok == '0' %}
+                            <span class="badge badge-danger" title="{{ c.last_test_reason }}">&#10007; fail</span>
+                            <br><span style="font-size: 11px; color: var(--danger);">{{ c.last_test_reason[:40] }}{% if c.last_test_reason|length > 40 %}…{% endif %}</span>
+                        {% elif c.last_test_ok == '' and c.last_test_at %}
+                            <span class="badge badge-muted" title="{{ c.last_test_reason }}">N/A</span>
+                        {% else %}
+                            <span style="color: var(--text-muted); font-size: 12px;">—</span>
+                        {% endif %}
+                        {% if c.last_test_at %}
+                            <br><span style="font-size: 11px; color: var(--text-muted);">{{ c.last_test_at[:16] }}</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if c.auth_kind == 'oauth2' %}
                         <a href="/services/{{ c.id }}/connect" class="btn btn-sm btn-primary">{{ 'Reconnect' if c.connected else 'Connect' }}</a>
@@ -308,6 +323,7 @@
                         {% if c.auth_kind == 'mcp_bearer' %}
                         <button class="btn btn-sm btn-outline" onclick="syncMcpTools('{{ c.id }}', this)" title="{{ c.mcp_tool_count }} tools cached">🔄 Sync ({{ c.mcp_tool_count }})</button>
                         {% endif %}
+                        <button class="btn btn-sm btn-outline" onclick="testConn('{{ c.id }}', this)">⚡ Test</button>
                         <button class="btn btn-sm btn-outline" onclick='openEdit({{ c | tojson }})'>Edit</button>
                         <form method="post" action="/services/delete" style="display:inline;" onsubmit="return confirm('Delete {{ c.id }}?')">
                             <input type="hidden" name="conn_id" value="{{ c.id }}">
@@ -644,6 +660,39 @@ function closeEdit() {
     // Restore key label in case it was changed for MCP
     const lbl = document.querySelector('#e_grp_key label');
     if (lbl) lbl.textContent = 'New API key (leave blank to keep current)';
+}
+
+async function testConn(connId, btn) {
+    const orig = btn.textContent;
+    btn.textContent = '⏳…';
+    btn.disabled = true;
+    const cell = document.getElementById('test_cell_' + connId);
+    try {
+        const resp = await fetch('/api/admin/connections/' + connId + '/test', {method: 'POST'});
+        const d = await resp.json();
+        if (!resp.ok) {
+            cell.innerHTML = '<span class="badge badge-danger" title="' + (d.detail || 'error') + '">&#10007; error</span>';
+            return;
+        }
+        const ok = d.ok, reason = (d.reason || '').slice(0, 60), ms = d.elapsed_ms,
+              at = (d.tested_at || '').slice(0, 16);
+        let badge = '';
+        if (ok === true) {
+            badge = '<span class="badge badge-success" title="' + (d.reason || '') +
+                    (ms ? ' · ' + ms + 'ms' : '') + '">&#10003; pass</span>';
+        } else if (ok === false) {
+            badge = '<span class="badge badge-danger" title="' + (d.reason || '') + '">&#10007; fail</span>' +
+                    '<br><span style="font-size:11px;color:var(--danger);">' + reason + '</span>';
+        } else {
+            badge = '<span class="badge badge-muted" title="' + (d.reason || '') + '">N/A</span>';
+        }
+        cell.innerHTML = badge + (at ? '<br><span style="font-size:11px;color:var(--text-muted);">' + at + '</span>' : '');
+    } catch(e) {
+        cell.innerHTML = '<span class="badge badge-danger">error</span>';
+    } finally {
+        btn.textContent = orig;
+        btn.disabled = false;
+    }
 }
 
 async function syncMcpTools(connId, btn) {

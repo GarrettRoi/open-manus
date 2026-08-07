@@ -15643,6 +15643,14 @@ async def vault_connect_link(conn_id: str):
     return await _vault_admin_call("POST", f"/api/admin/connections/{safe}/connect-link", {})
 
 
+@app.post("/api/vault/connections/{conn_id}/test")
+async def vault_test_connection(conn_id: str):
+    """Proxy to the vault's connection-test endpoint. Returns a sanitized probe
+    result (ok/reason/elapsed_ms/tested_at) with no credential values."""
+    safe = urllib.parse.quote(conn_id, safe="")
+    return await _vault_admin_call("POST", f"/api/admin/connections/{safe}/test", {})
+
+
 class VaultGrantUpdate(BaseModel):
     agent: str
     conn_id: str

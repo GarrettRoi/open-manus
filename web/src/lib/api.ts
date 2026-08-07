@@ -647,6 +647,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ agent, conn_id: connId, granted }),
     }),
+  testVaultConnection: (connId: string) =>
+    fetchJSON<VaultTestResult>(
+      `/api/vault/connections/${encodeURIComponent(connId)}/test`,
+      { method: "POST" },
+    ),
 
   // Profiles
   getProfiles: () =>
@@ -2019,6 +2024,26 @@ export interface VaultConnection {
   has_client?: boolean;
   token_expires_at?: string;
   custom_oauth?: { authorize_url: string; token_url: string; scopes: string };
+  // Last-test result persisted on the connection (raw Redis strings).
+  // "1" = pass, "0" = fail, "" = untestable kind, absent = never tested.
+  last_test_ok?: string;
+  last_test_reason?: string;
+  last_test_at?: string;
+  last_test_ms?: string;
+}
+
+export interface VaultTestResult {
+  /** true = auth confirmed, false = failure, null = untestable kind */
+  ok: boolean | null;
+  /** HTTP status code returned by the probe; null for MCP and untestable kinds */
+  status_code: number | null;
+  /** Human-readable reason — never contains credential values */
+  reason: string;
+  /** Round-trip time in milliseconds, or null when no network call was made */
+  elapsed_ms: number | null;
+  tested_at: string;
+  /** Only present for MCP connections */
+  tool_count?: number;
 }
 
 export interface VaultCatalogEntry {

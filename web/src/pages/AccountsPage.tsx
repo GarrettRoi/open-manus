@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
@@ -15,6 +16,7 @@ import type {
   VaultConnection,
   VaultConnectionCreate,
   VaultOverview,
+  VaultTestResult,
 } from "@/lib/api";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -63,6 +65,8 @@ export default function AccountsPage() {
   const [adding, setAdding] = useState<string | null>(null); // service key
   const [busy, setBusy] = useState(false);
   const [showMore, setShowMore] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, VaultTestResult>>({});
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -123,6 +127,18 @@ export default function AccountsPage() {
       );
     } catch (e) {
       showToast(String((e as Error)?.message || e), "error");
+    }
+  };
+
+  const handleTest = async (conn: VaultConnection) => {
+    setTesting(conn.id);
+    try {
+      const result = await api.testVaultConnection(conn.id);
+      setTestResults((prev) => ({ ...prev, [conn.id]: result }));
+    } catch (e) {
+      showToast(String((e as Error)?.message || e), "error");
+    } finally {
+      setTesting(null);
     }
   };
 
@@ -308,6 +324,24 @@ export default function AccountsPage() {
               onToggle={() => toggleGrant(conn, false)}
               onLogin={() => startOAuthLogin(conn)}
               onDelete={() => deleteConnection(conn)}
+              onTest={() => handleTest(conn)}
+              isTesting={testing === conn.id}
+              testResult={
+                testResults[conn.id] ??
+                (conn.last_test_at
+                  ? {
+                      ok: conn.last_test_ok === "1"
+                        ? true
+                        : conn.last_test_ok === "0"
+                          ? false
+                          : null,
+                      reason: conn.last_test_reason ?? "",
+                      status_code: null,
+                      elapsed_ms: conn.last_test_ms ? parseInt(conn.last_test_ms) : null,
+                      tested_at: conn.last_test_at,
+                    }
+                  : undefined)
+              }
             />
           ))}
         </CardContent>
@@ -336,6 +370,24 @@ export default function AccountsPage() {
               onToggle={() => toggleGrant(conn, true)}
               onLogin={() => startOAuthLogin(conn)}
               onDelete={() => deleteConnection(conn)}
+              onTest={() => handleTest(conn)}
+              isTesting={testing === conn.id}
+              testResult={
+                testResults[conn.id] ??
+                (conn.last_test_at
+                  ? {
+                      ok: conn.last_test_ok === "1"
+                        ? true
+                        : conn.last_test_ok === "0"
+                          ? false
+                          : null,
+                      reason: conn.last_test_reason ?? "",
+                      status_code: null,
+                      elapsed_ms: conn.last_test_ms ? parseInt(conn.last_test_ms) : null,
+                      tested_at: conn.last_test_at,
+                    }
+                  : undefined)
+              }
             />
           ))}
         </CardContent>
@@ -377,6 +429,9 @@ function ConnectionRow({
   onToggle,
   onLogin,
   onDelete,
+  onTest,
+  isTesting,
+  testResult,
 }: {
   conn: VaultConnection;
   granted: boolean;
@@ -384,9 +439,16 @@ function ConnectionRow({
   onToggle: () => void;
   onLogin: () => void;
   onDelete: () => void;
+  onTest: () => void;
+  isTesting: boolean;
+  testResult?: VaultTestResult;
 }) {
   const isOAuth = conn.auth_kind === "oauth2";
   const needsLogin = isOAuth && !conn.connected;
+
+  // Resolve the badge state: prefer live result from this session, fall back to persisted.
+  const displayResult = testResult;
+
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border px-3 py-2.5 sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-2">
@@ -416,11 +478,45 @@ function ConnectionRow({
                 no key
               </Badge>
             )}
+            {/* Last-test badge */}
+            {displayResult && displayResult.ok === true && (
+              <Badge
+                className="border-emerald-500/40 text-emerald-400"
+                title={`${displayResult.reason}${displayResult.elapsed_ms != null ? ` · ${displayResult.elapsed_ms}ms` : ""}`}
+              >
+                ✓ pass
+              </Badge>
+            )}
+            {displayResult && displayResult.ok === false && (
+              <Badge
+                className="border-red-500/40 text-red-400"
+                title={displayResult.reason}
+              >
+                ✗ fail
+              </Badge>
+            )}
+            {displayResult && displayResult.ok === null && (
+              <Badge className="border-border text-muted-foreground">
+                N/A
+              </Badge>
+            )}
           </div>
           <div className="truncate text-xs text-muted-foreground">
             {conn.id}
             {conn.base_url ? ` · ${conn.base_url}` : ""}
           </div>
+          {/* Failure detail */}
+          {displayResult && displayResult.ok === false && (
+            <div className="mt-0.5 truncate text-xs text-red-400">
+              {displayResult.reason}
+            </div>
+          )}
+          {/* Timestamp */}
+          {displayResult?.tested_at && (
+            <div className="text-xs text-muted-foreground">
+              tested {displayResult.tested_at.slice(0, 16)}
+            </div>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-1.5 sm:shrink-0">
@@ -429,6 +525,16 @@ function ConnectionRow({
             <ExternalLink className="mr-1 h-3.5 w-3.5" /> Log in
           </Button>
         )}
+        <Button
+          size="sm"
+          ghost
+          onClick={onTest}
+          disabled={busy || isTesting}
+          title="Test connection"
+          className="shrink-0"
+        >
+          <Zap className={`h-3.5 w-3.5 ${isTesting ? "animate-pulse" : ""}`} />
+        </Button>
         <Button size="sm" ghost onClick={onToggle} disabled={busy} className="flex-1 sm:flex-none">
           {granted ? "Disable" : "Enable for agent"}
         </Button>

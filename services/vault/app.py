@@ -26,7 +26,7 @@ import httpx
 import redis
 import uvicorn
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -397,7 +397,280 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             view["email_address"] = secrets_d.get("username", "")
         else:
             view["connected"] = bool(secrets_d.get("api_key"))
+
+    # Last-test result — always included (safe: no credentials stored here).
+    # Fields are stored as plain strings in the Redis hash; absent = never tested.
+    view["last_test_ok"] = conn.get("last_test_ok", "")        # "1"|"0"|"" (untestable)|absent
+    view["last_test_reason"] = conn.get("last_test_reason", "")
+    view["last_test_at"] = conn.get("last_test_at", "")
+    view["last_test_ms"] = conn.get("last_test_ms", "")
+    view["last_test_status"] = conn.get("last_test_status", "")
     return view
+
+
+# ---------------------------------------------------------------------------
+# Connection test engine
+# ---------------------------------------------------------------------------
+_UNTESTABLE_KINDS = {"apple", "macincloud", "email"}
+
+
+async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
+    """Fire a safe, read-only probe for *conn_id*. Never raises — always returns
+    a sanitized dict with at least {ok, reason, tested_at}.
+
+    ok: True  = auth confirmed
+        False = reachable but auth/network failed
+        None  = kind cannot be probed over HTTP (apple/macincloud/email)
+
+    Results are persisted to Redis (last_test_ok / last_test_reason /
+    last_test_at / last_test_ms / last_test_status) so the UI can show them
+    without re-testing.  Credentials are never included in the reason string.
+    """
+    tested_at = datetime.now(timezone.utc).isoformat()
+
+    def _persist(ok_str: str, reason: str,
+                 status_code: str = "", elapsed_ms: str = "") -> None:
+        try:
+            r.hset(f"vault:conn:{conn_id}", mapping={
+                "last_test_ok":     ok_str,
+                "last_test_reason": reason[:500],
+                "last_test_at":     tested_at,
+                "last_test_ms":     elapsed_ms,
+                "last_test_status": status_code,
+            })
+        except Exception:
+            pass
+
+    def _make(ok, reason, status_code=None, elapsed_ms=None, **extra):
+        return {
+            "ok": ok,
+            "status_code": status_code,
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+            "tested_at": tested_at,
+            **extra,
+        }
+
+    conn = store.get(conn_id)
+    if not conn:
+        return _make(False, "Connection not found")
+
+    auth_kind = (conn.get("auth") or {}).get("kind", "")
+
+    # ── Untestable kinds ──────────────────────────────────────────────────────
+    if auth_kind in _UNTESTABLE_KINDS:
+        reason = "no HTTP probe for this connection kind"
+        _persist("", reason)
+        return _make(None, reason)
+
+    # ── MCP bearer: use tools/list as the probe ───────────────────────────────
+    if auth_kind == "mcp_bearer":
+        secrets_d = store.get_secrets(conn_id)
+        api_key = secrets_d.get("api_key", "")
+        base_url = conn.get("base_url", "")
+        if not api_key:
+            reason = "no bearer token stored"
+            _persist("0", reason)
+            return _make(False, reason)
+        t0 = time.monotonic()
+        try:
+            tools = await custom_mcp.list_tools(base_url, api_key)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            reason = f"tools/list OK — {len(tools)} tool(s)"
+            _persist("1", reason, "", str(elapsed))
+            return _make(True, reason, elapsed_ms=elapsed, tool_count=len(tools))
+        except custom_mcp.MCPTokenExpiredError:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            reason = "MCP bearer token rejected (401) — update the token in the vault"
+            _persist("0", reason, "401", str(elapsed))
+            return _make(False, reason, status_code=401, elapsed_ms=elapsed)
+        except Exception as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            reason = str(exc)[:300]
+            # Scrub: never let the raw key appear in the reason
+            if api_key and len(api_key) >= 8:
+                reason = reason.replace(api_key, "***vault***")
+            _persist("0", reason, "", str(elapsed))
+            return _make(False, reason, elapsed_ms=elapsed)
+
+    # ── HTTP-based kinds: bearer / header / query / oauth2 ───────────────────
+    base_url = (conn.get("base_url") or "").rstrip("/")
+    if not base_url:
+        reason = "no base URL configured — edit the connection to add one"
+        _persist("0", reason)
+        return _make(False, reason)
+
+    # Probe definition from catalog; fall back to GET /
+    tpl = get_template(conn.get("service", "")) or {}
+    probe = tpl.get("test_probe") or {"method": "GET", "path": "/"}
+    method = (probe.get("method") or "GET").upper()
+    path = probe.get("path") or "/"
+    probe_json = probe.get("json")  # optional body (e.g. Railway GraphQL)
+
+    if not path.startswith("/"):
+        path = "/" + path
+    url = base_url + path
+
+    # SSRF guard — same logic as the proxy route
+    allowed = store.allowed_hosts(conn)
+    try:
+        parsed = httpx.URL(url)
+        target_host = parsed.host
+    except Exception:
+        reason = "invalid probe URL"
+        _persist("0", reason)
+        return _make(False, reason)
+
+    if target_host not in allowed:
+        reason = f"host '{target_host}' not in allowlist for this connection"
+        _persist("0", reason)
+        return _make(False, reason)
+    if parsed.scheme != "https":
+        reason = "only HTTPS upstream URLs are allowed"
+        _persist("0", reason)
+        return _make(False, reason)
+
+    # Build auth headers / params
+    secrets_d = store.get_secrets(conn_id)
+    # Collect all secret strings for post-response scrubbing
+    scrub_values = [v for v in secrets_d.values() if isinstance(v, str) and len(v) >= 8]
+    if isinstance(secrets_d.get("extra_headers"), dict):
+        scrub_values.extend(
+            str(v) for v in secrets_d["extra_headers"].values()
+            if isinstance(v, str) and len(v) >= 8
+        )
+
+    if auth_kind == "oauth2":
+        try:
+            access_token, _ = await oauth_mod.get_valid_access_token(
+                conn["service"], conn_id, store, conn=conn)
+            scrub_values.append(access_token)
+            injected = build_auth(conn, secrets_d, access_token=access_token)
+        except OAuthError as exc:
+            msg = str(exc).lower()
+            if ("not connected" in msg or "no access token" in msg
+                    or "complete the oauth" in msg or "service not connected" in msg):
+                reason = "not connected — complete the OAuth login first"
+            elif "no refresh token" in msg or "reconnect" in msg:
+                reason = "refresh token missing — needs re-login"
+            elif "refresh" in msg or "expired" in msg:
+                reason = "access token expired and refresh failed — needs re-login"
+            else:
+                raw = str(exc)[:150]
+                # scrub any stray token values that may appear in the error
+                for sv in scrub_values:
+                    raw = raw.replace(sv, "***vault***")
+                reason = f"OAuth error — needs re-login: {raw}"
+            _persist("0", reason)
+            return _make(False, reason)
+        except Exception as exc:
+            raw = str(exc)[:150]
+            for sv in scrub_values:
+                raw = raw.replace(sv, "***vault***")
+            reason = f"Auth build failed: {raw}"
+            _persist("0", reason)
+            return _make(False, reason)
+    else:
+        try:
+            injected = build_auth(conn, secrets_d)
+        except AuthInjectionError as exc:
+            reason = str(exc)[:300]
+            for sv in scrub_values:
+                reason = reason.replace(sv, "***vault***")
+            _persist("0", reason)
+            return _make(False, reason)
+
+    headers = dict(injected["headers"])
+    params = dict(injected["params"])
+
+    kwargs: Dict[str, Any] = {
+        "headers": headers,
+        "params": params or None,
+        "timeout": 15.0,
+        "follow_redirects": False,
+    }
+    if probe_json is not None:
+        kwargs["json"] = probe_json
+
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.request(method, url, **kwargs)
+        elapsed = int((time.monotonic() - t0) * 1000)
+    except httpx.RequestError as exc:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        reason = f"Connection error: {str(exc)[:200]}"
+        for sv in scrub_values:
+            reason = reason.replace(sv, "***vault***")
+        _persist("0", reason, "", str(elapsed))
+        return _make(False, reason, elapsed_ms=elapsed)
+
+    status = resp.status_code
+    # auth_ok heuristic: 401/403 = auth failure; 5xx = server error;
+    # anything else (including 404 on a known probe path) = auth worked.
+    if status in (401, 403):
+        ok = False
+        reason = f"Auth rejected (HTTP {status})"
+    elif status >= 500:
+        ok = False
+        reason = f"Server error (HTTP {status})"
+    else:
+        ok = True
+        reason = f"HTTP {status}"
+
+    # ── Per-probe body inspection ─────────────────────────────────────────────
+    response_check = probe.get("response_check")
+    if response_check == "graphql_auth" and ok:
+        # Some GraphQL APIs (e.g. Railway) always return 2xx/4xx regardless of
+        # auth state; the only reliable signal is the JSON body.
+        # Pass: body contains data.<any non-null field>
+        # Fail: body contains errors[].message with auth keywords
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        errors = body.get("errors") or []
+        data = body.get("data") or {}
+        auth_keywords = {"unauthorized", "not authorized", "unauthenticated",
+                         "authentication", "invalid token", "forbidden"}
+        error_msgs = " ".join(
+            (e.get("message") or "") for e in errors if isinstance(e, dict)
+        ).lower()
+        has_auth_error = any(kw in error_msgs for kw in auth_keywords)
+        # data must have at least one truthy field (e.g. me.name)
+        has_data = any(v is not None for v in data.values()) if data else False
+
+        if has_auth_error:
+            ok = False
+            # Scrub: error messages might contain token fragments
+            safe_msg = error_msgs[:200]
+            for sv in scrub_values:
+                safe_msg = safe_msg.replace(sv, "***vault***")
+            reason = f"auth rejected — {safe_msg}" if safe_msg else "auth rejected"
+        elif has_data:
+            # Extract a human-readable field to confirm what we got back
+            # (e.g. me.name = "Alice" → "authenticated as Alice")
+            inner = next(iter(data.values()), None)
+            display = ""
+            if isinstance(inner, dict):
+                display = next(
+                    (str(v) for v in inner.values() if isinstance(v, str) and v),
+                    ""
+                )
+            if display:
+                # Scrub display value — it might equal a name in a secret
+                for sv in scrub_values:
+                    display = display.replace(sv, "***vault***")
+                reason = f"authenticated — {display[:80]}"
+            else:
+                reason = f"authenticated (HTTP {status})"
+        else:
+            # No data, no clear auth error — treat as inconclusive pass
+            reason = f"HTTP {status} (no data returned)"
+
+    ok_str = "1" if ok else "0"
+    _persist(ok_str, reason, str(status), str(elapsed))
+    return _make(ok, reason, status_code=status, elapsed_ms=elapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +951,7 @@ def _parse_custom_oauth_form(form) -> tuple:
 
 
 @app.post("/services/add")
-async def add_service(request: Request):
+async def add_service(request: Request, background_tasks: BackgroundTasks):
     if (resp := _admin_or_redirect(request)):
         return resp
 
@@ -831,7 +1104,10 @@ async def add_service(request: Request):
             # Non-fatal: connection is saved; user can manually sync later.
 
     if status == "needs_login":
+        # OAuth connections: test fires after the callback completes, not here.
         return RedirectResponse(url=f"/services/{conn_id}/connect", status_code=303)
+    # Non-blocking test — result visible on next /services load.
+    background_tasks.add_task(_run_connection_test, conn_id)
     mcp_notice = ""
     if auth["kind"] == "mcp_bearer":
         count = len(json.loads(r.get(f"vault:conn:{conn_id}:mcp_tools") or "[]"))
@@ -841,7 +1117,7 @@ async def add_service(request: Request):
 
 
 @app.post("/services/update")
-async def update_service(request: Request):
+async def update_service(request: Request, background_tasks: BackgroundTasks):
     if (resp := _admin_or_redirect(request)):
         return resp
     form = await request.form()
@@ -1022,6 +1298,9 @@ async def update_service(request: Request):
                 except Exception as exc:
                     logger.warning("MCP tool re-sync failed for %s: %s", conn_id, exc)
 
+    # Non-blocking test — skip OAuth (needs login first); test fires after callback.
+    if (conn.get("auth") or {}).get("kind") != "oauth2":
+        background_tasks.add_task(_run_connection_test, conn_id)
     return RedirectResponse(url="/services?notice=Connection+updated", status_code=303)
 
 
@@ -1063,7 +1342,8 @@ async def oauth_connect(request: Request, conn_id: str):
 
 
 @app.get("/oauth/callback")
-async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+async def oauth_callback(request: Request, background_tasks: BackgroundTasks,
+                         code: str = "", state: str = "", error: str = ""):
     # Auth model: the single-use, server-generated OAuth state token IS the
     # authorization for this callback (it can only exist if an admin — via
     # the vault UI or the token-authed dashboard API — started the flow).
@@ -1098,6 +1378,8 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
     store.set_secrets(conn_id, secrets_d)
     r.hset(f"vault:conn:{conn_id}", "status", "ready")
     audit_log("admin", conn_id, "oauth_connected", f"Service: {pending['service']}")
+    # Fire a connection test in the background now that we have a live token.
+    background_tasks.add_task(_run_connection_test, conn_id)
     if has_session:
         return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
     return HTMLResponse(
@@ -2314,7 +2596,7 @@ def _form_like(body: Dict[str, Any]):
 
 
 @app.post("/api/admin/connections")
-async def admin_add_connection(request: Request):
+async def admin_add_connection(request: Request, background_tasks: BackgroundTasks):
     require_admin_api(request)
     _require_json_content_type(request)
     body = await request.json()
@@ -2433,6 +2715,10 @@ async def admin_add_connection(request: Request):
         if agent in AGENT_NAMES:
             store.set_grant(agent, conn_id, True)
             audit_log("admin", conn_id, "grant_added", f"Granted to {agent} (via dashboard)")
+
+    # Non-blocking test — skip OAuth connections (no token yet; test after callback).
+    if status != "needs_login":
+        background_tasks.add_task(_run_connection_test, conn_id)
 
     conn = store.get(conn_id)
     return {"connection": _conn_view(conn), "needs_login": status == "needs_login"}
@@ -2589,7 +2875,8 @@ def _apply_connection_update(
 
 
 @app.post("/api/admin/connections/{conn_id}/update")
-async def admin_update_connection(conn_id: str, request: Request):
+async def admin_update_connection(conn_id: str, request: Request,
+                                  background_tasks: BackgroundTasks):
     """Partial-update a vault connection (blank/absent fields keep existing values).
 
     Mirrors the HTML POST /services/update merge semantics so callers only
@@ -2681,7 +2968,38 @@ async def admin_update_connection(conn_id: str, request: Request):
                     logger.warning("MCP tool re-sync failed for %s after update: %s", cid, exc)
 
     updated = store.get(cid)
+    # Non-blocking test — skip OAuth connections (no token change here).
+    if (conn_upd.get("auth") or {}).get("kind") != "oauth2":
+        background_tasks.add_task(_run_connection_test, cid)
     return {"connection": _conn_view(updated)}
+
+
+@app.post("/api/admin/connections/{conn_id}/test")
+async def admin_test_connection(conn_id: str, request: Request):
+    """Run a safe read-only probe for the connection and return a sanitized result.
+
+    Dispatches by auth_kind:
+      bearer/header/query/oauth2 → fires the catalog test_probe (or GET /) with
+                                   injected credentials through the existing SSRF guard.
+      mcp_bearer                 → calls tools/list via the MCP session handshake.
+      apple/macincloud/email     → returns {ok: null} (non-HTTP protocol).
+
+    The result is persisted to the connection hash (last_test_ok / last_test_reason /
+    last_test_at / last_test_ms / last_test_status) so it appears in _conn_view.
+
+    Response: {ok: bool|null, status_code: int|null, reason: str,
+               elapsed_ms: int|null, tested_at: str}
+
+    Credentials are never included in the response.
+    Auth: admin session cookie OR X-Vault-Admin-Token header.
+    """
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    if not store.get(cid):
+        raise HTTPException(status_code=404, detail="Connection not found")
+    result = await _run_connection_test(cid)
+    audit_log("admin", cid, "connection_tested", result.get("reason", "")[:120])
+    return result
 
 
 @app.post("/api/admin/connections/{conn_id}/connect-link")

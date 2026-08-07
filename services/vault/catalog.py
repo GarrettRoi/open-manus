@@ -29,6 +29,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "allowed_hosts": ["api.openai.com"],
         "setup_help": "Paste an API key from https://platform.openai.com/api-keys.",
         "example_call": "POST /v1/chat/completions",
+        "test_probe": {"method": "GET", "path": "/v1/models"},
     },
     "elevenlabs": {
         "label": "ElevenLabs",
@@ -37,6 +38,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "allowed_hosts": ["api.elevenlabs.io"],
         "setup_help": "Paste an API key from ElevenLabs → Profile → API keys.",
         "example_call": "GET /v1/voices",
+        "test_probe": {"method": "GET", "path": "/v1/voices"},
     },
     "discord": {
         "label": "Discord API",
@@ -45,6 +47,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "allowed_hosts": ["discord.com"],
         "setup_help": "Paste a bot token from the Discord Developer Portal → Bot.",
         "example_call": "GET /users/@me",
+        "test_probe": {"method": "GET", "path": "/users/@me"},
     },
     "n8n": {
         "label": "n8n",
@@ -60,6 +63,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "from n8n → Settings → API."
         ),
         "example_call": "GET /workflows",
+        "test_probe": {"method": "GET", "path": "/workflows"},
     },
     "quo": {
         "label": "Quo (OpenPhone)",
@@ -71,14 +75,24 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Note: Quo uses the raw key in the Authorization header (no 'Bearer')."
         ),
         "example_call": "GET /phone-numbers",
+        "test_probe": {"method": "GET", "path": "/phone-numbers"},
     },
     "railway": {
         "label": "Railway",
         "auth": {"kind": "bearer"},
-        "base_url": "https://backboard.railway.app/graphql/v2",
-        "allowed_hosts": ["backboard.railway.app"],
+        "base_url": "https://backboard.railway.com/graphql/v2",
+        "allowed_hosts": ["backboard.railway.com"],
         "setup_help": "Paste a token from Railway → Account Settings → Tokens.",
         "example_call": 'POST / with GraphQL body {"query": "..."}',
+        "test_probe": {
+            "method": "POST",
+            "path": "/",
+            "json": {"query": "{ me { name } }"},
+            # After HTTP response, inspect the GraphQL body:
+            # errors[].message containing "Unauthorized"/"Not Authorized" → auth failure.
+            # data.me.name present → auth confirmed.
+            "response_check": "graphql_auth",
+        },
     },
     "google": {
         "label": "Google Workspace (Gmail / Drive / Sheets / Docs / Slides / Forms / Tasks / Chat / People / Calendar)",
@@ -119,6 +133,8 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Chat/Contacts)."
         ),
         "example_call": "GET /gmail/v1/users/me/messages",
+        # Google OAuth probe: userinfo works for any connected Google service
+        "test_probe": {"method": "GET", "path": "/oauth2/v1/userinfo"},
     },
     # ── Individual Google Workspace service connections ──────────────────────
     # Each connection is scoped to one service with its correct base URL and
@@ -142,6 +158,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Click Connect to log in and grant Gmail access."
         ),
         "example_call": "vault_<id>_gmail with operation='search'",
+        "test_probe": {"method": "GET", "path": "/gmail/v1/users/me/profile"},
     },
     "google_drive": {
         "label": "Google Drive (dedicated)",
@@ -159,6 +176,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "combined Google Workspace connection."
         ),
         "example_call": "vault_<id>_drive with operation='search'",
+        "test_probe": {"method": "GET", "path": "/drive/v3/about?fields=user"},
     },
     "google_sheets": {
         "label": "Google Sheets (dedicated)",
@@ -176,6 +194,9 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "endpoint. Same Google OAuth app as the combined connection."
         ),
         "example_call": "vault_<id>_sheets with operation='get'",
+        # No lightweight list endpoint — use the Drive about probe via www.googleapis.com.
+        # Sheets v4 has no ping; a 400/404 still proves auth works.
+        "test_probe": {"method": "GET", "path": "/v4/spreadsheets"},
     },
     "google_docs": {
         "label": "Google Docs (dedicated)",
@@ -190,6 +211,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Docs connection.",
         "example_call": "vault_<id>_docs with operation='get'",
+        "test_probe": {"method": "GET", "path": "/v1/documents"},
     },
     "google_slides": {
         "label": "Google Slides (dedicated)",
@@ -204,6 +226,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Slides connection.",
         "example_call": "vault_<id>_slides with operation='get'",
+        "test_probe": {"method": "GET", "path": "/v1/presentations"},
     },
     "google_forms": {
         "label": "Google Forms (dedicated)",
@@ -221,6 +244,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Forms connection.",
         "example_call": "vault_<id>_forms with operation='get'",
+        "test_probe": {"method": "GET", "path": "/v1/forms"},
     },
     "google_calendar": {
         "label": "Google Calendar (dedicated)",
@@ -235,6 +259,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Calendar connection.",
         "example_call": "vault_<id>_calendar with operation='events'",
+        "test_probe": {"method": "GET", "path": "/calendar/v3/users/me/calendarList"},
     },
     "google_tasks": {
         "label": "Google Tasks (dedicated)",
@@ -249,6 +274,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Tasks connection.",
         "example_call": "vault_<id>_tasks with operation='lists'",
+        "test_probe": {"method": "GET", "path": "/tasks/v1/users/@me/lists"},
     },
     "google_people": {
         "label": "Google People / Contacts (dedicated)",
@@ -263,6 +289,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google People / Contacts connection.",
         "example_call": "vault_<id>_people with operation='contacts'",
+        "test_probe": {"method": "GET", "path": "/v1/people/me?personFields=names"},
     },
     "google_meet": {
         "label": "Google Meet (dedicated)",
@@ -283,6 +310,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "in Google Cloud Console, then connect with the same OAuth app."
         ),
         "example_call": "vault_<id>_meet with operation='spaces'",
+        "test_probe": {"method": "GET", "path": "/v2/spaces"},
     },
     "google_app_script": {
         "label": "Google Apps Script (dedicated)",
@@ -303,6 +331,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "in Google Cloud Console."
         ),
         "example_call": "vault_<id>_app_script with operation='list'",
+        "test_probe": {"method": "GET", "path": "/v1/projects"},
     },
     "github": {
         "label": "GitHub",
@@ -322,6 +351,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "API-key service using a personal access token — pick 'Custom'.)"
         ),
         "example_call": "GET /user/repos",
+        "test_probe": {"method": "GET", "path": "/user"},
     },
     "outlook": {
         "label": "Outlook / Microsoft 365",
@@ -343,6 +373,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "application (client) ID and secret here and click Connect."
         ),
         "example_call": "GET /me/messages",
+        "test_probe": {"method": "GET", "path": "/me"},
     },
     "apple": {
         "label": "Apple iCloud (Calendar / Reminders / Contacts)",
@@ -360,6 +391,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "shown to agents."
         ),
         "example_call": "Use the Apple tool for calendar, reminders, and contacts",
+        # No HTTP probe — uses CalDAV/CardDAV protocols via apple_ops.py
     },
     "bluebubbles": {
         "label": "BlueBubbles iMessage bridge",
@@ -377,6 +409,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "HTTP calls and never stores message history."
         ),
         "example_call": "GET /api/v1/health",
+        "test_probe": {"method": "GET", "path": "/api/v1/ping"},
     },
     "custom_oauth": {
         "label": "Custom (any OAuth app)",
@@ -401,6 +434,8 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "scopes, API base URL, and the client ID + secret here."
         ),
         "example_call": "GET /whatever/the/api/offers",
+        # Generic fallback — GET / against the configured base URL
+        "test_probe": {"method": "GET", "path": "/"},
     },
     "macincloud": {
         "label": "MACinCloud (Mac desktop via SSH/VNC)",
@@ -425,6 +460,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "All credentials are stored encrypted and agents never see them."
         ),
         "example_call": "Use the Mac tool for screenshot, open_browser, run_command, applescript",
+        # No HTTP probe — uses SSH/VNC protocols via mac_ops.py
     },
     "email": {
         "label": "Email (IMAP/SMTP)",
@@ -459,6 +495,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             'POST /api/vault/email/{conn} with {"action": "list", "limit": 10} '
             "(actions: folders, list, read, send)"
         ),
+        # No HTTP probe — uses IMAP/SMTP protocols via email_ops.py
     },
     "vowsok": {
         "label": "Vowsok",
@@ -473,6 +510,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Get your token from the Vowsok dashboard → API / Integrations."
         ),
         "example_call": "Use the native vault_<name>_<tool> tools registered from Vowsok",
+        # MCP kind: test uses tools/list — no test_probe needed
     },
     "mcp_bearer": {
         "label": "Custom MCP (bearer token)",
@@ -492,6 +530,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Only HTTPS endpoints are accepted."
         ),
         "example_call": "Use the native vault_<name>_<tool> tools registered from the MCP server",
+        # MCP kind: test uses tools/list — no test_probe needed
     },
     "alpaca": {
         "label": "Alpaca Markets",
@@ -507,6 +546,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Both keys are stored encrypted; agents never see them."
         ),
         "example_call": "GET /v2/account",
+        "test_probe": {"method": "GET", "path": "/v2/account"},
     },
     "custom": {
         "label": "Custom (any API)",
@@ -526,6 +566,8 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "(header name + optional prefix), and the key itself."
         ),
         "example_call": "GET /whatever/the/api/offers",
+        # Generic fallback — GET / against the configured base URL
+        "test_probe": {"method": "GET", "path": "/"},
     },
 }
 
