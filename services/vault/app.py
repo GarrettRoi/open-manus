@@ -2398,9 +2398,50 @@ replit_mcp = replit_mcp_mod.ReplitMCP(r, encrypt_value, decrypt_value, PUBLIC_UR
 @app.get("/api/admin/replit-mcp/status")
 async def replit_mcp_status(request: Request):
     require_admin_api(request)
-    return {"connected": replit_mcp.connected(),
-            "target_repl": replit_mcp.target_repl(),
-            "redirect_uri": replit_mcp.redirect_uri}
+
+    def _gather_stats():
+        approved_ids = r.lrange("devreq:approved", 0, -1)
+        failed = unqueued = started = 0
+        for rid in approved_ids:
+            raw = r.get(f"devreq:item:{rid}")
+            if not raw:
+                continue
+            try:
+                it = json.loads(raw)
+            except ValueError:
+                continue
+            ds = it.get("dispatch_status")
+            if ds == "failed":
+                failed += 1
+            elif ds == "started":
+                started += 1
+            elif not ds:
+                unqueued += 1
+        hb = r.get(replit_mcp_mod.K_HEARTBEAT)
+        hb_age = None
+        if hb:
+            try:
+                hb_age = int(time.time()) - int(hb)
+            except (TypeError, ValueError):
+                pass
+        return {
+            "dispatch_queue_depth": r.llen("devreq:dispatch"),
+            "approved_count": len(approved_ids),
+            "failed_dispatch_count": failed,
+            "started_count": started,
+            "unqueued_count": unqueued,
+            "loop_alive": hb_age is not None and hb_age < 120,
+            "loop_heartbeat_age_seconds": hb_age,
+        }
+
+    import asyncio as _asyncio
+    stats = await _asyncio.to_thread(_gather_stats)
+    return {
+        "connected": replit_mcp.connected(),
+        "target_repl": replit_mcp.target_repl(),
+        "redirect_uri": replit_mcp.redirect_uri,
+        **stats,
+    }
 
 
 @app.get("/admin/replit-mcp/connect")
@@ -2449,6 +2490,18 @@ async def replit_mcp_callback(code: str = "", state: str = "", error: str = ""):
         "automatically. You can close this tab.</p>")
 
 
+@app.post("/api/admin/replit-mcp/sweep")
+async def replit_mcp_sweep(request: Request):
+    """Re-queue all approved dev requests that are unqueued or failed dispatch."""
+    require_admin_api(request)
+    import asyncio as _asyncio
+    requeued = await _asyncio.to_thread(replit_mcp_mod.sweep_dispatch_backlog, r)
+    if requeued:
+        audit_log("admin", "REPLIT_MCP", "replit_mcp_sweep",
+                  f"requeued={requeued}")
+    return {"ok": True, "requeued": requeued, "count": len(requeued)}
+
+
 @app.post("/api/admin/replit-mcp/dispatch/{req_id}")
 async def replit_mcp_dispatch(req_id: str, request: Request):
     """Manually (re-)queue an approved dev request for dispatch."""
@@ -2493,6 +2546,11 @@ async def startup():
     # Nightly backups of all vault:* keys to local disk (Railway volume).
     import asyncio
     asyncio.create_task(vault_backup.backup_loop(r))
+    # Re-queue approved requests missed before this deploy (backlog sweep).
+    requeued = await asyncio.to_thread(replit_mcp_mod.sweep_dispatch_backlog, r)
+    if requeued:
+        logger.info("Startup sweep re-queued %d dev request(s): %s",
+                    len(requeued), requeued)
     # Auto-dispatch approved dev requests to Replit Agent (MCP bridge).
     asyncio.create_task(replit_mcp_mod.dispatch_loop(replit_mcp))
 

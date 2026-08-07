@@ -42,10 +42,14 @@ K_CLIENT = "replitmcp:client"
 K_TOKENS = "replitmcp:tokens"
 K_PKCE = "replitmcp:pkce:"
 K_TARGET = "replitmcp:target_repl"
+K_HEARTBEAT = "replitmcp:loop_heartbeat"
+K_CLAIM = "replitmcp:claim:"
 DISPATCH_QUEUE = "devreq:dispatch"
 
 _EXPIRY_SLACK = 90
 PKCE_TTL = 600
+CLAIM_TTL = 300       # seconds — long enough to cover a full MCP round-trip
+_SWEEP_IDLE_TICKS = 12  # BRPOP timeouts between periodic sweeps (≈ 2 min at 10 s/tick)
 
 
 class ReplitMCPError(Exception):
@@ -369,6 +373,44 @@ class ReplitMCP:
 # ---------------------------------------------------------------------------
 # Dispatcher: devreq:dispatch queue -> Replit Agent run
 # ---------------------------------------------------------------------------
+
+def sweep_dispatch_backlog(r) -> list:
+    """Re-queue approved dev requests that were never dispatched or failed.
+
+    Dedup guards:
+    - Skips items whose dispatch_status is already "started".
+    - Uses a short-TTL SETNX claim key (K_CLAIM + req_id) so a concurrent
+      sweep or a request still sitting in the queue cannot be double-queued.
+
+    Returns the list of req_ids that were pushed onto devreq:dispatch.
+    """
+    approved_ids = r.lrange("devreq:approved", 0, -1)
+    requeued = []
+    for req_id in approved_ids:
+        raw = r.get(f"devreq:item:{req_id}")
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw if isinstance(raw, str) else raw.decode())
+        except (ValueError, AttributeError):
+            continue
+        # Never re-queue an item that is already in flight or done.
+        ds = item.get("dispatch_status")
+        if ds == "started":
+            logger.debug("Sweep: request %s already started, skipping", req_id)
+            continue
+        # SETNX claim key prevents double-queuing across concurrent sweeps.
+        claimed = r.set(K_CLAIM + req_id, "1", nx=True, ex=CLAIM_TTL)
+        if not claimed:
+            logger.debug("Sweep: request %s already claimed, skipping", req_id)
+            continue
+        r.lpush(DISPATCH_QUEUE, req_id)
+        requeued.append(req_id)
+        logger.info("Sweep: re-queued dev request %s (prior dispatch_status=%s)",
+                    req_id, ds or "never dispatched")
+    return requeued
+
+
 def _build_prompt(item: Dict[str, Any]) -> str:
     return (
         f"Approved dev modification request #{item.get('id')} from Open Manus "
@@ -385,13 +427,35 @@ def _build_prompt(item: Dict[str, Any]) -> str:
 async def dispatch_loop(mcp: ReplitMCP) -> None:
     """Forever: pop approved request ids from devreq:dispatch and start
     Replit Agent runs. Failures are recorded on the request item so the
-    owner can see why nothing started."""
+    owner can see why nothing started.
+
+    Also writes a heartbeat key every iteration (K_HEARTBEAT, EX 60) so the
+    status endpoint can confirm the loop is alive, and runs a periodic backlog
+    sweep every _SWEEP_IDLE_TICKS BRPOP timeouts to catch items that slipped
+    through (e.g. approved before the current deploy was live).
+    """
     logger.info("Replit MCP dispatcher started (queue: %s)", DISPATCH_QUEUE)
+    idle_ticks = 0
     while True:
         try:
+            # Heartbeat: let the status endpoint know the loop is running.
+            await asyncio.to_thread(
+                mcp.r.set, K_HEARTBEAT, str(int(time.time())), ex=60)
+
             popped = await asyncio.to_thread(mcp.r.brpop, DISPATCH_QUEUE, 10)
             if not popped:
+                # BRPOP timed out — count idle ticks and maybe sweep backlog.
+                idle_ticks += 1
+                if idle_ticks >= _SWEEP_IDLE_TICKS:
+                    idle_ticks = 0
+                    requeued = await asyncio.to_thread(
+                        sweep_dispatch_backlog, mcp.r)
+                    if requeued:
+                        logger.info("Periodic sweep re-queued %d request(s): %s",
+                                    len(requeued), requeued)
                 continue
+
+            idle_ticks = 0
             req_id = popped[1]
             if isinstance(req_id, bytes):
                 req_id = req_id.decode()
@@ -401,6 +465,7 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                 raw = raw.decode()
             if not raw:
                 logger.warning("Dispatch: request %s not found", req_id)
+                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
                 continue
             item = json.loads(raw)
             try:
@@ -417,6 +482,10 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
             kwargs = {"ex": ttl} if ttl and ttl > 0 else {}
             await asyncio.to_thread(
                 mcp.r.set, f"devreq:item:{req_id}", json.dumps(item), **kwargs)
+            # Release the claim key so a future sweep can re-queue this item
+            # if it failed (dispatch_status=="started" guards against re-queuing
+            # a successfully launched run).
+            await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
         except asyncio.CancelledError:
             raise
         except Exception:

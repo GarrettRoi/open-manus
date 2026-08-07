@@ -22,11 +22,63 @@ import discord
 logger = logging.getLogger(__name__)
 
 MSG_LIMIT = 1900  # leave headroom under Discord's 2000-char cap
+_POLL_INTERVAL = 5   # seconds between each poll of dispatch_status
+_POLL_ATTEMPTS = 18  # 18 × 5 s = 90 s total
 
 
 def _store():
     from tools import dev_requests
     return dev_requests
+
+
+async def _poll_dispatch_outcome(channel, req_id: str, title: str) -> None:
+    """Post a follow-up in the channel once the vault resolves the dispatch.
+
+    Polls devreq:item:{req_id} every _POLL_INTERVAL seconds for up to
+    _POLL_ATTEMPTS iterations, then posts one of:
+      ✅  started   — Replit Agent run is underway
+      ❌  failed    — dispatch error message included
+      ⏳  timeout   — no result yet, direct owner to the dashboard
+    """
+    for _ in range(_POLL_ATTEMPTS):
+        await asyncio.sleep(_POLL_INTERVAL)
+        try:
+            item = await asyncio.to_thread(_store().get_request, req_id)
+        except Exception:
+            logger.debug("Dispatch poller: could not read request %s", req_id)
+            continue
+        ds = (item or {}).get("dispatch_status")
+        if ds == "started":
+            try:
+                await channel.send(
+                    f"✅ Replit Agent run started for dev request "
+                    f"#{req_id} \"{title}\" — work is underway."
+                )
+            except Exception:
+                logger.exception("Dispatch poller: could not post success for %s", req_id)
+            return
+        if ds == "failed":
+            err = ((item or {}).get("dispatch_error") or "unknown error")[:300]
+            try:
+                await channel.send(
+                    f"❌ Auto-dispatch failed for dev request "
+                    f"#{req_id} \"{title}\".\n"
+                    f"Reason: `{err}`\n"
+                    "Retry via the vault dashboard, or complete the Replit "
+                    "OAuth connection at `/admin/replit-mcp/connect` first."
+                )
+            except Exception:
+                logger.exception("Dispatch poller: could not post failure for %s", req_id)
+            return
+    # Timed out — no dispatch_status appeared.
+    try:
+        await channel.send(
+            f"⏳ No dispatch result yet for dev request "
+            f"#{req_id} \"{title}\" after 90 s — "
+            "check the vault dashboard (`/api/admin/replit-mcp/status`) for status."
+        )
+    except Exception:
+        logger.exception("Dispatch poller: could not post timeout for %s", req_id)
 
 
 class DevRequestApprovalView(discord.ui.View):
@@ -79,12 +131,18 @@ class DevRequestApprovalView(discord.ui.View):
         self.resolved = True
         for child in self.children:
             child.disabled = True
-        note = ("approved — a Replit Agent build is being kicked off "
-                "automatically" if status == "approved" else "closed")
+        title = item.get("title", "")
+        if status == "approved":
+            note = "approved — queued for Replit Agent dispatch (result will follow)"
+        else:
+            note = "closed"
         await interaction.response.edit_message(
-            content=f"{label} — request #{self.req_id} "
-                    f"“{item.get('title', '')}” {note}.",
+            content=f"{label} — request #{self.req_id} \"{title}\" {note}.",
             view=self)
+        if status == "approved":
+            asyncio.create_task(
+                _poll_dispatch_outcome(interaction.channel, self.req_id, title)
+            )
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
