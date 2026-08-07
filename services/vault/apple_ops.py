@@ -73,10 +73,20 @@ def _unesc_ical(value: str) -> str:
     return value.replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
 
 
+def _unfold_ical(data: str) -> str:
+    """Unfold RFC 5545 line-folded iCalendar data.
+
+    Lines longer than 75 octets are wrapped with CRLF (or LF) followed by a
+    single SP or HT.  Rejoin them before parsing so no property is truncated.
+    """
+    return re.sub(r"\r?\n[ \t]", "", data)
+
+
 def _ical_props(data: str, component: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     inside = False
-    for raw in data.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    unfolded = _unfold_ical(data.replace("\r\n", "\n").replace("\r", "\n"))
+    for raw in unfolded.split("\n"):
         line = raw.strip()
         if line == f"BEGIN:{component}":
             inside = True
@@ -227,34 +237,94 @@ class AppleOps:
         return calendars[0]["url"]
 
     async def _calendar_report(self, calendar_url: str, component: str, start: str = "", end: str = "") -> List[Dict[str, Any]]:
+        # Normalise start/end to iCalendar UTC format expected by Apple's server.
+        utc_start = _ical_time(start) if start else ""
+        utc_end = _ical_time(end) if end else ""
+
         time_filter = ""
-        if start or end:
-            attrs = (f' start="{start}"' if start else "") + (f' end="{end}"' if end else "")
+        if utc_start or utc_end:
+            attrs = (f' start="{utc_start}"' if utc_start else "") + (f' end="{utc_end}"' if utc_end else "")
             time_filter = f'<c:time-range{attrs}/>'
-        body = f"""<?xml version="1.0"?>
+
+        query_body = f"""<?xml version="1.0"?>
 <c:calendar-query xmlns:d="{DAV}" xmlns:c="{CALDAV}"><d:prop>
 <d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR">
 <c:comp-filter name="{component}">{time_filter}</c:comp-filter>
 </c:comp-filter></c:filter></c:calendar-query>"""
-        root = await self._request(
+
+        query_resp = await self._request(
             "REPORT", calendar_url,
             headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-            content=body, expected=(207,),
+            content=query_body, expected=(207,),
         )
-        result = []
-        parsed = _xml(root.text)
+        parsed = _xml(query_resp.text)
+
+        # Phase 1 — collect hrefs + any inline calendar-data from the query response.
+        # Apple's iCloud sometimes returns HREFs without inline data; those hrefs
+        # are collected for a follow-up multiget in phase 2.
+        phase1: Dict[str, dict] = {}   # href -> {"etag": ..., "ical": ...}
+        missing_hrefs: List[str] = []  # hrefs that need a multiget fetch
+
         for response in parsed.iter():
             if _local(response.tag) != "response":
                 continue
             href_node = next((n for n in response if _local(n.tag) == "href"), None)
-            data_node = next((n for n in response.iter() if _local(n.tag) == "calendar-data"), None)
-            if data_node is None:
+            href = _href(href_node, calendar_url)
+            if not href or not href.lower().endswith(".ics"):
                 continue
-            ical = _text(data_node)
+            etag = next((_text(n) for n in response.iter() if _local(n.tag) == "getetag"), "")
+            data_node = next((n for n in response.iter() if _local(n.tag) == "calendar-data"), None)
+            ical = _text(data_node) if data_node is not None else ""
+            phase1[href] = {"etag": etag, "ical": ical}
+            if not ical:
+                missing_hrefs.append(href)
+
+        # Phase 2 — multiget for any hrefs that came back without calendar-data.
+        if missing_hrefs:
+            href_elems = "".join(f"<d:href>{html.escape(h)}</d:href>" for h in missing_hrefs)
+            multiget_body = f"""<?xml version="1.0"?>
+<c:calendar-multiget xmlns:d="{DAV}" xmlns:c="{CALDAV}"><d:prop>
+<d:getetag/><c:calendar-data/></d:prop>{href_elems}</c:calendar-multiget>"""
+            try:
+                mg_resp = await self._request(
+                    "REPORT", calendar_url,
+                    headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                    content=multiget_body, expected=(207,),
+                )
+                mg_parsed = _xml(mg_resp.text)
+                for response in mg_parsed.iter():
+                    if _local(response.tag) != "response":
+                        continue
+                    href_node = next((n for n in response if _local(n.tag) == "href"), None)
+                    href = _href(href_node, calendar_url)
+                    if not href or href not in phase1:
+                        continue
+                    data_node = next((n for n in response.iter() if _local(n.tag) == "calendar-data"), None)
+                    ical = _text(data_node) if data_node is not None else ""
+                    etag = next((_text(n) for n in response.iter() if _local(n.tag) == "getetag"), phase1[href]["etag"])
+                    if ical:
+                        phase1[href] = {"etag": etag, "ical": ical}
+            except AppleOpsError:
+                pass  # multiget failed — proceed with whatever phase 1 gave us
+
+        # Phase 3 — parse iCal data and build result rows.
+        _WANTED = {"UID", "SUMMARY", "DESCRIPTION", "DTSTART", "DTEND", "DUE", "STATUS", "LOCATION"}
+        result = []
+        for href, info in phase1.items():
+            ical = info["ical"]
+            if not ical:
+                continue
             props = _ical_props(ical, component)
-            result.append({"href": _href(href_node, calendar_url), "etag": next((_text(n) for n in response.iter() if _local(n.tag) == "getetag"), ""), **{
-                k.lower(): v for k, v in props.items() if k in {"UID", "SUMMARY", "DESCRIPTION", "DTSTART", "DTEND", "DUE", "STATUS", "LOCATION"}
-            }})
+            if not props:
+                # The .ics data exists but we couldn't parse any VEVENT/VTODO —
+                # include the stub so the caller knows the href exists.
+                result.append({"href": href, "etag": info["etag"]})
+                continue
+            result.append({
+                "href": href,
+                "etag": info["etag"],
+                **{k.lower(): v for k, v in props.items() if k in _WANTED},
+            })
         return result
 
     async def run(self, operation: str, args: Dict[str, Any]) -> Dict[str, Any]:
