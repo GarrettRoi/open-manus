@@ -2503,8 +2503,14 @@ async def replit_mcp_sweep(request: Request):
 
 
 @app.post("/api/admin/replit-mcp/dispatch/{req_id}")
-async def replit_mcp_dispatch(req_id: str, request: Request):
-    """Manually (re-)queue an approved dev request for dispatch."""
+async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False):
+    """Manually (re-)queue an approved dev request for dispatch.
+
+    If a worker is actively dispatching the item (live lease), returns 409
+    unless ?force=true is passed. With ?force=true the existing lease and claim
+    are cleared and a new queue entry is inserted — the in-flight worker's
+    finalize_lease() CAS will return False so it will not overwrite the status.
+    """
     require_admin_api(request)
     rid = re.sub(r"[^0-9A-Za-z_-]", "", req_id)[:32]
     raw = r.get(f"devreq:item:{rid}") if rid else None
@@ -2514,26 +2520,39 @@ async def replit_mcp_dispatch(req_id: str, request: Request):
         item = json.loads(raw)
     except ValueError:
         raise HTTPException(status_code=500, detail="Corrupt request record")
-    # Only owner-approved requests may be dispatched — the Discord approval
-    # is the trust boundary; this endpoint is retry-only.
     if item.get("status") != "approved":
         raise HTTPException(status_code=409,
                             detail=f"Request '{rid}' is {item.get('status')!r}, "
                                    "not approved — approve it in Discord first")
-    # Force-clear any existing claim then atomically claim+LPUSH.
-    # Manual /dispatch is an explicit admin retry — it should always work
-    # regardless of whether the claim from a prior failure is still alive.
-    # Sweep and approval use enqueue_if_unclaimed without force so they respect
-    # the claim-TTL cooldown after failure.
+
     import asyncio as _asyncio
-    await _asyncio.to_thread(r.delete, replit_mcp_mod.K_CLAIM + rid)
+
+    # Check for a live dispatch lease.
+    lease_live = await _asyncio.to_thread(replit_mcp_mod.has_live_lease, r, rid)
+    if lease_live and not force:
+        return JSONResponse(status_code=409, content={
+            "ok": False,
+            "lease_active": True,
+            "detail": (
+                f"Request '{rid}' is currently being dispatched (active lease). "
+                "Use ?force=true to supersede the in-flight worker. "
+                "The superseded worker's finalize step will be a no-op."
+            ),
+        })
+
+    # Clear lease + claim so a fresh enqueue can proceed.
+    # With force=True this supersedes the in-flight worker (its CAS will fail).
+    # Without force (lease_live=False) this just clears a stale claim/lease.
+    await _asyncio.to_thread(r.delete,
+                             replit_mcp_mod.K_LEASE + rid,
+                             replit_mcp_mod.K_CLAIM + rid)
     queued = await _asyncio.to_thread(replit_mcp_mod.enqueue_if_unclaimed, r, rid)
     if not queued:
-        # Should not happen after force-delete, but guard anyway.
         return {"ok": False, "queued": False, "rid": rid,
-                "detail": "enqueue failed unexpectedly after claim clear"}
-    audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
-    return {"ok": True, "queued": rid}
+                "detail": "enqueue failed unexpectedly after lease/claim clear"}
+    action = "force_requeued" if (lease_live and force) else "requeued"
+    audit_log("admin", "REPLIT_MCP", f"replit_mcp_{action}", f"request={rid}")
+    return {"ok": True, "queued": rid, "superseded": bool(lease_live and force)}
 
 
 @app.get("/health")

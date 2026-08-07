@@ -44,25 +44,35 @@ K_PKCE = "replitmcp:pkce:"
 K_TARGET = "replitmcp:target_repl"
 K_HEARTBEAT = "replitmcp:loop_heartbeat"
 K_CLAIM = "replitmcp:claim:"
+K_LEASE = "replitmcp:lease:"
 DISPATCH_QUEUE = "devreq:dispatch"
 
 _EXPIRY_SLACK = 90
 PKCE_TTL = 600
-CLAIM_TTL = 300       # seconds — long enough to cover a full MCP round-trip
+CLAIM_TTL = 300       # seconds — enqueue guard; long enough to cover LEASE_TTL
+LEASE_TTL = 60        # seconds — durable dispatch lease; renewed every LEASE_RENEW_INTERVAL
+LEASE_RENEW_INTERVAL = 20  # seconds between lease renewals in the worker
 _SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5 s/tick)
 
 # ---------------------------------------------------------------------------
-# Atomic enqueue: SETNX claim + LPUSH in a single Lua transaction.
-# Shared by ALL three producers (approval, sweep, manual /dispatch endpoint)
-# so no two of them can double-queue the same request regardless of timing.
+# Lua scripts — all atomically executed by Redis.
 #
-# KEYS[1] = claim key   (replitmcp:claim:{id})
-# KEYS[2] = queue name  (devreq:dispatch)
-# ARGV[1] = claim TTL   (seconds, int)
-# ARGV[2] = req_id      (value pushed onto the queue)
+# _ENQUEUE_SCRIPT: SETNX claim + LPUSH in one transaction.
+#   KEYS[1]=claim key  KEYS[2]=queue  ARGV[1]=CLAIM_TTL  ARGV[2]=req_id
+#   Returns 1 if enqueued (claim acquired), 0 if already claimed.
 #
-# Returns 1 if the claim was acquired and the item enqueued, 0 if already
-# claimed (already in queue or currently being dispatched).
+# _ACQUIRE_LEASE_SCRIPT: set lease key NX with a unique token.
+#   KEYS[1]=lease key  ARGV[1]=token  ARGV[2]=LEASE_TTL
+#   Returns 1 if lease acquired, 0 if another worker holds it.
+#
+# _RENEW_LEASE_SCRIPT: extend TTL only if we still hold the token (CAS).
+#   KEYS[1]=lease key  ARGV[1]=token  ARGV[2]=LEASE_TTL
+#   Returns 1 if renewed (token matched), 0 if lease was superseded.
+#
+# _FINALIZE_LEASE_SCRIPT: CAS write of final item state + release lease.
+#   KEYS[1]=lease key  KEYS[2]=item key
+#   ARGV[1]=token  ARGV[2]=item JSON  ARGV[3]=item TTL (0 = no expiry)
+#   Returns 1 if written (token matched), 0 if lease was superseded.
 # ---------------------------------------------------------------------------
 _ENQUEUE_SCRIPT = """
 local claimed = redis.call("SET", KEYS[1], "1", "NX", "EX", tonumber(ARGV[1]))
@@ -73,9 +83,109 @@ end
 return 0
 """
 
+_ACQUIRE_LEASE_SCRIPT = """
+local ok = redis.call("SET", KEYS[1], ARGV[1], "NX", "EX", tonumber(ARGV[2]))
+if ok then return 1 end
+return 0
+"""
+
+_RENEW_LEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+    return 1
+end
+return 0
+"""
+
+_FINALIZE_LEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+local ttl = tonumber(ARGV[3])
+if ttl > 0 then
+    redis.call("SET", KEYS[2], ARGV[2], "EX", ttl)
+else
+    redis.call("SET", KEYS[2], ARGV[2])
+end
+redis.call("DEL", KEYS[1])
+return 1
+"""
+
 
 class ReplitMCPError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Lease / claim helper functions (sync — call via asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+def enqueue_if_unclaimed(r, req_id: str) -> bool:
+    """Atomically claim + enqueue a dev request for dispatch.
+
+    Uses a single Lua script so SETNX and LPUSH are one Redis operation.
+    Returns True if enqueued (claim acquired), False if already claimed.
+    """
+    result = r.eval(
+        _ENQUEUE_SCRIPT, 2,
+        K_CLAIM + req_id,   # KEYS[1]
+        DISPATCH_QUEUE,     # KEYS[2]
+        str(CLAIM_TTL),     # ARGV[1]
+        req_id,             # ARGV[2]
+    )
+    return bool(result)
+
+
+def acquire_lease(r, req_id: str, token: str) -> bool:
+    """Acquire the dispatch lease for req_id with a unique token.
+
+    Returns True if this worker owns the lease, False if another does.
+    The lease expires in LEASE_TTL seconds unless renewed.
+    """
+    result = r.eval(
+        _ACQUIRE_LEASE_SCRIPT, 1,
+        K_LEASE + req_id,   # KEYS[1]
+        token,              # ARGV[1]
+        str(LEASE_TTL),     # ARGV[2]
+    )
+    return bool(result)
+
+
+def renew_lease(r, req_id: str, token: str) -> bool:
+    """Extend the lease TTL only if we still hold the token (CAS).
+
+    Returns True if renewed, False if the lease was superseded or expired.
+    """
+    result = r.eval(
+        _RENEW_LEASE_SCRIPT, 1,
+        K_LEASE + req_id,   # KEYS[1]
+        token,              # ARGV[1]
+        str(LEASE_TTL),     # ARGV[2]
+    )
+    return bool(result)
+
+
+def finalize_lease(r, req_id: str, token: str, item: dict, item_ttl: int) -> bool:
+    """CAS-write the final item state and release the lease atomically.
+
+    Verifies that this worker's token still matches the lease key before
+    writing. Returns True if written, False if the lease was superseded
+    (token mismatch — another worker or a force-dispatch took over).
+    """
+    result = r.eval(
+        _FINALIZE_LEASE_SCRIPT, 2,
+        K_LEASE + req_id,               # KEYS[1]
+        f"devreq:item:{req_id}",        # KEYS[2]
+        token,                          # ARGV[1]
+        json.dumps(item),               # ARGV[2]
+        str(max(0, item_ttl or 0)),     # ARGV[3]
+    )
+    return bool(result)
+
+
+def has_live_lease(r, req_id: str) -> bool:
+    """Return True if a dispatch lease is currently held for req_id."""
+    return bool(r.exists(K_LEASE + req_id))
 
 
 class ReplitMCP:
@@ -393,38 +503,19 @@ class ReplitMCP:
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher: devreq:dispatch queue -> Replit Agent run
+# Dispatcher support: sweep + prompt builder + async lease renewal
 # ---------------------------------------------------------------------------
-
-def enqueue_if_unclaimed(r, req_id: str) -> bool:
-    """Atomically claim + enqueue a dev request for dispatch.
-
-    Uses a single Lua script so the SETNX and LPUSH are one Redis operation —
-    no window exists between them for a concurrent producer to duplicate the
-    entry. Returns True if the request was claimed and pushed, False if it was
-    already claimed (already in queue or actively being dispatched).
-    """
-    result = r.eval(
-        _ENQUEUE_SCRIPT,
-        2,                        # numkeys
-        K_CLAIM + req_id,         # KEYS[1] — claim key
-        DISPATCH_QUEUE,           # KEYS[2] — dispatch queue
-        str(CLAIM_TTL),           # ARGV[1] — claim TTL in seconds
-        req_id,                   # ARGV[2] — value pushed onto queue
-    )
-    return bool(result)
-
 
 def sweep_dispatch_backlog(r) -> list:
     """Re-queue approved dev requests that were never dispatched or failed.
 
-    Dedup guards:
-    - Skips items whose dispatch_status is "started" (run already underway).
-    - Delegates the claim+enqueue step to enqueue_if_unclaimed(), which uses
-      a Lua script to make SETNX+LPUSH atomic — safe to call concurrently
-      with approval and manual /dispatch without producing duplicates.
+    Skip guards (in order):
+    1. dispatch_status == "started" — Agent run already underway.
+    2. Live lease key (K_LEASE + req_id) — worker is actively dispatching.
+    3. Claim key exists (K_CLAIM + req_id) — item is enqueued or in the
+       post-failure cooldown window; enqueue_if_unclaimed() will return False.
 
-    Returns the list of req_ids that were pushed onto devreq:dispatch.
+    Returns the list of req_ids pushed onto devreq:dispatch.
     """
     approved_ids = r.lrange("devreq:approved", 0, -1)
     requeued = []
@@ -436,12 +527,14 @@ def sweep_dispatch_backlog(r) -> list:
             item = json.loads(raw if isinstance(raw, str) else raw.decode())
         except (ValueError, AttributeError):
             continue
-        # dispatch_status=="started" means an Agent run is already underway —
-        # never re-queue, even if the claim key has since expired.
         if item.get("dispatch_status") == "started":
             logger.debug("Sweep: request %s already started, skipping", req_id)
             continue
-        # Atomic claim+enqueue via Lua; returns False if already claimed.
+        # A live lease means a worker is mid-MCP-call (possibly past CLAIM_TTL
+        # due to token refresh) — never re-queue while the lease is live.
+        if has_live_lease(r, req_id):
+            logger.debug("Sweep: request %s has active lease, skipping", req_id)
+            continue
         if not enqueue_if_unclaimed(r, req_id):
             logger.debug("Sweep: request %s already claimed/queued, skipping", req_id)
             continue
@@ -464,45 +557,68 @@ def _build_prompt(item: Dict[str, Any]) -> str:
     )
 
 
+async def _renew_lease_loop(r, req_id: str, token: str) -> None:
+    """Background coroutine: renew the dispatch lease every LEASE_RENEW_INTERVAL
+    seconds until cancelled. Logs a warning if the lease is lost (superseded by
+    a force-dispatch), so the caller's finalize_lease() CAS will return False.
+    """
+    try:
+        while True:
+            await asyncio.sleep(LEASE_RENEW_INTERVAL)
+            still_held = await asyncio.to_thread(renew_lease, r, req_id, token)
+            if not still_held:
+                logger.warning(
+                    "Dispatch: lease for request %s lost (superseded) — "
+                    "final CAS write will be skipped", req_id)
+                return
+            logger.debug("Dispatch: lease renewed for request %s", req_id)
+    except asyncio.CancelledError:
+        pass
+
+
 async def dispatch_loop(mcp: ReplitMCP) -> None:
     """Forever: pop approved request ids from devreq:dispatch and start
-    Replit Agent runs. Failures are recorded on the request item so the
-    owner can see why nothing started.
+    Replit Agent runs via the Replit MCP bridge.
 
-    Also writes a heartbeat key every iteration (K_HEARTBEAT, EX 60) so the
-    status endpoint can confirm the loop is alive, and runs a periodic backlog
-    sweep every _SWEEP_IDLE_TICKS BRPOP timeouts to catch items that slipped
-    through (e.g. approved before the current deploy was live).
+    Durable lease protocol (prevents duplicate Agent runs even when an MCP
+    call outlives the enqueue claim TTL):
+      1. Pop req_id from queue.
+      2. Acquire a unique-token dispatch lease (replitmcp:lease:{id}, NX, 60 s).
+         If another worker holds it, skip — the item is already being worked.
+      3. Start a background lease-renewal coroutine (renews every 20 s) so the
+         lease survives the full MCP call (up to 120 s + token refresh).
+      4. Re-check dispatch_status; skip if already "started".
+      5. Call start_agent_run.
+      6. Finalize via Lua CAS: verify the token still matches, write the item,
+         delete the lease. If the token no longer matches (force-dispatch
+         superseded us), skip the write — the superseding worker owns the run.
+      7. Cancel the renewal task.
 
-    Uses a dedicated Redis client for BRPOP with socket_keepalive=True so
-    Railway's TCP idle-timeout cannot kill the blocking connection, and
-    socket_timeout=8 > BRPOP timeout=5 so the server-side nil return always
-    arrives before the socket gives up — preventing the crash-loop that
-    occurred when the shared mcp.r client had no keepalive and the 10 s BRPOP
-    raced against Railway's ~10 s network idle timeout.
+    Claim key (replitmcp:claim:{id}) is the enqueue-dedup guard; it is set at
+    LPUSH time and left to expire via CLAIM_TTL. The lease is the in-flight
+    guard. Both must be absent before a new enqueue is possible.
     """
     import os as _os
     import redis as _redis_mod
+    import uuid as _uuid
 
     _redis_url = _os.getenv("REDIS_URL", "redis://localhost:6379")
     _brpop_r = _redis_mod.from_url(
         _redis_url,
         decode_responses=True,
-        socket_timeout=8,        # must exceed BRPOP timeout below
-        socket_keepalive=True,   # keeps the connection alive during the wait
+        socket_timeout=8,
+        socket_keepalive=True,
     )
 
     logger.info("Replit MCP dispatcher started (queue: %s)", DISPATCH_QUEUE)
     idle_ticks = 0
     while True:
         try:
-            # Heartbeat: let the status endpoint know the loop is running.
             await asyncio.to_thread(
                 mcp.r.set, K_HEARTBEAT, str(int(time.time())), ex=60)
 
             popped = await asyncio.to_thread(_brpop_r.brpop, DISPATCH_QUEUE, 5)
             if not popped:
-                # BRPOP timed out — count idle ticks and maybe sweep backlog.
                 idle_ticks += 1
                 if idle_ticks >= _SWEEP_IDLE_TICKS:
                     idle_ticks = 0
@@ -518,49 +634,73 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
             if isinstance(req_id, bytes):
                 req_id = req_id.decode()
             req_id = req_id.strip()
+
+            # --- Load item --------------------------------------------------
             raw = await asyncio.to_thread(mcp.r.get, f"devreq:item:{req_id}")
             if isinstance(raw, bytes):
                 raw = raw.decode()
             if not raw:
-                logger.warning("Dispatch: request %s not found", req_id)
-                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
+                logger.warning("Dispatch: request %s not found in Redis", req_id)
                 continue
             item = json.loads(raw)
-            # Final guard: re-read from Redis just before calling the MCP so
-            # a duplicate queue entry (e.g. from a stale manual re-queue before
-            # the atomic enqueue migration) cannot start a second Agent run.
-            if item.get("dispatch_status") == "started":
+
+            # --- Acquire durable dispatch lease -----------------------------
+            lease_token = str(_uuid.uuid4())
+            lease_ok = await asyncio.to_thread(
+                acquire_lease, mcp.r, req_id, lease_token)
+            if not lease_ok:
                 logger.info(
-                    "Dispatch: request %s already started (concurrent entry) — skipping",
-                    req_id)
-                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
+                    "Dispatch: request %s already has an active lease — "
+                    "skipping this queue entry", req_id)
                 continue
+
+            # --- Lease acquired: start renewal and do the work --------------
+            renew_task = asyncio.create_task(
+                _renew_lease_loop(mcp.r, req_id, lease_token))
             try:
-                result = await mcp.start_agent_run(_build_prompt(item))
-                item["dispatch_status"] = "started"
-                item["dispatched_at"] = int(time.time())
-                item["dispatch_result"] = str(result)[:500]
-                logger.info("Dispatched dev request %s to Replit Agent", req_id)
-            except Exception as exc:
-                item["dispatch_status"] = "failed"
-                item["dispatch_error"] = str(exc)[:500]
-                logger.error("Dispatch of dev request %s failed: %s", req_id, exc)
-            ttl = await asyncio.to_thread(mcp.r.ttl, f"devreq:item:{req_id}")
-            kwargs = {"ex": ttl} if ttl and ttl > 0 else {}
-            await asyncio.to_thread(
-                mcp.r.set, f"devreq:item:{req_id}", json.dumps(item), **kwargs)
-            # Claim handling after dispatch attempt:
-            #
-            # SUCCESS (started): leave the claim to expire via TTL. The primary
-            # guard is dispatch_status=="started"; the claim is redundant but
-            # harmless extra protection.
-            #
-            # FAILURE: do NOT delete the claim — let it expire via CLAIM_TTL
-            # (300 s). Deleting immediately would open a window for a concurrent
-            # sweep that is mid-iteration to re-queue the same item (confirmed
-            # duplicate in production parallel-sweep test). After CLAIM_TTL the
-            # item becomes retry-able again naturally. Manual /dispatch bypasses
-            # this by force-clearing the claim before enqueuing.
+                # Re-read dispatch_status under the lease; another worker may
+                # have written "started" between enqueue and now.
+                raw2 = await asyncio.to_thread(mcp.r.get, f"devreq:item:{req_id}")
+                if raw2:
+                    item = json.loads(
+                        raw2 if isinstance(raw2, str) else raw2.decode())
+                if item.get("dispatch_status") == "started":
+                    logger.info(
+                        "Dispatch: request %s already started — releasing lease",
+                        req_id)
+                    await asyncio.to_thread(mcp.r.delete, K_LEASE + req_id)
+                    continue
+
+                # Call the MCP (may take up to 120 s + token refresh)
+                try:
+                    result = await mcp.start_agent_run(_build_prompt(item))
+                    item["dispatch_status"] = "started"
+                    item["dispatched_at"] = int(time.time())
+                    item["dispatch_result"] = str(result)[:500]
+                    logger.info("Dispatched dev request %s to Replit Agent", req_id)
+                except Exception as exc:
+                    item["dispatch_status"] = "failed"
+                    item["dispatch_error"] = str(exc)[:500]
+                    logger.error("Dispatch of dev request %s failed: %s",
+                                 req_id, exc)
+
+                # CAS finalize: write item + release lease atomically.
+                # Returns False if a force-dispatch superseded our token.
+                item_ttl = await asyncio.to_thread(
+                    mcp.r.ttl, f"devreq:item:{req_id}")
+                written = await asyncio.to_thread(
+                    finalize_lease, mcp.r, req_id, lease_token, item, item_ttl)
+                if not written:
+                    logger.warning(
+                        "Dispatch: lease for request %s was superseded — "
+                        "final status NOT written by this worker", req_id)
+            finally:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
+
         except asyncio.CancelledError:
             raise
         except Exception:
