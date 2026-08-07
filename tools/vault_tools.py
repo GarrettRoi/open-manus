@@ -779,15 +779,38 @@ GOOGLE_OPERATIONS: Dict[str, str] = {
 
 
 def _google_call(conn_id: str, product: str, args: dict) -> str:
-    """Execute a structured Google Workspace operation through the vault."""
-    operation = str((args or {}).get("operation") or "").strip()
+    """Execute a structured Google Workspace operation through the vault.
+
+    Accepts two calling conventions so LLMs that misread the schema still work:
+      Flat (preferred):  {"operation": "search", "args": {"q": "..."}}
+      Nested (fallback): {"args": {"operation": "search", "q": "..."}}
+    """
+    a = args or {}
+    operation = str(a.get("operation") or "").strip()
+    inner = a.get("args") if isinstance(a.get("args"), dict) else {}
+
+    if not operation:
+        # LLM may have nested everything (incl. operation) inside "args".
+        operation = str(inner.get("operation") or "").strip()
+        if operation:
+            # Promote: remaining keys in inner become the real args.
+            inner = {k: v for k, v in inner.items() if k != "operation"}
+        else:
+            # As a last resort, treat the whole dict (minus "args" key) as flat args.
+            flat = {k: v for k, v in a.items() if k != "args"}
+            operation = str(flat.get("operation") or "").strip()
+            if operation:
+                inner = {k: v for k, v in flat.items() if k != "operation"}
+
     if not operation:
         return json.dumps({"error": "operation is required",
-                           "operations": GOOGLE_OPERATIONS.get(product, "")})
+                           "hint": f"Pass operation as a top-level key. "
+                                   f"Supported: {GOOGLE_OPERATIONS.get(product, 'see tool description')}",
+                           "example": {"operation": "search", "args": {"q": "..."}}})
     payload = {
         "product": product,
         "operation": operation,
-        "args": args.get("args") if isinstance(args.get("args"), dict) else {},
+        "args": inner,
     }
     try:
         return json.dumps(
@@ -812,27 +835,37 @@ def _google_call(conn_id: str, product: str, args: dict) -> str:
 def _build_google_schema(conn: dict, tool_name: str, product: str) -> dict:
     conn_id = conn["id"]
     label = conn.get("label") or conn_id
+    ops_str = GOOGLE_OPERATIONS.get(product, "")
     return {
         "name": tool_name,
         "description": (
-            f"Google {product.capitalize()} for the '{label}' account, via the "
+            f"Google {product.capitalize()} for the '{label}' account via the "
             "secure vault (OAuth token attached server-side — never handle "
-            "credentials).\n"
-            f"Operations: {GOOGLE_OPERATIONS[product]}.\n"
-            "Also supports operation='request' with args (method, path, params, "
-            f"json) pinned to the {product} API for anything not listed. "
-            "Pass operation-specific values inside `args`."
+            f"credentials).\n"
+            f"Supported operations: {ops_str}.\n"
+            "Also supports operation='request' with args={{method, path, params, json}} "
+            f"for any raw {product.capitalize()} API call not listed above.\n"
+            "CALLING CONVENTION: pass `operation` as a TOP-LEVEL key alongside `args`. "
+            'Example: {"operation": "search", "args": {"q": "my query"}}. '
+            "Do NOT nest `operation` inside `args`."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": f"One of: {GOOGLE_OPERATIONS[product]} — or 'request'.",
+                    "description": (
+                        f"Which operation to run. One of: {ops_str} — or 'request'. "
+                        "Pass this as a top-level key, NOT inside args."
+                    ),
                 },
                 "args": {
                     "type": "object",
-                    "description": "Operation-specific arguments (see operation list).",
+                    "description": (
+                        "Operation-specific arguments (everything EXCEPT operation itself). "
+                        "For example, {\"q\": \"query\"} for search, "
+                        "{\"spreadsheet_id\": \"...\", \"range\": \"A1:B5\"} for get."
+                    ),
                 },
             },
             "required": ["operation"],

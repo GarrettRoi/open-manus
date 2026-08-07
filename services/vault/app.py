@@ -1246,6 +1246,36 @@ async def list_connections(request: Request):
                 + f" Or call POST {{vault}}/api/vault/mcp/{cid} with "
                   '{"tool": "<tool_name>", "arguments": {...}} directly.'
             )
+        elif view.get("auth_kind") == "oauth2" and (conn.get("service") or "").startswith("google"):
+            # Combined google connection AND individual google_* service connections:
+            # use the native suite tools (vault_<id>_<product>) rather than the proxy.
+            svc = conn.get("service") or ""
+            _GOOGLE_INDIVIDUAL_MAP = {
+                "google_gmail": "gmail", "google_drive": "drive",
+                "google_sheets": "sheets", "google_docs": "docs",
+                "google_slides": "slides", "google_forms": "forms",
+                "google_calendar": "calendar", "google_tasks": "tasks",
+                "google_people": "people", "google_meet": "meet",
+                "google_app_script": "app_script",
+            }
+            if svc in _GOOGLE_INDIVIDUAL_MAP:
+                product = _GOOGLE_INDIVIDUAL_MAP[svc]
+                view["how_to_call"] = (
+                    f"Use the native vault_{cid.lower()}_{product} tool — call it with "
+                    '{"operation": "<op>", "args": {<op-specific-kwargs>}}. '
+                    f"The `operation` key MUST be top-level (not inside `args`). "
+                    f"Also available: vault_{cid.lower()} for raw proxy calls with "
+                    '{"method": "GET|POST|...", "path": "/...", "json": {...}}.'
+                )
+            else:
+                view["how_to_call"] = (
+                    f"Use the native vault_{cid.lower()}_<product> suite tools "
+                    "(gmail, drive, sheets, docs, slides, forms, tasks, chat, people, calendar, "
+                    "meet, app_script). Call each with "
+                    '{"operation": "<op>", "args": {<op-specific-kwargs>}}. '
+                    "The `operation` key MUST be top-level, not nested inside `args`. "
+                    f"Also available: vault_{cid.lower()} for raw proxy calls."
+                )
         else:
             view["how_to_call"] = (
                 f"POST {{vault}}/api/vault/proxy/{cid} with JSON "
