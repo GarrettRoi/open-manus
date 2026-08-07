@@ -133,8 +133,11 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "Chat/Contacts)."
         ),
         "example_call": "GET /gmail/v1/users/me/messages",
-        # Google OAuth probe: userinfo works for any connected Google service
-        "test_probe": {"method": "GET", "path": "/oauth2/v1/userinfo"},
+        # Probe: Drive "about" endpoint — covered by auth/drive scope (always granted)
+        # and hosted on www.googleapis.com which is this connection's base_url.
+        # Do NOT use /oauth2/v1/userinfo — that requires openid/email/profile scopes
+        # which this connection never requests, causing false 401 "Auth rejected" results.
+        "test_probe": {"method": "GET", "path": "/drive/v3/about?fields=user"},
     },
     # ── Individual Google Workspace service connections ──────────────────────
     # Each connection is scoped to one service with its correct base URL and
