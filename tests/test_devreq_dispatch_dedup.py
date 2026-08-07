@@ -318,9 +318,17 @@ class TestSweepDispatchBacklog:
 # ---------------------------------------------------------------------------
 
 class TestAdminEnqueue:
-    """admin_enqueue: atomic check-lease / clear / enqueue for /dispatch endpoint."""
+    """admin_enqueue: atomic check-lease / check-claim / enqueue for /dispatch endpoint.
 
-    def test_no_lease_returns_1_and_enqueues(self):
+    Decision table (mirrors _ADMIN_ENQUEUE_SCRIPT):
+      lease live + no force  → 0  (409 "dispatch in progress")
+      lease live + force     → 2  (enqueued, lease superseded)
+      no lease + no force + SETNX wins → 1  (enqueued normally)
+      no lease + no force + SETNX loses → 3  (409 "already queued/cooling")
+      no lease + force       → 1  (DEL stale claim, re-enqueue)
+    """
+
+    def test_no_lease_no_claim_returns_1_and_enqueues(self):
         r = _r()
         _seed_approved(r, "60")
         result = replit_mcp.admin_enqueue(r, "60", force=False)
@@ -337,7 +345,7 @@ class TestAdminEnqueue:
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 0
         assert r.get(replit_mcp.K_LEASE + "61") == token  # lease untouched
 
-    def test_live_lease_force_true_returns_2(self):
+    def test_live_lease_force_true_returns_2_and_supersedes(self):
         r = _r()
         token = str(uuid.uuid4())
         replit_mcp.acquire_lease(r, "62", token)
@@ -346,57 +354,75 @@ class TestAdminEnqueue:
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
         assert not r.exists(replit_mcp.K_LEASE + "62")  # lease cleared
 
-    def test_concurrent_calls_enqueue_exactly_once(self):
-        """Six concurrent admin_enqueue calls must produce exactly one queue entry."""
+    def test_claim_exists_no_force_returns_3(self):
+        """Claim already set (item queued or in cooldown) + no force → 3."""
+        r = _r()
+        _seed_approved(r, "67")
+        # First call wins the claim
+        assert replit_mcp.admin_enqueue(r, "67", force=False) == 1
+        # Second call loses SETNX → result 3
+        assert replit_mcp.admin_enqueue(r, "67", force=False) == 3
+        # Exactly one queue entry
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
+
+    def test_claim_exists_force_true_clears_and_reenqueues(self):
+        """Stale claim + force=True → DELs claim, re-enqueues, returns 1."""
+        r = _r()
+        _seed_approved(r, "66", dispatch_status="failed")
+        r.set(replit_mcp.K_CLAIM + "66", "1", ex=300)
+        result = replit_mcp.admin_enqueue(r, "66", force=True)
+        assert result == 1
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
+
+    def test_six_concurrent_no_force_exactly_one_enqueue(self):
+        """Six simultaneous no-force calls: exactly 1 wins (result=1), rest get result=3."""
         r = _r()
         _seed_approved(r, "63")
         results = [replit_mcp.admin_enqueue(r, "63", force=False) for _ in range(6)]
-        enqueued = sum(1 for rv in results if rv == 1)
-        rejected_or_superseded = sum(1 for rv in results if rv == 0)
-        # The first call wins (result=1); all subsequent calls see the claim and
-        # — since the lease is absent — also return 1 after atomically clearing
-        # the just-set claim and re-enqueuing. With the atomic script this
-        # is actually safe because after DEL+SET+LPUSH only one Lua eval
-        # produces exactly one entry per atomic script call.
-        # The key invariant: queue depth == number of result=1 or result=2 calls.
-        non_zero = sum(1 for rv in results if rv != 0)
-        assert r.llen(replit_mcp.DISPATCH_QUEUE) == non_zero, (
-            f"Queue depth {r.llen(replit_mcp.DISPATCH_QUEUE)} should equal "
-            f"number of successful enqueues {non_zero}")
+        assert results.count(1) == 1, f"Expected exactly 1 winner, results={results}"
+        assert results.count(3) == 5, f"Expected 5 'already queued', results={results}"
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
 
-    def test_concurrent_calls_no_unexpected_errors(self):
-        """admin_enqueue never raises — it always returns 0, 1, or 2."""
+    def test_concurrent_calls_never_raise(self):
+        """admin_enqueue always returns 0, 1, 2, or 3 — never raises."""
         r = _r()
         _seed_approved(r, "64")
         results = [replit_mcp.admin_enqueue(r, "64", force=False) for _ in range(8)]
         for i, rv in enumerate(results):
-            assert rv in (0, 1, 2), f"call {i}: unexpected return value {rv!r}"
+            assert rv in (0, 1, 2, 3), f"call {i}: unexpected return value {rv!r}"
 
-    def test_force_supersedes_existing_lease_for_worker_cas(self):
+    def test_force_supersedes_live_lease_cas_fails_for_old_worker(self):
         """After force=True, the old lease token's finalize_lease CAS returns False."""
         r = _r()
         _seed_approved(r, "65")
         old_token = str(uuid.uuid4())
         replit_mcp.acquire_lease(r, "65", old_token)
-        # Force-dispatch supersedes the old worker
         result = replit_mcp.admin_enqueue(r, "65", force=True)
         assert result == 2
-        # Old worker tries to finalize — must fail (lease cleared by force)
         item = {"id": "65", "dispatch_status": "started", "source": "old"}
         written = replit_mcp.finalize_lease(r, "65", old_token, item, 86400)
         assert written is False
-        assert not r.exists("devreq:item:65") or \
-               json.loads(r.get("devreq:item:65") or "{}").get("source") != "old"
+        stored_raw = r.get("devreq:item:65")
+        if stored_raw:
+            assert json.loads(stored_raw).get("source") != "old"
 
-    def test_stale_claim_no_lease_is_cleared_and_enqueued(self):
-        """No live lease + existing claim → claim cleared atomically, item pushed."""
+    def test_no_live_lease_force_clears_stale_claim(self):
+        """force=True with no live lease DELs any stale claim and re-enqueues."""
         r = _r()
-        _seed_approved(r, "66", dispatch_status="failed")
-        r.set(replit_mcp.K_CLAIM + "66", "1", ex=300)  # stale claim from prior fail
-        result = replit_mcp.admin_enqueue(r, "66", force=False)
-        # No live lease → force flag irrelevant, we proceed and re-enqueue
+        _seed_approved(r, "68", dispatch_status="failed")
+        r.set(replit_mcp.K_CLAIM + "68", "1", ex=300)  # stale from prior failure
+        result = replit_mcp.admin_enqueue(r, "68", force=True)
         assert result == 1
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
+
+    def test_result_3_does_not_add_to_queue(self):
+        """result=3 must never push another entry to the dispatch queue."""
+        r = _r()
+        _seed_approved(r, "69")
+        replit_mcp.admin_enqueue(r, "69", force=False)   # wins claim
+        before = r.llen(replit_mcp.DISPATCH_QUEUE)
+        replit_mcp.admin_enqueue(r, "69", force=False)   # should return 3
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == before  # no new entry
 
 
 class TestDispatcherGuard:

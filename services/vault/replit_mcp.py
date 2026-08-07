@@ -74,15 +74,28 @@ _SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5
 #   ARGV[1]=token  ARGV[2]=item JSON  ARGV[3]=item TTL (0 = no expiry)
 #   Returns 1 if written (token matched), 0 if lease was superseded.
 #
-# _ADMIN_ENQUEUE_SCRIPT: atomic check-lease / clear / enqueue for /dispatch.
-#   Makes the entire "check lease, delete lease+claim, set claim, push" one
-#   Redis operation so concurrent /dispatch calls cannot race each other.
+# _ADMIN_ENQUEUE_SCRIPT: atomic check-lease / check-claim / enqueue for /dispatch.
+#   All guard checks and the enqueue happen inside one Lua eval so no two
+#   concurrent calls can race each other.
+#
 #   KEYS[1]=lease key  KEYS[2]=claim key  KEYS[3]=dispatch queue
-#   ARGV[1]="1" to force (supersede live lease), "0" to reject if live
+#   ARGV[1]="1" if force=true, "0" if force=false
 #   ARGV[2]=claim TTL  ARGV[3]=req_id
-#   Returns 0 = live lease present, force not set (caller → 409)
-#           1 = enqueued, no live lease existed
-#           2 = enqueued, live lease was superseded (force=true)
+#
+#   Decision table:
+#   ┌──────────────┬───────────┬──────────────────────────────────────────┐
+#   │ lease live?  │ force?    │ result                                   │
+#   ├──────────────┼───────────┼──────────────────────────────────────────┤
+#   │ yes          │ no        │ 0  — 409 "dispatch in progress"          │
+#   │ yes          │ yes       │ 2  — supersede: DEL both, SETNX, LPUSH   │
+#   │ no           │ no        │ 1  — won claim (SETNX), LPUSH            │
+#   │              │           │ 3  — lost claim (already queued/cooling) │
+#   │ no           │ yes       │ 1  — force-clear claim, SETNX, LPUSH     │
+#   └──────────────┴───────────┴──────────────────────────────────────────┘
+#   Returns 0 = live lease, force not set (caller → 409)
+#           1 = enqueued (won claim or force without live lease)
+#           2 = enqueued, live lease superseded (force=true, lease was live)
+#           3 = claim already held by earlier caller, not forced (caller → 409)
 # ---------------------------------------------------------------------------
 _ENQUEUE_SCRIPT = """
 local claimed = redis.call("SET", KEYS[1], "1", "NX", "EX", tonumber(ARGV[1]))
@@ -123,16 +136,31 @@ return 1
 
 _ADMIN_ENQUEUE_SCRIPT = """
 local lease_live = redis.call("EXISTS", KEYS[1])
-if lease_live == 1 and ARGV[1] == "0" then
-    return 0
-end
-redis.call("DEL", KEYS[1], KEYS[2])
-redis.call("SET", KEYS[2], "1", "EX", tonumber(ARGV[2]))
-redis.call("LPUSH", KEYS[3], ARGV[3])
 if lease_live == 1 then
+    if ARGV[1] == "0" then
+        return 0
+    end
+    -- force=true with live lease: supersede (DEL both, SETNX, LPUSH)
+    redis.call("DEL", KEYS[1], KEYS[2])
+    redis.call("SET", KEYS[2], "1", "EX", tonumber(ARGV[2]))
+    redis.call("LPUSH", KEYS[3], ARGV[3])
     return 2
 end
-return 1
+-- No live lease.
+if ARGV[1] == "1" then
+    -- force=true without live lease: clear stale claim and re-enqueue.
+    redis.call("DEL", KEYS[2])
+    redis.call("SET", KEYS[2], "1", "EX", tonumber(ARGV[2]))
+    redis.call("LPUSH", KEYS[3], ARGV[3])
+    return 1
+end
+-- no force: only enqueue if we win the claim (SETNX).
+local won = redis.call("SET", KEYS[2], "1", "NX", "EX", tonumber(ARGV[2]))
+if won then
+    redis.call("LPUSH", KEYS[3], ARGV[3])
+    return 1
+end
+return 3
 """
 
 
@@ -213,15 +241,18 @@ def has_live_lease(r, req_id: str) -> bool:
 
 
 def admin_enqueue(r, req_id: str, force: bool = False) -> int:
-    """Atomically check-lease / clear / enqueue for the /dispatch admin endpoint.
+    """Atomically check-lease / check-claim / enqueue for the /dispatch admin endpoint.
 
-    All six operations (EXISTS lease, DEL lease+claim, SET claim, LPUSH) execute
-    in a single Lua script — concurrent admin calls cannot race each other.
+    Everything executes inside one Lua eval — concurrent admin calls cannot
+    race each other.  See _ADMIN_ENQUEUE_SCRIPT for the full decision table.
 
     Returns:
-      0 — live lease present and force=False (caller should return 409)
-      1 — enqueued normally (no live lease existed)
-      2 — enqueued, a live lease was superseded (force=True cleared it)
+      0 — live lease, force=False → caller should 409 "dispatch in progress"
+      1 — enqueued: won the SETNX claim (no-force) or force-cleared stale claim
+      2 — enqueued: live lease superseded by force=True
+      3 — claim already held (another caller already queued this item, or the
+          post-failure cooldown TTL is still live) → caller should 409 "already
+          queued or in cooldown, use ?force=true to override"
     """
     result = r.eval(
         _ADMIN_ENQUEUE_SCRIPT, 3,

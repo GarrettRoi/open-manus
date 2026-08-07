@@ -2533,14 +2533,28 @@ async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False
     #   result=1: enqueued normally
     #   result=2: enqueued, live lease superseded (force=true)
     result = await _asyncio.to_thread(replit_mcp_mod.admin_enqueue, r, rid, force)
+
     if result == 0:
+        # Live lease, force not set.
         return JSONResponse(status_code=409, content={
             "ok": False,
-            "lease_active": True,
+            "reason": "dispatch_in_progress",
             "detail": (
                 f"Request '{rid}' is currently being dispatched (active lease). "
                 "Use ?force=true to supersede the in-flight worker. "
                 "The superseded worker's finalize step will be a no-op."
+            ),
+        })
+
+    if result == 3:
+        # No live lease but claim is held — item is already queued or in the
+        # post-failure cooldown window. force=true clears and re-enqueues.
+        return JSONResponse(status_code=409, content={
+            "ok": False,
+            "reason": "already_queued",
+            "detail": (
+                f"Request '{rid}' is already queued or in the post-failure "
+                "cooldown window. Use ?force=true to force a new dispatch."
             ),
         })
 
