@@ -345,6 +345,61 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
                 "required": ["operation"],
             },
         }
+    # Google OAuth connections: return a hub schema so agents call this tool
+    # with {product, operation, args} instead of confusing it with a generic
+    # HTTP proxy.  The per-product tools (vault_<id>_sheets, etc.) are
+    # preferred, but this hub lets agents pick the product dynamically.
+    auth_kind_raw = str(conn.get("auth_kind") or "")
+    if (service or "").lower() == "google" and auth_kind_raw == "oauth2":
+        product_list = ", ".join(GOOGLE_PRODUCTS)
+        suite_tools = "\n".join(f"• {tool_name}_{p}" for p in GOOGLE_PRODUCTS)
+        return {
+            "name": tool_name,
+            "description": (
+                f"Google Workspace hub for the '{conn.get('label') or conn_id}' account.\n"
+                f"Prefer the dedicated per-product tools when you know which product you need:\n"
+                f"{suite_tools}\n\n"
+                f"Use this hub when you need to specify the product dynamically. "
+                f"Pass `product` (one of: {product_list}), `operation`, and `args`.\n"
+                "OAuth token is attached server-side — never handle credentials.\n"
+                + (description if description not in (
+                    f"Call the {service} API"
+                    + (f" ({conn.get('label', '')})" if conn.get('label', '').lower() != (service or '').lower() else "")
+                    + " through the secure vault proxy. Credentials are attached "
+                      "server-side — never handle or ask for API keys."
+                    + (f"\nBase URL: {base_url} (give `path` relative to it)." if base_url else ""),
+                ) else "")
+            ).strip(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {
+                        "type": "string",
+                        "enum": GOOGLE_PRODUCTS,
+                        "description": (
+                            "Which Google product to call. One of: " + product_list + ". "
+                            "For the dedicated per-product tools you do not need this field."
+                        ),
+                    },
+                    "operation": {
+                        "type": "string",
+                        "description": (
+                            "Which operation to run. Depends on the product — "
+                            "see GOOGLE_WORKSPACE_VAULT_SKILL.md for the full list."
+                        ),
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation-specific arguments. Put all parameters here. "
+                            "Example: {\"spreadsheet_id\": \"...\", \"range\": \"A1:B5\"}."
+                        ),
+                    },
+                },
+                "required": ["product", "operation"],
+            },
+        }
+
     return {
         "name": tool_name,
         "description": description,
@@ -915,6 +970,28 @@ def _make_conn_handler(conn_id: str, auth_kind: str = "", service: str = ""):
         def _mac_handler(args: dict, **_kw) -> str:
             return _special_call(conn_id, "mac", args or {})
         return _mac_handler
+    # Google OAuth hub: accept {product, operation, args} and route through
+    # the structured Google endpoint rather than the generic proxy.
+    if service == "google" and auth_kind == "oauth2":
+        def _google_hub_handler(args: dict, **_kw) -> str:
+            a = args or {}
+            product = str(a.get("product") or "").strip().lower()
+            if not product:
+                return json.dumps({
+                    "error": "product is required for the Google hub tool.",
+                    "hint": (
+                        "Pass 'product' as one of: " + ", ".join(GOOGLE_PRODUCTS) + ". "
+                        "Or use the dedicated per-product tool "
+                        f"(e.g. vault_{conn_id.lower()}_sheets) which does not need 'product'."
+                    ),
+                })
+            if product not in GOOGLE_PRODUCTS:
+                return json.dumps({
+                    "error": f"Unknown Google product '{product}'.",
+                    "hint": "product must be one of: " + ", ".join(GOOGLE_PRODUCTS),
+                })
+            return _google_call(conn_id, product, a)
+        return _google_hub_handler
 
     def _handler(args: dict, **_kw) -> str:
         if service in {"apple", "email"}:

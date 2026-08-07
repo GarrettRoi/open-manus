@@ -1269,12 +1269,19 @@ async def list_connections(request: Request):
                 )
             else:
                 view["how_to_call"] = (
-                    f"Use the native vault_{cid.lower()}_<product> suite tools "
-                    "(gmail, drive, sheets, docs, slides, forms, tasks, chat, people, calendar, "
-                    "meet, app_script). Call each with "
+                    f"Use the dedicated per-product tools: "
+                    f"vault_{cid.lower()}_gmail, vault_{cid.lower()}_drive, "
+                    f"vault_{cid.lower()}_sheets, vault_{cid.lower()}_docs, "
+                    f"vault_{cid.lower()}_slides, vault_{cid.lower()}_forms, "
+                    f"vault_{cid.lower()}_tasks, vault_{cid.lower()}_chat, "
+                    f"vault_{cid.lower()}_people, vault_{cid.lower()}_calendar, "
+                    f"vault_{cid.lower()}_meet, vault_{cid.lower()}_app_script. "
+                    "Call each with "
                     '{"operation": "<op>", "args": {<op-specific-kwargs>}}. '
                     "The `operation` key MUST be top-level, not nested inside `args`. "
-                    f"Also available: vault_{cid.lower()} for raw proxy calls."
+                    f"Alternatively vault_{cid.lower()} is a hub tool — call it with "
+                    '{"product": "<product>", "operation": "<op>", "args": {...}} '
+                    "when you need to pick the product dynamically."
                 )
         else:
             view["how_to_call"] = (
