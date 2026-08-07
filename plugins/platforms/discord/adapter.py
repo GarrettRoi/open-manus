@@ -3848,18 +3848,36 @@ class DiscordAdapter(BasePlatformAdapter):
         # channel this bot cannot even see. Treat "can view the channel" as
         # membership: agents that are not in the chat refuse the command
         # with a friendly ephemeral instead of acting from outside it.
-        if not in_dm and chan_obj is not None:
-            guild = getattr(interaction, "guild", None)
-            me = getattr(guild, "me", None)
-            if me is not None:
-                try:
-                    perms = chan_obj.permissions_for(me)
-                    if not getattr(perms, "view_channel", True):
-                        return (False, REASON_NOT_IN_CHANNEL)
-                except Exception:
-                    # Unresolvable permissions (partial objects, etc.) —
-                    # fall through to the existing gates.
-                    pass
+        #
+        # Primary source: interaction.app_permissions — Discord sends the
+        # app's resolved permissions for the invoking channel on every
+        # interaction, so this works even when interaction.channel is an
+        # uncached PartialMessageable (no permissions_for) or guild.me is
+        # absent from member cache. Fallback: permissions_for on resolved
+        # channel objects (test doubles and older payloads).
+        if not in_dm and getattr(interaction, "guild_id", None) is not None:
+            visible: Optional[bool] = None
+            app_perms = getattr(interaction, "app_permissions", None)
+            if app_perms is not None:
+                vc = getattr(app_perms, "view_channel", None)
+                if isinstance(vc, bool):
+                    visible = vc
+            if visible is None and chan_obj is not None:
+                guild = getattr(interaction, "guild", None)
+                me = getattr(guild, "me", None)
+                perms_for = getattr(chan_obj, "permissions_for", None)
+                if me is not None and callable(perms_for):
+                    try:
+                        pv = getattr(perms_for(me), "view_channel", None)
+                        if isinstance(pv, bool):
+                            visible = pv
+                    except Exception as e:
+                        logger.debug(
+                            "[Discord] Channel visibility check failed "
+                            "(falling through to other gates): %s", e,
+                        )
+            if visible is False:
+                return (False, REASON_NOT_IN_CHANNEL)
 
         channel_ids: set = set()
         channel_keys: set = set()

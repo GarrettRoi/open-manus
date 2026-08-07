@@ -813,3 +813,87 @@ async def test_skill_handler_dispatches_for_authorized(
     interaction = _make_interaction("100200300")
     await handler(interaction, "alpha", "extra args")
     assert dispatched == ["/alpha extra args"]
+
+
+# ---------------------------------------------------------------------------
+# Channel membership gate: slash commands limited to agents in the chat
+# (view_channel visibility). Primary source: interaction.app_permissions;
+# fallback: channel.permissions_for(guild.me) on resolved channel objects.
+# ---------------------------------------------------------------------------
+
+from plugins.platforms.discord.adapter import REASON_NOT_IN_CHANNEL  # noqa: E402
+
+
+def _allow_all(monkeypatch):
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+
+
+@pytest.mark.asyncio
+async def test_app_permissions_deny_rejects(adapter, monkeypatch):
+    """app_permissions.view_channel=False → agent not in this chat."""
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1")
+    interaction.app_permissions = SimpleNamespace(view_channel=False)
+    allowed, reason = adapter._evaluate_slash_authorization(interaction)
+    assert allowed is False
+    assert reason == REASON_NOT_IN_CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_app_permissions_allow_passes(adapter, monkeypatch):
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1")
+    interaction.app_permissions = SimpleNamespace(view_channel=True)
+    allowed, reason = adapter._evaluate_slash_authorization(interaction)
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_fallback_permissions_for_deny_rejects(adapter, monkeypatch):
+    """No app_permissions but resolved channel denies view → reject."""
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1")
+    me = SimpleNamespace(id=99999)
+    interaction.guild.me = me
+    interaction.channel.permissions_for = (
+        lambda m: SimpleNamespace(view_channel=False)
+    )
+    allowed, reason = adapter._evaluate_slash_authorization(interaction)
+    assert allowed is False
+    assert reason == REASON_NOT_IN_CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_partial_channel_without_permissions_falls_through(
+    adapter, monkeypatch,
+):
+    """Unresolvable visibility (no app_permissions, partial channel) does
+    not block — the remaining gates still apply."""
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1")  # SimpleNamespace channel, no perms
+    allowed, reason = adapter._evaluate_slash_authorization(interaction)
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_dm_not_gated_by_membership(adapter, monkeypatch):
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1", in_dm=True)
+    interaction.app_permissions = SimpleNamespace(view_channel=False)
+    allowed, reason = adapter._evaluate_slash_authorization(interaction)
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_not_in_channel_friendly_ephemeral_no_admin_alert(adapter, monkeypatch):
+    """Rejection uses friendly copy and skips the admin alert."""
+    _allow_all(monkeypatch)
+    interaction = _make_interaction("1")
+    interaction.app_permissions = SimpleNamespace(view_channel=False)
+    notify = AsyncMock()
+    adapter._notify_unauthorized_slash = notify
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    msg = interaction.response.send_message.await_args.args[0]
+    assert "not in this chat" in msg
+    await asyncio.sleep(0)  # allow any stray create_task to run
+    notify.assert_not_awaited()
