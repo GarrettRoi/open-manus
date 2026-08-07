@@ -32,6 +32,11 @@ except ImportError:
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 WORKSPACE_DIR = os.getenv("HERMES_WORKSPACE_DIR", "/root/.hermes/workspace")
+# MEMORY_DIR is hardcoded to /root/.hermes — the standard single-agent Railway
+# layout where HERMES_HOME is unset and defaults to this path. If Railway
+# deployments ever adopt profile mode (HERMES_HOME=/root/.hermes/profiles/<name>),
+# this would need to read $HERMES_HOME instead so save/restore paths match the
+# real cron/jobs.py JOBS_FILE location.
 MEMORY_DIR = "/root/.hermes"
 
 # Files to persist (relative to MEMORY_DIR)
@@ -44,11 +49,21 @@ PERSIST_FILES = [
     "memories/MEMORY.md",
     "memories/USER.md",
     "workspace/MEMORY.md",
+    # LEGACY — no part of the cron subsystem reads/writes this path. The active
+    # cron job store is cron/jobs.json (see entry below). Kept here to avoid
+    # breaking workspace_sync.py's MEMORY_SYNC_OWNED handoff; annotated rather
+    # than removed so the history is clear.
     "workspace/cron_jobs.json",
     "workspace/tasks.json",
     "workspace/notes.md",
     # Session index (which sessions exist / channel bindings)
     "sessions/sessions.json",
+    # Active cron job store — persists agent-scheduled jobs across Railway
+    # redeploys. Path: /root/.hermes/cron/jobs.json (cron/jobs.py: JOBS_FILE).
+    # Redis key: agent:{name}:memory:cron:jobs.json
+    # Output files (cron/output/…) are intentionally excluded — they are
+    # ephemeral per-job artefacts and would exceed the 512 KB cap.
+    "cron/jobs.json",
 ]
 
 # Directories whose text files are swept wholesale (relative to MEMORY_DIR).

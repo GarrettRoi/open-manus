@@ -59,6 +59,9 @@ SHARED_PREFIX = "shared/"
 
 # Files redis_memory_sync.py already persists at the workspace root — leave
 # them to that script so the two syncs never fight over the same file.
+# Note: cron_jobs.json here refers to the LEGACY workspace copy
+# (workspace/cron_jobs.json). The active cron job store is
+# cron/jobs.json (persisted via redis_memory_sync.py PERSIST_FILES).
 MEMORY_SYNC_OWNED = {"MEMORY.md", "cron_jobs.json", "tasks.json", "notes.md"}
 
 # Never sync: credentials, transient/tool dirs, sync state.
