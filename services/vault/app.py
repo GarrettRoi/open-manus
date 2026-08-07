@@ -901,6 +901,11 @@ async def update_service(request: Request):
         new_token = (form.get("api_key") or "").strip()
         if new_token:
             secrets_d["api_key"] = new_token
+        # Enforce HTTPS when a new URL is supplied.
+        _new_mcp_url = (form.get("base_url") or "").strip()
+        if _new_mcp_url and not _new_mcp_url.startswith("https://"):
+            return RedirectResponse(
+                url="/services?error=MCP+server+URL+must+use+HTTPS", status_code=303)
     if (conn.get("auth") or {}).get("kind") == "email":
         email_address = (form.get("email_address") or "").strip()
         app_password = (form.get("email_app_password") or "").strip()
@@ -927,10 +932,11 @@ async def update_service(request: Request):
         auth = dict(auth)
         auth["oauth"] = merged
 
+    final_base_url = (form.get("base_url") or conn.get("base_url", "")).strip()
     store.save(
         conn_id, service=conn["service"],
         label=form.get("label") or conn.get("label", ""),
-        base_url=(form.get("base_url") or conn.get("base_url", "")).strip(),
+        base_url=final_base_url,
         auth=auth,
         secrets=secrets_d,
         description=form.get("description", conn.get("description", "")),
@@ -938,6 +944,22 @@ async def update_service(request: Request):
         status=conn.get("status", "ready"),
     )
     audit_log("admin", conn_id, "connection_updated")
+
+    # MCP bearer connections: re-sync tool manifest when URL or token changed.
+    if (conn.get("auth") or {}).get("kind") == "mcp_bearer":
+        _tok_changed = bool((form.get("api_key") or "").strip())
+        _url_changed = (form.get("base_url") or "").strip() not in ("", conn.get("base_url", "").strip())
+        if _tok_changed or _url_changed:
+            _mcp_tok = secrets_d.get("api_key", "")
+            if final_base_url and _mcp_tok:
+                try:
+                    _tools = await custom_mcp.list_tools(final_base_url, _mcp_tok)
+                    r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(_tools))
+                    logger.info("Re-synced %d MCP tools for %s after dashboard update",
+                                len(_tools), conn_id)
+                except Exception as exc:
+                    logger.warning("MCP tool re-sync failed for %s: %s", conn_id, exc)
+
     return RedirectResponse(url="/services?notice=Connection+updated", status_code=303)
 
 
