@@ -49,7 +49,7 @@ DISPATCH_QUEUE = "devreq:dispatch"
 _EXPIRY_SLACK = 90
 PKCE_TTL = 600
 CLAIM_TTL = 300       # seconds — long enough to cover a full MCP round-trip
-_SWEEP_IDLE_TICKS = 12  # BRPOP timeouts between periodic sweeps (≈ 2 min at 10 s/tick)
+_SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5 s/tick)
 
 
 class ReplitMCPError(Exception):
@@ -433,7 +433,25 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
     status endpoint can confirm the loop is alive, and runs a periodic backlog
     sweep every _SWEEP_IDLE_TICKS BRPOP timeouts to catch items that slipped
     through (e.g. approved before the current deploy was live).
+
+    Uses a dedicated Redis client for BRPOP with socket_keepalive=True so
+    Railway's TCP idle-timeout cannot kill the blocking connection, and
+    socket_timeout=8 > BRPOP timeout=5 so the server-side nil return always
+    arrives before the socket gives up — preventing the crash-loop that
+    occurred when the shared mcp.r client had no keepalive and the 10 s BRPOP
+    raced against Railway's ~10 s network idle timeout.
     """
+    import os as _os
+    import redis as _redis_mod
+
+    _redis_url = _os.getenv("REDIS_URL", "redis://localhost:6379")
+    _brpop_r = _redis_mod.from_url(
+        _redis_url,
+        decode_responses=True,
+        socket_timeout=8,        # must exceed BRPOP timeout below
+        socket_keepalive=True,   # keeps the connection alive during the wait
+    )
+
     logger.info("Replit MCP dispatcher started (queue: %s)", DISPATCH_QUEUE)
     idle_ticks = 0
     while True:
@@ -442,7 +460,7 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
             await asyncio.to_thread(
                 mcp.r.set, K_HEARTBEAT, str(int(time.time())), ex=60)
 
-            popped = await asyncio.to_thread(mcp.r.brpop, DISPATCH_QUEUE, 10)
+            popped = await asyncio.to_thread(_brpop_r.brpop, DISPATCH_QUEUE, 5)
             if not popped:
                 # BRPOP timed out — count idle ticks and maybe sweep backlog.
                 idle_ticks += 1
