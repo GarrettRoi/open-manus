@@ -144,8 +144,17 @@
 
         <div id="grp_mcp_bearer" class="form-group" style="display:none;">
             <label>Bearer token</label>
-            <input type="password" name="api_key" placeholder="Paste your MCP bearer token — agents will never see it">
+            <input type="password" name="mcp_token" placeholder="Paste your MCP bearer token — agents will never see it">
             <small style="color:var(--text-muted);">This token is sent as <code>Authorization: Bearer &lt;token&gt;</code> in every MCP call. For Vowsok: find it in your dashboard → API / Integrations.</small>
+        </div>
+
+        <div id="grp_alpaca_env" class="form-group" style="display:none;">
+            <label>Environment</label>
+            <select name="alpaca_env" style="width: 100%; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius);">
+                <option value="paper">Paper (sandbox — paper-api.alpaca.markets)</option>
+                <option value="live">Live (real money — api.alpaca.markets)</option>
+            </select>
+            <small style="color:var(--text-muted);">Paper uses your paper-trading keys; Live uses real-money keys. Keys are generated separately in the Alpaca dashboard.</small>
         </div>
 
         <div id="grp_mac" style="display:none;">
@@ -334,6 +343,14 @@
                 <input type="password" name="api_secret">
                 <small style="color:var(--text-muted);">Rotate the Alpaca secret key here. The current value is never shown.</small>
             </div>
+            <div class="form-group" id="e_grp_alpaca_env" style="display:none;">
+                <label>Environment</label>
+                <select name="alpaca_env" id="e_alpaca_env" style="width: 100%; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius);">
+                    <option value="paper">Paper (sandbox — paper-api.alpaca.markets)</option>
+                    <option value="live">Live (real money — api.alpaca.markets)</option>
+                </select>
+                <small style="color:var(--text-muted);">Changing this switches the proxied host. Paper and Live keys are separate — update your keys above if switching environments.</small>
+            </div>
             <div id="e_grp_apple" class="form-row" style="display:none;">
                 <div class="form-group">
                     <label>Apple ID email (leave blank to keep)</label>
@@ -495,7 +512,8 @@ function onServiceChange() {
     document.getElementById('grp_mac').style.display = isMac ? '' : 'none';
     document.getElementById('grp_email').style.display = isEmail ? '' : 'none';
     document.getElementById('grp_alpaca_secret').style.display = isAlpaca ? '' : 'none';
-    document.getElementById('lbl_api_key').textContent = isAlpaca ? 'API Key ID (public key)' : 'API key';
+    document.getElementById('grp_alpaca_env').style.display = isAlpaca ? '' : 'none';
+    document.getElementById('lbl_api_key').textContent = isAlpaca ? 'API Key ID (never shown to agents)' : 'API key';
     if (sid === 'apple' || isMac) document.getElementById('grp_api_key').style.display = 'none';
     document.getElementById('svc_redirect').style.display = isOAuth ? '' : 'none';
     document.getElementById('btn_add').textContent = isOAuth ? 'Save & Connect with Login' : 'Add Service';
@@ -576,6 +594,13 @@ function openEdit(c) {
         document.getElementById('e_lbl_api_key').textContent = 'New API Key ID (leave blank to keep)';
     }
     document.getElementById('e_grp_alpaca_secret').style.display = isAlpacaEdit ? '' : 'none';
+    // Alpaca env selector: derive paper/live from stored base_url; hide raw base_url.
+    document.getElementById('e_grp_alpaca_env').style.display = isAlpacaEdit ? '' : 'none';
+    document.getElementById('e_base_url').closest('.form-group').style.display = isAlpacaEdit ? 'none' : '';
+    if (isAlpacaEdit) {
+        const isLive = (c.base_url || '').indexOf('paper') === -1;
+        document.getElementById('e_alpaca_env').value = isLive ? 'live' : 'paper';
+    }
     document.getElementById('e_grp_apple').style.display = isApple ? '' : 'none';
     document.getElementById('e_grp_mac').style.display = isMac ? '' : 'none';
     document.getElementById('e_grp_email').style.display = isEmail ? '' : 'none';

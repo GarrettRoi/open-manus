@@ -695,6 +695,11 @@ async def add_service(request: Request):
 
     auth = dict(tpl["auth"])
     base_url = (form.get("base_url") or tpl.get("base_url") or "").strip()
+    # Alpaca: environment selector picks the correct host (Paper vs Live).
+    if service == "alpaca":
+        alpaca_env = (form.get("alpaca_env") or "paper").strip().lower()
+        base_url = ("https://api.alpaca.markets/v2" if alpaca_env == "live"
+                    else "https://paper-api.alpaca.markets/v2")
     if auth["kind"] == "header":
         # allow custom-template header overrides
         # None = field absent (keep default); "" = intentionally blank
@@ -762,7 +767,7 @@ async def add_service(request: Request):
                 url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         base_url = ""
     elif auth["kind"] == "mcp_bearer":
-        api_key = (form.get("api_key") or "").strip()
+        api_key = (form.get("mcp_token") or "").strip()
         if not api_key:
             return RedirectResponse(
                 url="/services?error=Bearer+token+required+for+MCP+connections",
@@ -930,7 +935,10 @@ async def update_service(request: Request):
             if val:
                 secrets_d[secret_fld] = val
     if (conn.get("auth") or {}).get("kind") == "mcp_bearer":
-        new_token = (form.get("api_key") or "").strip()
+        # Accept mcp_token (add-form field name, avoids api_key collision on the
+        # add form) OR api_key (edit-modal field name — e_grp_key submits api_key
+        # for all key-based connections; there is no duplicate-field risk there).
+        new_token = (form.get("mcp_token") or form.get("api_key") or "").strip()
         if new_token:
             secrets_d["api_key"] = new_token
             # New token supplied — clear any stale 401-status immediately so the
@@ -967,7 +975,18 @@ async def update_service(request: Request):
         auth = dict(auth)
         auth["oauth"] = merged
 
-    final_base_url = (form.get("base_url") or conn.get("base_url", "")).strip()
+    # Alpaca: environment selector overrides whatever is in the base_url field.
+    if conn.get("service") == "alpaca":
+        _alpaca_env = (form.get("alpaca_env") or "").strip().lower()
+        if _alpaca_env == "live":
+            final_base_url = "https://api.alpaca.markets/v2"
+        elif _alpaca_env == "paper":
+            final_base_url = "https://paper-api.alpaca.markets/v2"
+        else:
+            # No env submitted — keep the stored value unchanged.
+            final_base_url = conn.get("base_url", "https://paper-api.alpaca.markets/v2")
+    else:
+        final_base_url = (form.get("base_url") or conn.get("base_url", "")).strip()
     store.save(
         conn_id, service=conn["service"],
         label=form.get("label") or conn.get("label", ""),
@@ -982,7 +1001,7 @@ async def update_service(request: Request):
 
     # MCP bearer connections: re-sync tool manifest when URL or token changed.
     if (conn.get("auth") or {}).get("kind") == "mcp_bearer":
-        _tok_changed = bool((form.get("api_key") or "").strip())
+        _tok_changed = bool((form.get("mcp_token") or form.get("api_key") or "").strip())
         _url_changed = (form.get("base_url") or "").strip() not in ("", conn.get("base_url", "").strip())
         if _tok_changed or _url_changed:
             _mcp_tok = secrets_d.get("api_key", "")
