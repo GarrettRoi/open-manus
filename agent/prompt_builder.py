@@ -195,6 +195,22 @@ VAULT_GUIDANCE = (
     "user it's pending approval in the vault dashboard."
 )
 
+DEV_REQUEST_GUIDANCE = (
+    "When you hit a platform limitation — a missing tool capability, a vault "
+    "gap, shared infrastructure bug, or worthwhile improvement — do not give "
+    "up or work around it silently. Use request_dev_modification(action='submit') "
+    "to file a structured change request with the development team. Write the "
+    "full context in 'description': what you tried, what failed or is missing, "
+    "and the specific change you suggest. The owner reviews and approves "
+    "requests in Discord (/devrequests); approved ones are automatically queued "
+    "for the dev team to implement. After submitting, tell the user you filed "
+    "a request and include the request ID so they can track it. "
+    "If request_dev_modification is unavailable (REDIS_URL not configured), "
+    "state clearly that dev-request filing is unavailable due to a "
+    "configuration issue and describe what change you would have requested, "
+    "so the owner can act on it manually."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

@@ -1088,6 +1088,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Home voice channel: if the owner is already sitting in the
                 # agent's designated channel when we come online, join them.
                 asyncio.create_task(adapter_self.check_designated_voice_channel())
+                # Non-blocking Redis reachability check for /devrequests.
+                asyncio.create_task(adapter_self._warn_if_devreq_redis_unhealthy())
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -3254,6 +3256,37 @@ class DiscordAdapter(BasePlatformAdapter):
         # If humans are already in it (e.g. the invoker), join right away.
         asyncio.create_task(self.check_designated_voice_channel())
 
+    async def _warn_if_devreq_redis_unhealthy(self) -> None:
+        """Non-blocking startup probe: warn if REDIS_URL is absent or unreachable.
+
+        Called once from on_ready as a fire-and-forget task.  Failures here
+        must never crash the adapter — this is purely advisory logging.
+        """
+        try:
+            url = os.getenv("REDIS_URL", "").strip()
+            if not url:
+                logger.warning(
+                    "[%s] REDIS_URL is not set — /devrequests will fail and "
+                    "request_dev_modification is hidden from all agents",
+                    self.name,
+                )
+                return
+            import redis as _redis_mod
+            _r = await asyncio.to_thread(
+                _redis_mod.from_url, url,
+                decode_responses=True, socket_timeout=3,
+            )
+            await asyncio.to_thread(_r.ping)
+            logger.debug(
+                "[%s] Dev-request Redis reachability check OK", self.name
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] REDIS_URL is set but Redis is unreachable at startup "
+                "— /devrequests will fail: %s",
+                self.name, e,
+            )
+
     async def check_designated_voice_channel(self) -> None:
         """Startup check: if humans are already in the home voice channel, join."""
         dvc = self._designated_voice_channel_id
@@ -4802,7 +4835,19 @@ class DiscordAdapter(BasePlatformAdapter):
             name="devrequests",
             description="Review agents' dev modification requests (approve or deny)",
         )
-        async def slash_devrequests(interaction: discord.Interaction):
+        @discord.app_commands.describe(
+            action="list (default) — show pending requests with Approve/Deny buttons; "
+                   "diag — Redis health fingerprint and per-status queue counts",
+        )
+        @discord.app_commands.choices(action=[
+            discord.app_commands.Choice(
+                name="list — show pending requests", value="list"),
+            discord.app_commands.Choice(
+                name="diag — Redis health & queue counts", value="diag"),
+        ])
+        async def slash_devrequests(
+            interaction: discord.Interaction, action: str = "list"
+        ):
             if not await self._check_slash_authorization(interaction, "/devrequests"):
                 return
             try:
@@ -4810,18 +4855,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     from dev_requests_ui import handle_devrequests_slash
                 except ImportError:
                     from .dev_requests_ui import handle_devrequests_slash
-                await handle_devrequests_slash(interaction)
+                await handle_devrequests_slash(interaction, action=action)
             except Exception as e:
                 logger.exception("/devrequests failed")
+                _msg = f"Dev request review failed: {e}"
+                # After a defer inside handle_devrequests_slash the followup path
+                # is the correct one; fall back to response if followup is not yet
+                # available (e.g. import error before any defer was issued).
                 try:
-                    await interaction.response.send_message(
-                        f"Dev request review failed: {e}", ephemeral=True)
+                    await interaction.followup.send(_msg, ephemeral=True)
                 except Exception:
                     try:
-                        await interaction.followup.send(
-                            f"Dev request review failed: {e}", ephemeral=True)
+                        await interaction.response.send_message(_msg, ephemeral=True)
                     except Exception:
-                        pass
+                        logger.error(
+                            "/devrequests: all error-delivery paths exhausted for: %s", e
+                        )
 
         @tree.command(
             name="voicehome",

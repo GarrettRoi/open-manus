@@ -680,7 +680,31 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
     import redis as _redis_mod
     import uuid as _uuid
 
-    _redis_url = _os.getenv("REDIS_URL", "redis://localhost:6379")
+    _redis_url = _os.getenv("REDIS_URL", "").strip()
+    if not _redis_url:
+        # Do NOT fall back to localhost — a silent localhost connection would
+        # drain a different (empty) Redis than the one agents write to, causing
+        # approved requests to be permanently lost in the dispatch queue.
+        # Instead idle in a long sleep loop so the vault supervisor does not
+        # thrash restarts, and log loudly so the operator notices.
+        logger.error(
+            "Replit MCP dispatcher: REDIS_URL is not set — cannot connect to "
+            "Redis.  Approved dev requests will NOT be dispatched until "
+            "REDIS_URL is configured.  Idling (check every 60 s)."
+        )
+        while True:
+            await asyncio.sleep(60)
+            _redis_url = _os.getenv("REDIS_URL", "").strip()
+            if _redis_url:
+                logger.info(
+                    "Replit MCP dispatcher: REDIS_URL is now set — restarting "
+                    "dispatch loop."
+                )
+                break
+            logger.error(
+                "Replit MCP dispatcher: REDIS_URL still not set — still idling."
+            )
+
     _brpop_r = _redis_mod.from_url(
         _redis_url,
         decode_responses=True,

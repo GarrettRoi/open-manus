@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tools.registry import registry
 
@@ -54,6 +54,18 @@ end
 return 0
 """
 
+# ---------------------------------------------------------------------------
+# Startup health check — warn early so operators notice before a /devrequests
+# invocation silently fails.
+# ---------------------------------------------------------------------------
+_redis_url_at_import = os.getenv("REDIS_URL", "").strip()
+if not _redis_url_at_import:
+    logger.warning(
+        "REDIS_URL is not set — request_dev_modification tool is registered "
+        "but its check_fn will hide it from all agents, and any attempt to "
+        "call it will return an explanatory error rather than submitting a request."
+    )
+
 
 def _enqueue_if_unclaimed(r, req_id: str) -> bool:
     """Atomic SETNX+LPUSH via Lua. Returns True if enqueued, False if already claimed."""
@@ -71,7 +83,13 @@ def _enqueue_if_unclaimed(r, req_id: str) -> bool:
 def _redis():
     url = os.getenv("REDIS_URL", "").strip()
     if not url:
-        raise RuntimeError("REDIS_URL is not configured on this agent")
+        raise RuntimeError(
+            "REDIS_URL is not configured on this agent — the dev-request tool "
+            "is unavailable. To file a platform change request, tell the owner "
+            "directly what you need changed, or ask them to open /devrequests "
+            "in Discord to see the queue. Once REDIS_URL is set this tool will "
+            "become available."
+        )
     import redis  # already a runtime dependency (memory sync)
     return redis.from_url(url, decode_responses=True, socket_timeout=10)
 
@@ -114,9 +132,33 @@ def get_request(req_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _clean_stale_ids(r, list_key: str) -> Tuple[int, List[str]]:
+    """LREM any IDs from *list_key* whose item keys have expired or gone missing.
+
+    Returns (removed_count, list_of_removed_ids).
+    Logs each removal at WARNING so it is auditable.
+    """
+    all_ids = r.lrange(list_key, 0, -1)
+    removed = []
+    for rid in all_ids:
+        if not r.exists(f"devreq:item:{rid}"):
+            count = r.lrem(list_key, 0, rid)
+            if count:
+                logger.warning(
+                    "Removed stale ID %s from %s (item key missing/expired, "
+                    "removed %d occurrence(s))",
+                    rid, list_key, count,
+                )
+                removed.append(rid)
+    return len(removed), removed
+
+
 def list_requests(status: str = "pending", limit: int = LIST_MAX) -> List[Dict[str, Any]]:
     r = _redis()
     if status in ("pending", "approved"):
+        # Actively sweep stale IDs before reading the list so the owner sees
+        # an accurate count and "no pending" is never a lie.
+        _clean_stale_ids(r, f"devreq:{status}")
         ids = r.lrange(f"devreq:{status}", -limit, -1)
     else:  # any status — scan the id space via the counter
         top = int(r.get("devreq:seq") or 0)
@@ -128,6 +170,32 @@ def list_requests(status: str = "pending", limit: int = LIST_MAX) -> List[Dict[s
                      or status == "all"):
             out.append(item)
     return out[-limit:]
+
+
+def queue_counts() -> Dict[str, Any]:
+    """Return per-status counts including missing/expired items.
+
+    Does NOT remove stale IDs (read-only snapshot for diagnostics).
+    Live counts are post-sweep values from list_requests(); this function
+    shows the raw state so the operator can see the divergence.
+    """
+    r = _redis()
+    pending_ids = r.lrange("devreq:pending", 0, -1)
+    approved_ids = r.lrange("devreq:approved", 0, -1)
+    dispatch_len = r.llen(_DISPATCH_QUEUE)
+    pending_live = sum(1 for rid in pending_ids if r.exists(f"devreq:item:{rid}"))
+    approved_live = sum(1 for rid in approved_ids if r.exists(f"devreq:item:{rid}"))
+    heartbeat = r.get("replitmcp:loop_heartbeat")
+    return {
+        "pending_in_list": len(pending_ids),
+        "pending_live": pending_live,
+        "pending_expired": len(pending_ids) - pending_live,
+        "approved_in_list": len(approved_ids),
+        "approved_live": approved_live,
+        "approved_expired": len(approved_ids) - approved_live,
+        "dispatch_backlog": dispatch_len,
+        "heartbeat_ts": int(heartbeat) if heartbeat else None,
+    }
 
 
 def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[str, Any]]:
