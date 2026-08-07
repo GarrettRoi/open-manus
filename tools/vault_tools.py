@@ -235,28 +235,51 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
         return {
             "name": tool_name,
             "description": description + (
-                "\nOperations: screenshot (capture desktop → returns image_b64), "
-                "run_command (shell cmd, returns output), open_browser (url), "
-                "applescript (script), list_apps, key_combo (keys e.g. 'command+c'), "
-                "type_text (text), focus_app (app name). "
-                "Credentials stay in the vault — agents never see them."
+                "\nOperations:"
+                "\n• screenshot — capture desktop → returns image_b64 (PNG). args: {cursor: bool}"
+                "\n• run_command — run a shell cmd. args: {command, allow_shell_ops, timeout}"
+                "\n• open_browser — open URL. args: {url, app}"
+                "\n• applescript — run AppleScript. args: {script, allow_shell}"
+                "\n• list_apps — list installed apps. no args needed"
+                "\n• key_combo — send keyboard shortcut. args: {keys} e.g. 'command+c'"
+                "\n• type_text — type at cursor. args: {text}"
+                "\n• focus_app — bring app to front. args: {app}"
+                "\n• click_at — click at screen coords. args: {x, y}"
+                "\n• right_click_at — right-click at screen coords. args: {x, y}"
+                "\n• double_click_at — double-click at screen coords. args: {x, y}"
+                "\n• mouse_move — move cursor without clicking. args: {x, y}"
+                "\n• scroll — scroll wheel. args: {x, y, scroll_dy (+up/-down lines), scroll_dx}"
+                "\n• get_session_url — get the VNC viewer URL to share with Garrett. no args"
+                "\n• request_handoff — ask Garrett to take over the desktop."
+                " args: {message: 'Please help with this CAPTCHA'}."
+                " Returns viewer_url to include in your message to him."
+                "\n• return_control — signal to Garrett that he can hand control back. no args"
+                "\nCredentials and SSH keys stay in the vault — agents never see them."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "operation": {
                         "type": "string",
-                        "enum": ["screenshot", "run_command", "open_browser",
-                                 "applescript", "list_apps", "key_combo",
-                                 "type_text", "focus_app"],
+                        "enum": [
+                            "screenshot", "run_command", "open_browser",
+                            "applescript", "list_apps", "key_combo",
+                            "type_text", "focus_app",
+                            "click_at", "right_click_at", "double_click_at",
+                            "mouse_move", "scroll",
+                            "get_session_url", "request_handoff", "return_control",
+                        ],
                     },
                     "args": {
                         "type": "object",
                         "description": (
-                            "Operation arguments. run_command: {command, allow_shell_ops, timeout}. "
+                            "Operation-specific arguments. "
+                            "click_at/right_click_at/double_click_at/mouse_move: {x, y}. "
+                            "scroll: {x, y, scroll_dy, scroll_dx}. "
+                            "run_command: {command, allow_shell_ops, timeout}. "
                             "open_browser: {url, app}. applescript: {script, allow_shell}. "
                             "key_combo: {keys}. type_text: {text}. focus_app: {app}. "
-                            "screenshot: {cursor (bool)}."
+                            "request_handoff: {message}. screenshot: {cursor}."
                         ),
                     },
                 },

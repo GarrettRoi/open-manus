@@ -299,6 +299,75 @@ def _quote(s: str) -> str:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+async def _mouse_event(secrets: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    """Synthesize a mouse event at absolute screen coordinates via CoreGraphics."""
+    x = int(args.get("x") or 0)
+    y = int(args.get("y") or 0)
+    action = str(args.get("action") or "click").lower()   # click | right_click | double_click | move | scroll
+    scroll_dx = int(args.get("scroll_dx") or 0)
+    scroll_dy = int(args.get("scroll_dy") or 0)
+
+    if action == "scroll":
+        # scroll_dy > 0 = scroll up/towards user; < 0 = scroll down
+        py_snippet = (
+            f"import Quartz, time\n"
+            f"Quartz.CGEventPost(Quartz.kCGHIDEventTap,\n"
+            f"    Quartz.CGEventCreateScrollWheelEvent(None,\n"
+            f"        Quartz.kCGScrollEventUnitLine, 2, {scroll_dy}, {scroll_dx}))\n"
+        )
+    else:
+        if action == "right_click":
+            down_t = "Quartz.kCGEventRightMouseDown"
+            up_t   = "Quartz.kCGEventRightMouseUp"
+            btn    = "Quartz.kCGMouseButtonRight"
+        else:
+            down_t = "Quartz.kCGEventLeftMouseDown"
+            up_t   = "Quartz.kCGEventLeftMouseUp"
+            btn    = "Quartz.kCGMouseButtonLeft"
+        clicks = 2 if action == "double_click" else 1
+        if action == "move":
+            py_snippet = (
+                f"import Quartz\n"
+                f"pt = Quartz.CGPoint({x}, {y})\n"
+                f"Quartz.CGEventPost(Quartz.kCGHIDEventTap,\n"
+                f"    Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft))\n"
+            )
+        else:
+            py_snippet = (
+                f"import Quartz, time\n"
+                f"pt = Quartz.CGPoint({x}, {y})\n"
+                f"Quartz.CGEventPost(Quartz.kCGHIDEventTap,\n"
+                f"    Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft))\n"
+                f"time.sleep(0.05)\n"
+                f"for _ in range({clicks}):\n"
+                f"    Quartz.CGEventPost(Quartz.kCGHIDEventTap,\n"
+                f"        Quartz.CGEventCreateMouseEvent(None, {down_t}, pt, {btn}))\n"
+                f"    time.sleep(0.05)\n"
+                f"    Quartz.CGEventPost(Quartz.kCGHIDEventTap,\n"
+                f"        Quartz.CGEventCreateMouseEvent(None, {up_t}, pt, {btn}))\n"
+                f"    time.sleep(0.05)\n"
+            )
+
+    # Wrap in a Python one-liner suitable for ssh exec_command
+    cmd = f"/usr/bin/python3 -c \"{py_snippet.replace(chr(10), '; ')}\""
+    loop = asyncio.get_running_loop()
+
+    def _exec() -> str:
+        client = _ssh_connect(secrets)
+        try:
+            return _run_ssh(client, cmd, timeout=15)
+        finally:
+            client.close()
+
+    output = await loop.run_in_executor(None, _exec)
+    result: Dict[str, Any] = {"action": action, "x": x, "y": y}
+    if action == "scroll":
+        result.update({"scroll_dx": scroll_dx, "scroll_dy": scroll_dy})
+    if output:
+        result["output"] = output  # surface any Python error
+    return result
+
+
 OPERATIONS = {
     "screenshot": _screenshot,
     "run_command": _run_command,
@@ -308,6 +377,12 @@ OPERATIONS = {
     "key_combo": _key_combo,
     "type_text": _type_text,
     "focus_app": _focus_app,
+    # Mouse / pointer events — synthesized via CoreGraphics over SSH
+    "click_at":        _mouse_event,  # args: x, y
+    "right_click_at":  _mouse_event,  # args: x, y
+    "double_click_at": _mouse_event,  # args: x, y
+    "mouse_move":      _mouse_event,  # args: x, y
+    "scroll":          _mouse_event,  # args: x, y, scroll_dy (±lines), scroll_dx
 }
 
 OPERATION_HINTS = {
@@ -319,6 +394,11 @@ OPERATION_HINTS = {
     "key_combo": "Send a keyboard shortcut. args: keys e.g. 'command+c', 'command+shift+s'",
     "type_text": "Type text at the current cursor position. args: text (required)",
     "focus_app": "Bring an app to the foreground. args: app (app name, e.g. 'Safari')",
+    "click_at": "Click at absolute screen coordinates. args: x (int), y (int). Uses CoreGraphics.",
+    "right_click_at": "Right-click at absolute screen coordinates. args: x (int), y (int).",
+    "double_click_at": "Double-click at absolute screen coordinates. args: x (int), y (int).",
+    "mouse_move": "Move the cursor without clicking. args: x (int), y (int).",
+    "scroll": "Scroll the mouse wheel. args: x (int), y (int), scroll_dy (+up/-down lines), scroll_dx (horizontal).",
 }
 
 
@@ -332,4 +412,16 @@ async def run_mac_operation(
             f"Unknown operation '{op}'. "
             f"Available: {', '.join(sorted(OPERATIONS))}"
         )
-    return await OPERATIONS[op](secrets, args or {})
+    # Mouse-event operations all share _mouse_event; inject the correct action
+    # so the handler knows which type of event to synthesize.
+    _OP_TO_ACTION = {
+        "click_at": "click",
+        "right_click_at": "right_click",
+        "double_click_at": "double_click",
+        "mouse_move": "move",
+        "scroll": "scroll",
+    }
+    effective_args = dict(args or {})
+    if op in _OP_TO_ACTION:
+        effective_args.setdefault("action", _OP_TO_ACTION[op])
+    return await OPERATIONS[op](secrets, effective_args)
