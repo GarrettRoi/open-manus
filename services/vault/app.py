@@ -2566,6 +2566,18 @@ def _apply_connection_update(
         if new_token:
             secrets_d["api_key"] = new_token
 
+    # ── Alpaca (and any future extra_secret service): api_secret → extra header ─
+    # The HTML form path has the same logic; mirror it here so the JSON admin API
+    # can also rotate the Alpaca Secret Key without touching the extra_headers
+    # field directly (which requires knowing the internal header name).
+    _conn_tpl = get_template(conn.get("service", "")) or {}
+    if _conn_tpl.get("extra_secret"):
+        api_secret = (str(body.get("api_secret") or "")).strip()
+        if api_secret:
+            eh = dict(secrets_d.get("extra_headers") or {})
+            eh["APCA-API-SECRET-KEY"] = api_secret
+            secrets_d["extra_headers"] = eh
+
     return conn, secrets_d, None
 
 
