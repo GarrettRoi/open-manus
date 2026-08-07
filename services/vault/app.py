@@ -2527,9 +2527,13 @@ async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False
 
     import asyncio as _asyncio
 
-    # Check for a live dispatch lease.
-    lease_live = await _asyncio.to_thread(replit_mcp_mod.has_live_lease, r, rid)
-    if lease_live and not force:
+    # Atomic check-lease / clear / enqueue — all in one Lua script so concurrent
+    # admin calls cannot race each other (concurrent DEL+enqueue was non-atomic).
+    #   result=0: live lease, force not set → 409
+    #   result=1: enqueued normally
+    #   result=2: enqueued, live lease superseded (force=true)
+    result = await _asyncio.to_thread(replit_mcp_mod.admin_enqueue, r, rid, force)
+    if result == 0:
         return JSONResponse(status_code=409, content={
             "ok": False,
             "lease_active": True,
@@ -2540,19 +2544,10 @@ async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False
             ),
         })
 
-    # Clear lease + claim so a fresh enqueue can proceed.
-    # With force=True this supersedes the in-flight worker (its CAS will fail).
-    # Without force (lease_live=False) this just clears a stale claim/lease.
-    await _asyncio.to_thread(r.delete,
-                             replit_mcp_mod.K_LEASE + rid,
-                             replit_mcp_mod.K_CLAIM + rid)
-    queued = await _asyncio.to_thread(replit_mcp_mod.enqueue_if_unclaimed, r, rid)
-    if not queued:
-        return {"ok": False, "queued": False, "rid": rid,
-                "detail": "enqueue failed unexpectedly after lease/claim clear"}
-    action = "force_requeued" if (lease_live and force) else "requeued"
+    superseded = result == 2
+    action = "force_requeued" if superseded else "requeued"
     audit_log("admin", "REPLIT_MCP", f"replit_mcp_{action}", f"request={rid}")
-    return {"ok": True, "queued": rid, "superseded": bool(lease_live and force)}
+    return {"ok": True, "queued": rid, "superseded": superseded}
 
 
 @app.get("/health")

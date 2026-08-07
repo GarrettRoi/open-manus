@@ -73,6 +73,16 @@ _SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5
 #   KEYS[1]=lease key  KEYS[2]=item key
 #   ARGV[1]=token  ARGV[2]=item JSON  ARGV[3]=item TTL (0 = no expiry)
 #   Returns 1 if written (token matched), 0 if lease was superseded.
+#
+# _ADMIN_ENQUEUE_SCRIPT: atomic check-lease / clear / enqueue for /dispatch.
+#   Makes the entire "check lease, delete lease+claim, set claim, push" one
+#   Redis operation so concurrent /dispatch calls cannot race each other.
+#   KEYS[1]=lease key  KEYS[2]=claim key  KEYS[3]=dispatch queue
+#   ARGV[1]="1" to force (supersede live lease), "0" to reject if live
+#   ARGV[2]=claim TTL  ARGV[3]=req_id
+#   Returns 0 = live lease present, force not set (caller → 409)
+#           1 = enqueued, no live lease existed
+#           2 = enqueued, live lease was superseded (force=true)
 # ---------------------------------------------------------------------------
 _ENQUEUE_SCRIPT = """
 local claimed = redis.call("SET", KEYS[1], "1", "NX", "EX", tonumber(ARGV[1]))
@@ -108,6 +118,20 @@ else
     redis.call("SET", KEYS[2], ARGV[2])
 end
 redis.call("DEL", KEYS[1])
+return 1
+"""
+
+_ADMIN_ENQUEUE_SCRIPT = """
+local lease_live = redis.call("EXISTS", KEYS[1])
+if lease_live == 1 and ARGV[1] == "0" then
+    return 0
+end
+redis.call("DEL", KEYS[1], KEYS[2])
+redis.call("SET", KEYS[2], "1", "EX", tonumber(ARGV[2]))
+redis.call("LPUSH", KEYS[3], ARGV[3])
+if lease_live == 1 then
+    return 2
+end
 return 1
 """
 
@@ -186,6 +210,29 @@ def finalize_lease(r, req_id: str, token: str, item: dict, item_ttl: int) -> boo
 def has_live_lease(r, req_id: str) -> bool:
     """Return True if a dispatch lease is currently held for req_id."""
     return bool(r.exists(K_LEASE + req_id))
+
+
+def admin_enqueue(r, req_id: str, force: bool = False) -> int:
+    """Atomically check-lease / clear / enqueue for the /dispatch admin endpoint.
+
+    All six operations (EXISTS lease, DEL lease+claim, SET claim, LPUSH) execute
+    in a single Lua script — concurrent admin calls cannot race each other.
+
+    Returns:
+      0 — live lease present and force=False (caller should return 409)
+      1 — enqueued normally (no live lease existed)
+      2 — enqueued, a live lease was superseded (force=True cleared it)
+    """
+    result = r.eval(
+        _ADMIN_ENQUEUE_SCRIPT, 3,
+        K_LEASE + req_id,       # KEYS[1]
+        K_CLAIM + req_id,       # KEYS[2]
+        DISPATCH_QUEUE,         # KEYS[3]
+        "1" if force else "0",  # ARGV[1]
+        str(CLAIM_TTL),         # ARGV[2]
+        req_id,                 # ARGV[3]
+    )
+    return int(result)
 
 
 class ReplitMCP:
