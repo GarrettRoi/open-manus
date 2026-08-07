@@ -1623,7 +1623,13 @@ async def google_operation(conn_id: str, request: Request, body: GoogleOperation
     conn = store.get(cid)
     if not conn:
         raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
-    if conn.get("service") != "google" or (conn.get("auth") or {}).get("kind") != "oauth2":
+    _GOOGLE_SERVICES = {
+        "google", "google_gmail", "google_drive", "google_sheets",
+        "google_docs", "google_slides", "google_forms", "google_calendar",
+        "google_tasks", "google_people", "google_meet", "google_app_script",
+    }
+    if (conn.get("service") or "") not in _GOOGLE_SERVICES \
+            or (conn.get("auth") or {}).get("kind") != "oauth2":
         raise HTTPException(
             status_code=409,
             detail=f"'{cid}' is not a Google OAuth connection — use the HTTP proxy instead.")

@@ -27,16 +27,18 @@ class GoogleOpsError(Exception):
 # Host + default path prefix per product. `request` paths must start with the
 # prefix, keeping the raw escape hatch inside the product's own API surface.
 PRODUCTS: Dict[str, Dict[str, str]] = {
-    "gmail":    {"host": "gmail.googleapis.com",    "prefix": "/gmail/v1/"},
-    "drive":    {"host": "www.googleapis.com",      "prefix": "/drive/v3/"},
-    "sheets":   {"host": "sheets.googleapis.com",   "prefix": "/v4/spreadsheets"},
-    "docs":     {"host": "docs.googleapis.com",     "prefix": "/v1/documents"},
-    "slides":   {"host": "slides.googleapis.com",   "prefix": "/v1/presentations"},
-    "forms":    {"host": "forms.googleapis.com",    "prefix": "/v1/forms"},
-    "tasks":    {"host": "tasks.googleapis.com",    "prefix": "/tasks/v1/"},
-    "chat":     {"host": "chat.googleapis.com",     "prefix": "/v1/spaces"},
-    "people":   {"host": "people.googleapis.com",   "prefix": "/v1/people"},
-    "calendar": {"host": "www.googleapis.com",      "prefix": "/calendar/v3/"},
+    "gmail":      {"host": "gmail.googleapis.com",    "prefix": "/gmail/v1/"},
+    "drive":      {"host": "www.googleapis.com",      "prefix": "/drive/v3/"},
+    "sheets":     {"host": "sheets.googleapis.com",   "prefix": "/v4/spreadsheets"},
+    "docs":       {"host": "docs.googleapis.com",     "prefix": "/v1/documents"},
+    "slides":     {"host": "slides.googleapis.com",   "prefix": "/v1/presentations"},
+    "forms":      {"host": "forms.googleapis.com",    "prefix": "/v1/forms"},
+    "tasks":      {"host": "tasks.googleapis.com",    "prefix": "/tasks/v1/"},
+    "chat":       {"host": "chat.googleapis.com",     "prefix": "/v1/spaces"},
+    "people":     {"host": "people.googleapis.com",   "prefix": "/v1/people"},
+    "calendar":   {"host": "www.googleapis.com",      "prefix": "/calendar/v3/"},
+    "meet":       {"host": "meet.googleapis.com",     "prefix": "/v2/"},
+    "app_script": {"host": "script.googleapis.com",  "prefix": "/v1/"},
 }
 
 _PERSON_FIELDS = "names,emailAddresses,phoneNumbers,organizations,addresses,birthdays"
@@ -409,24 +411,66 @@ def _calendar(op: str, a: Dict[str, Any]) -> Dict[str, Any]:
     raise GoogleOpsError(f"Unknown calendar operation: {op}")
 
 
+def _meet(op: str, a: Dict[str, Any]) -> Dict[str, Any]:
+    h = PRODUCTS["meet"]["host"]
+    if op == "spaces":
+        return _spec("GET", h, "/v2/spaces",
+                     params={"pageSize": _limit(a)})
+    if op == "get_space":
+        (name,) = _need(a, "name")
+        return _spec("GET", h, f"/v2/{_seg(name, 'name')}")
+    if op == "end_active_conference":
+        (name,) = _need(a, "name")
+        return _spec("POST", h, f"/v2/{_seg(name, 'name')}:endActiveConference",
+                     json_body={})
+    raise GoogleOpsError(f"Unknown meet operation: {op}")
+
+
+def _app_script(op: str, a: Dict[str, Any]) -> Dict[str, Any]:
+    h = PRODUCTS["app_script"]["host"]
+    if op == "list":
+        return _spec("GET", h, "/v1/projects",
+                     params={"pageSize": _limit(a)})
+    if op == "get":
+        (script_id,) = _need(a, "script_id")
+        return _spec("GET", h, f"/v1/projects/{_seg(script_id, 'script_id')}")
+    if op == "get_content":
+        (script_id,) = _need(a, "script_id")
+        return _spec("GET", h, f"/v1/projects/{_seg(script_id, 'script_id')}/content")
+    if op == "run":
+        (script_id, function_name) = _need(a, "script_id", "function_name")
+        body: Dict[str, Any] = {"function": function_name}
+        if a.get("parameters"):
+            body["parameters"] = a["parameters"]
+        if a.get("dev_mode") is not None:
+            body["devMode"] = bool(a["dev_mode"])
+        return _spec("POST", h,
+                     f"/v1/scripts/{_seg(script_id, 'script_id')}:run",
+                     json_body=body)
+    raise GoogleOpsError(f"Unknown app_script operation: {op}")
+
+
 _BUILDERS = {
     "gmail": _gmail, "drive": _drive, "sheets": _sheets, "docs": _docs,
     "slides": _slides, "forms": _forms, "tasks": _tasks, "chat": _chat,
     "people": _people, "calendar": _calendar,
+    "meet": _meet, "app_script": _app_script,
 }
 
 # Operation names surfaced in tool schemas / docs.
 OPERATIONS: Dict[str, List[str]] = {
-    "gmail": ["search", "read", "send", "modify", "labels", "request"],
-    "drive": ["search", "get", "download", "export", "create_folder", "delete", "request"],
-    "sheets": ["create", "meta", "get", "update", "append", "batch_get", "request"],
-    "docs": ["create", "get", "insert_text", "batch_update", "request"],
-    "slides": ["create", "get", "batch_update", "request"],
-    "forms": ["create", "get", "responses", "batch_update", "request"],
-    "tasks": ["lists", "list", "create", "complete", "delete", "request"],
-    "chat": ["spaces", "messages", "send", "request"],
-    "people": ["contacts", "search", "get", "request"],
-    "calendar": ["calendars", "events", "create_event", "update_event", "delete_event", "request"],
+    "gmail":      ["search", "read", "send", "modify", "labels", "request"],
+    "drive":      ["search", "get", "download", "export", "create_folder", "delete", "request"],
+    "sheets":     ["create", "meta", "get", "update", "append", "batch_get", "request"],
+    "docs":       ["create", "get", "insert_text", "batch_update", "request"],
+    "slides":     ["create", "get", "batch_update", "request"],
+    "forms":      ["create", "get", "responses", "batch_update", "request"],
+    "tasks":      ["lists", "list", "create", "complete", "delete", "request"],
+    "chat":       ["spaces", "messages", "send", "request"],
+    "people":     ["contacts", "search", "get", "request"],
+    "calendar":   ["calendars", "events", "create_event", "update_event", "delete_event", "request"],
+    "meet":       ["spaces", "get_space", "end_active_conference", "request"],
+    "app_script": ["list", "get", "get_content", "run", "request"],
 }
 
 

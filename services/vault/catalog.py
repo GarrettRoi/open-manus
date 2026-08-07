@@ -120,6 +120,190 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "GET /gmail/v1/users/me/messages",
     },
+    # ── Individual Google Workspace service connections ──────────────────────
+    # Each connection is scoped to one service with its correct base URL and
+    # minimal OAuth scope, so agents hit the right endpoint every time.
+    # All share the same Google OAuth app (same client ID/secret) but are
+    # stored as separate vault connections with dedicated tool names.
+    "google_gmail": {
+        "label": "Google Gmail (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://gmail.googleapis.com",
+        "allowed_hosts": ["gmail.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": (
+            "Dedicated Gmail connection. Same Google OAuth app as the combined "
+            "Google Workspace connection — use the same client ID and secret. "
+            "Click Connect to log in and grant Gmail access."
+        ),
+        "example_call": "vault_<id>_gmail with operation='search'",
+    },
+    "google_drive": {
+        "label": "Google Drive (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://www.googleapis.com",
+        "allowed_hosts": ["www.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/drive"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": (
+            "Dedicated Google Drive connection. Same Google OAuth app as the "
+            "combined Google Workspace connection."
+        ),
+        "example_call": "vault_<id>_drive with operation='search'",
+    },
+    "google_sheets": {
+        "label": "Google Sheets (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://sheets.googleapis.com",
+        "allowed_hosts": ["sheets.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/spreadsheets"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": (
+            "Dedicated Google Sheets connection with the correct sheets.googleapis.com "
+            "endpoint. Same Google OAuth app as the combined connection."
+        ),
+        "example_call": "vault_<id>_sheets with operation='get'",
+    },
+    "google_docs": {
+        "label": "Google Docs (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://docs.googleapis.com",
+        "allowed_hosts": ["docs.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/documents"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google Docs connection.",
+        "example_call": "vault_<id>_docs with operation='get'",
+    },
+    "google_slides": {
+        "label": "Google Slides (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://slides.googleapis.com",
+        "allowed_hosts": ["slides.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/presentations"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google Slides connection.",
+        "example_call": "vault_<id>_slides with operation='get'",
+    },
+    "google_forms": {
+        "label": "Google Forms (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://forms.googleapis.com",
+        "allowed_hosts": ["forms.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": [
+                "https://www.googleapis.com/auth/forms.body",
+                "https://www.googleapis.com/auth/forms.responses.readonly",
+            ],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google Forms connection.",
+        "example_call": "vault_<id>_forms with operation='get'",
+    },
+    "google_calendar": {
+        "label": "Google Calendar (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://www.googleapis.com",
+        "allowed_hosts": ["www.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/calendar"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google Calendar connection.",
+        "example_call": "vault_<id>_calendar with operation='events'",
+    },
+    "google_tasks": {
+        "label": "Google Tasks (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://tasks.googleapis.com",
+        "allowed_hosts": ["tasks.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/tasks"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google Tasks connection.",
+        "example_call": "vault_<id>_tasks with operation='lists'",
+    },
+    "google_people": {
+        "label": "Google People / Contacts (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://people.googleapis.com",
+        "allowed_hosts": ["people.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/contacts.readonly"],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": "Dedicated Google People / Contacts connection.",
+        "example_call": "vault_<id>_people with operation='contacts'",
+    },
+    "google_meet": {
+        "label": "Google Meet (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://meet.googleapis.com",
+        "allowed_hosts": ["meet.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": [
+                "https://www.googleapis.com/auth/meetings.space.created",
+                "https://www.googleapis.com/auth/meetings.space.readonly",
+            ],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": (
+            "Dedicated Google Meet connection. Enable the Google Meet REST API "
+            "in Google Cloud Console, then connect with the same OAuth app."
+        ),
+        "example_call": "vault_<id>_meet with operation='spaces'",
+    },
+    "google_app_script": {
+        "label": "Google Apps Script (dedicated)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://script.googleapis.com",
+        "allowed_hosts": ["script.googleapis.com", "oauth2.googleapis.com"],
+        "oauth": {
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "scopes": [
+                "https://www.googleapis.com/auth/script.projects",
+                "https://www.googleapis.com/auth/script.projects.readonly",
+            ],
+            "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
+        },
+        "setup_help": (
+            "Dedicated Google Apps Script connection. Enable the Apps Script API "
+            "in Google Cloud Console."
+        ),
+        "example_call": "vault_<id>_app_script with operation='list'",
+    },
     "github": {
         "label": "GitHub",
         "auth": {"kind": "oauth2"},

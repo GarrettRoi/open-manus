@@ -611,8 +611,26 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
     }
 
 
+# Products registered as suite sub-tools for the combined "google" connection.
 GOOGLE_PRODUCTS = ["gmail", "drive", "sheets", "docs", "slides", "forms",
-                   "tasks", "chat", "people", "calendar"]
+                   "tasks", "chat", "people", "calendar", "meet", "app_script"]
+
+# Mapping from individual Google service catalog keys → the single product
+# they expose.  Each creates one base proxy tool + one product suite tool
+# (e.g. google_sheets connection → vault_<id> + vault_<id>_sheets).
+GOOGLE_INDIVIDUAL_SERVICES: Dict[str, str] = {
+    "google_gmail":      "gmail",
+    "google_drive":      "drive",
+    "google_sheets":     "sheets",
+    "google_docs":       "docs",
+    "google_slides":     "slides",
+    "google_forms":      "forms",
+    "google_calendar":   "calendar",
+    "google_tasks":      "tasks",
+    "google_people":     "people",
+    "google_meet":       "meet",
+    "google_app_script": "app_script",
+}
 
 # ---------------------------------------------------------------------------
 # MCP bearer-token connection tools
@@ -740,6 +758,9 @@ GOOGLE_OPERATIONS: Dict[str, str] = {
              "modify (id, add_labels, remove_labels), labels",
     "drive": "search (q or name_contains, limit), get (file_id), download (file_id), "
              "export (file_id, mime_type), create_folder (name, parent_id), delete (file_id)",
+    "meet": "spaces (limit), get_space (name), end_active_conference (name)",
+    "app_script": "list (limit), get (script_id), get_content (script_id), "
+                  "run (script_id, function_name, parameters, dev_mode)",
     "sheets": "create (title), meta (spreadsheet_id), get (spreadsheet_id, range), "
               "update (spreadsheet_id, range, values), append (spreadsheet_id, range, values), "
               "batch_get (spreadsheet_id, ranges)",
@@ -884,11 +905,16 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
         for conn_id, conn in sorted(seen.items()):
             tool_name = _tool_name_for(conn_id)
             auth_kind = str(conn.get("auth_kind") or "")
-            is_google = ((conn.get("service") or "").lower() == "google"
-                         and auth_kind == "oauth2")
+            service_lower = (conn.get("service") or "").lower()
+            is_google = service_lower == "google" and auth_kind == "oauth2"
+            google_product = (GOOGLE_INDIVIDUAL_SERVICES.get(service_lower)
+                              if auth_kind == "oauth2" else None)
+            is_google_individual = bool(google_product)
             wanted_names = [tool_name]
             if is_google:
                 wanted_names += [f"{tool_name}_{p}" for p in GOOGLE_PRODUCTS]
+            elif is_google_individual:
+                wanted_names += [f"{tool_name}_{google_product}"]
             collision = next(
                 (n for n in wanted_names
                  if claimed.get(n) not in (None, conn_id)), None)
@@ -943,35 +969,56 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
             # Google suite tools are reconciled on EVERY sync — independent
             # of whether the base tool changed — so failed registrations are
             # retried and auth-kind changes drop stale product tools.
+            def _register_google_product(product: str) -> bool:
+                """Register one product tool; return True on success."""
+                nonlocal added, updated
+                pname = f"{tool_name}_{product}"
+                pschema = _build_google_schema(conn, pname, product)
+                pexisting = registry.get_entry(pname)
+                already = pname in _registered_suite.get(conn_id, [])
+                if already and pexisting is not None and pexisting.schema == pschema:
+                    return True  # unchanged — keep it
+                try:
+                    registry.register(
+                        name=pname,
+                        toolset=TOOLSET,
+                        schema=pschema,
+                        handler=_make_google_handler(conn_id, product),
+                        description=f"Google {product} via vault connection {conn_id}",
+                        emoji="🔐",
+                    )
+                    if already:
+                        updated += 1
+                    else:
+                        added += 1
+                    return True
+                except Exception:
+                    logger.exception(
+                        "Failed to register google %s tool for %s", product, conn_id)
+                    return False
+
             if is_google and base_ok:
                 suite: List[str] = []
                 for product in GOOGLE_PRODUCTS:
-                    pname = f"{tool_name}_{product}"
-                    pschema = _build_google_schema(conn, pname, product)
-                    pexisting = registry.get_entry(pname)
-                    already = pname in _registered_suite.get(conn_id, [])
-                    if already and pexisting is not None and pexisting.schema == pschema:
-                        suite.append(pname)
-                        continue
-                    try:
-                        registry.register(
-                            name=pname,
-                            toolset=TOOLSET,
-                            schema=pschema,
-                            handler=_make_google_handler(conn_id, product),
-                            description=f"Google {product} via vault connection {conn_id}",
-                            emoji="🔐",
-                        )
-                        suite.append(pname)
-                        if already:
-                            updated += 1
-                        else:
-                            added += 1
-                    except Exception:
-                        logger.exception(
-                            "Failed to register google %s tool for %s", product, conn_id)
+                    if _register_google_product(product):
+                        suite.append(f"{tool_name}_{product}")
                 _registered_suite[conn_id] = suite
-            elif not is_google and conn_id in _registered_suite:
+            elif is_google_individual and base_ok:
+                # Individual service connection: register only the one product tool.
+                suite_individual: List[str] = []
+                if _register_google_product(google_product):
+                    suite_individual.append(f"{tool_name}_{google_product}")
+                # Deregister any stale tools from a prior service type.
+                for stale in _registered_suite.get(conn_id, []):
+                    if stale not in suite_individual:
+                        try:
+                            registry.deregister(stale)
+                        except Exception:
+                            pass
+                        removed += 1
+                _registered_suite[conn_id] = suite_individual
+            elif not is_google and not is_google_individual \
+                    and conn_id in _registered_suite:
                 # No longer a google oauth connection — drop stale suite tools.
                 for name in _registered_suite.pop(conn_id):
                     try:
