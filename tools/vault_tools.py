@@ -630,6 +630,20 @@ def _mcp_call(conn_id: str, tool_name: str, args: dict) -> str:
             body = e.read().decode() if e.fp else ""
         except Exception:
             pass
+        # Structured 401: the vault detected that the MCP bearer token has
+        # expired.  Only return the structured result when the body's
+        # detail.error == "mcp_token_expired" — any other 401 (including
+        # vault agent-auth failures, which use a plain-string detail) must
+        # fall through to the generic "Vault MCP error (401): ..." handler.
+        if e.code == 401:
+            try:
+                parsed = json.loads(body)
+                detail_obj = parsed.get("detail") if isinstance(parsed, dict) else None
+                if isinstance(detail_obj, dict) and detail_obj.get("error") == "mcp_token_expired":
+                    return json.dumps(detail_obj)
+            except Exception:
+                pass
+            # Not the structured form — fall through to generic handler below.
         try:
             detail = json.loads(body).get("detail", body)
         except Exception:

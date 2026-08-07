@@ -275,6 +275,15 @@
                             {% else %}
                                 <span class="badge badge-warning">login needed</span>
                             {% endif %}
+                        {% elif c.auth_kind == 'mcp_bearer' %}
+                            {% if c.mcp_token_suspect %}
+                                <span class="badge badge-danger">&#9888; token may be invalid</span>
+                                {% if c.mcp_last_error_at %}<br><span style="font-size: 11px; color: var(--text-muted);">401 at {{ c.mcp_last_error_at[:16] }}</span>{% endif %}
+                            {% elif c.connected %}
+                                <span class="badge badge-success">ready</span>
+                            {% else %}
+                                <span class="badge badge-warning">no token</span>
+                            {% endif %}
                         {% elif c.status == 'needs_base_url' %}
                             <span class="badge badge-warning">needs base URL</span>
                         {% elif c.connected %}

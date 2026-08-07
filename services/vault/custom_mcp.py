@@ -37,6 +37,15 @@ class CustomMCPError(Exception):
     pass
 
 
+class MCPTokenExpiredError(CustomMCPError):
+    """Raised when the upstream MCP server rejects the bearer token with a 401.
+
+    Distinct from the base CustomMCPError so callers (app.py) can return a
+    structured, agent-readable 401 rather than a generic 502.
+    """
+    pass
+
+
 def _is_ip_safe(addr: str) -> bool:
     """Return False if *addr* is a loopback/private/link-local/reserved IP."""
     try:
@@ -148,7 +157,7 @@ async def _mcp_session(server_url: str, bearer_token: str,
             },
         })
         if init_resp.status_code == 401:
-            raise CustomMCPError(
+            raise MCPTokenExpiredError(
                 "MCP server rejected the bearer token (401). "
                 "Update the token in the vault dashboard."
             )
@@ -179,6 +188,14 @@ async def _mcp_session(server_url: str, bearer_token: str,
         if params is not None:
             body["params"] = params
         resp = await client.post(server_url, headers=headers, json=body)
+
+    # Guard: a 401 on the actual call means the token was accepted during
+    # initialize but rejected later (e.g. mid-session expiry or per-tool ACL).
+    if resp.status_code == 401:
+        raise MCPTokenExpiredError(
+            "MCP server rejected the bearer token on the tool call (401). "
+            "Update the token in the vault dashboard."
+        )
 
     msg = _parse_mcp_response(resp)
     if not msg:

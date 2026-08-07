@@ -361,6 +361,10 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
         except (ValueError, TypeError):
             view["mcp_tools"] = []
         view["mcp_tool_count"] = len(view["mcp_tools"])
+        # 401-status flag: set when the upstream MCP server rejected the token.
+        mcp_status = r.hgetall(f"vault:conn:{conn['id']}:mcp_status")
+        view["mcp_token_suspect"] = mcp_status.get("last_error") == "token_expired"
+        view["mcp_last_error_at"] = mcp_status.get("last_error_at", "")
 
     if include_secret_state:
         secrets_d = _pk_secrets
@@ -804,10 +808,19 @@ async def add_service(request: Request):
 
     # For MCP connections: eagerly sync the tool manifest from the remote server.
     if auth["kind"] == "mcp_bearer":
+        _mcp_status_key = f"vault:conn:{conn_id}:mcp_status"
         try:
             tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
             r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            r.delete(_mcp_status_key)
             logger.info("Synced %d MCP tools for connection %s", len(tools), conn_id)
+        except custom_mcp.MCPTokenExpiredError as exc:
+            logger.warning("MCP tool sync 401 for %s: %s", conn_id, exc)
+            r.hset(_mcp_status_key, mapping={
+                "last_error": "token_expired",
+                "last_error_at": datetime.now(timezone.utc).isoformat(),
+            })
+            # Non-fatal: connection is saved; badge will warn admin.
         except Exception as exc:
             logger.warning("MCP tool sync failed for %s: %s", conn_id, exc)
             # Non-fatal: connection is saved; user can manually sync later.
@@ -920,6 +933,9 @@ async def update_service(request: Request):
         new_token = (form.get("api_key") or "").strip()
         if new_token:
             secrets_d["api_key"] = new_token
+            # New token supplied — clear any stale 401-status immediately so the
+            # dashboard badge goes green before the next successful call.
+            r.delete(f"vault:conn:{conn_id}:mcp_status")
         # Enforce HTTPS when a new URL is supplied.
         _new_mcp_url = (form.get("base_url") or "").strip()
         if _new_mcp_url and not _new_mcp_url.startswith("https://"):
@@ -970,12 +986,20 @@ async def update_service(request: Request):
         _url_changed = (form.get("base_url") or "").strip() not in ("", conn.get("base_url", "").strip())
         if _tok_changed or _url_changed:
             _mcp_tok = secrets_d.get("api_key", "")
+            _mcp_status_key = f"vault:conn:{conn_id}:mcp_status"
             if final_base_url and _mcp_tok:
                 try:
                     _tools = await custom_mcp.list_tools(final_base_url, _mcp_tok)
                     r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(_tools))
+                    r.delete(_mcp_status_key)  # clear flag on successful re-sync
                     logger.info("Re-synced %d MCP tools for %s after dashboard update",
                                 len(_tools), conn_id)
+                except custom_mcp.MCPTokenExpiredError as exc:
+                    logger.warning("MCP re-sync 401 for %s: %s", conn_id, exc)
+                    r.hset(_mcp_status_key, mapping={
+                        "last_error": "token_expired",
+                        "last_error_at": datetime.now(timezone.utc).isoformat(),
+                    })
                 except Exception as exc:
                     logger.warning("MCP tool re-sync failed for %s: %s", conn_id, exc)
 
@@ -1833,12 +1857,29 @@ async def mcp_tool_call(conn_id: str, request: Request):
         raise HTTPException(status_code=409, detail="No MCP server URL stored — update the connection")
 
     audit_log(agent_name, cid, "mcp_call", f"tool={tool_name}")
+    _mcp_status_key = f"vault:conn:{cid}:mcp_status"
     try:
         result = await custom_mcp.call_tool(server_url, bearer_token, tool_name, arguments)
+    except custom_mcp.MCPTokenExpiredError:
+        conn_label = conn.get("label") or cid
+        r.hset(_mcp_status_key, mapping={
+            "last_error": "token_expired",
+            "last_error_at": datetime.now(timezone.utc).isoformat(),
+        })
+        raise HTTPException(status_code=401, detail={
+            "error": "mcp_token_expired",
+            "message": (
+                f"MCP token for {conn_label} has expired — "
+                "ask the owner to update it in the vault dashboard"
+            ),
+            "action": "ask_owner_to_update_vault_connection",
+        })
     except custom_mcp.CustomMCPError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"MCP call failed: {exc}")
+    # Successful call — clear any stale token-expired flag.
+    r.delete(_mcp_status_key)
     return result
 
 
@@ -1867,14 +1908,30 @@ async def mcp_sync_tools(conn_id: str, request: Request):
     if not server_url:
         raise HTTPException(status_code=409, detail="No server URL stored")
 
+    _mcp_status_key = f"vault:conn:{cid}:mcp_status"
     try:
         tools = await custom_mcp.list_tools(server_url, bearer_token)
+    except custom_mcp.MCPTokenExpiredError:
+        conn_label = conn.get("label") or cid
+        r.hset(_mcp_status_key, mapping={
+            "last_error": "token_expired",
+            "last_error_at": datetime.now(timezone.utc).isoformat(),
+        })
+        raise HTTPException(status_code=401, detail={
+            "error": "mcp_token_expired",
+            "message": (
+                f"MCP token for {conn_label} has expired — "
+                "ask the owner to update it in the vault dashboard"
+            ),
+            "action": "ask_owner_to_update_vault_connection",
+        })
     except custom_mcp.CustomMCPError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"MCP tool sync failed: {exc}")
 
     r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(tools))
+    r.delete(_mcp_status_key)  # clear any stale token-expired flag on success
     audit_log("admin", cid, "mcp_sync_tools", f"{len(tools)} tools")
     logger.info("MCP tool sync for %s: %d tools", cid, len(tools))
     return {
@@ -2101,10 +2158,18 @@ async def admin_add_connection(request: Request):
 
     # For MCP connections: eagerly sync the tool manifest from the remote server.
     if auth["kind"] == "mcp_bearer":
+        _mcp_status_key = f"vault:conn:{conn_id}:mcp_status"
         try:
             tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
             r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            r.delete(_mcp_status_key)
             logger.info("Synced %d MCP tools for connection %s (admin API)", len(tools), conn_id)
+        except custom_mcp.MCPTokenExpiredError as exc:
+            logger.warning("MCP tool sync 401 for %s (admin API): %s", conn_id, exc)
+            r.hset(_mcp_status_key, mapping={
+                "last_error": "token_expired",
+                "last_error_at": datetime.now(timezone.utc).isoformat(),
+            })
         except Exception as exc:
             logger.warning("MCP tool sync failed for %s (admin API): %s", conn_id, exc)
 
@@ -2326,6 +2391,10 @@ async def admin_update_connection(conn_id: str, request: Request):
     if (conn_upd.get("auth") or {}).get("kind") == "mcp_bearer":
         _url_changed = new_base_url and new_base_url != conn.get("base_url", "").rstrip("/")
         _tok_changed = bool((str(body.get("api_key") or body.get("bearer_token") or "")).strip())
+        _mcp_status_key = f"vault:conn:{cid}:mcp_status"
+        if _tok_changed:
+            # New token supplied — clear stale 401-status immediately.
+            r.delete(_mcp_status_key)
         if _url_changed or _tok_changed:
             _mcp_url = new_base_url or conn.get("base_url", "")
             _mcp_tok = secrets_upd.get("api_key", "")
@@ -2333,7 +2402,14 @@ async def admin_update_connection(conn_id: str, request: Request):
                 try:
                     _tools = await custom_mcp.list_tools(_mcp_url, _mcp_tok)
                     r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(_tools))
+                    r.delete(_mcp_status_key)  # clear flag on successful re-sync
                     logger.info("Re-synced %d MCP tools for %s after update", len(_tools), cid)
+                except custom_mcp.MCPTokenExpiredError as exc:
+                    logger.warning("MCP re-sync 401 for %s after update: %s", cid, exc)
+                    r.hset(_mcp_status_key, mapping={
+                        "last_error": "token_expired",
+                        "last_error_at": datetime.now(timezone.utc).isoformat(),
+                    })
                 except Exception as exc:
                     logger.warning("MCP tool re-sync failed for %s after update: %s", cid, exc)
 
