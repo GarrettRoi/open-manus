@@ -309,6 +309,20 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         ),
         "example_call": "Use the native vault_<name>_<tool> tools registered from the MCP server",
     },
+    "alpaca": {
+        "label": "Alpaca Markets",
+        "auth": {"kind": "header", "header_name": "APCA-API-KEY-ID", "prefix": ""},
+        "base_url": "https://paper-api.alpaca.markets/v2",
+        "allowed_hosts": ["paper-api.alpaca.markets"],
+        "extra_secret": True,
+        "setup_help": (
+            "Paste your Alpaca API Key ID and Secret Key from "
+            "https://app.alpaca.markets/paper-trading/overview → API Keys. "
+            "Both keys are stored encrypted; agents never see them. "
+            "Paper trading only — live trading is out of scope."
+        ),
+        "example_call": "GET /v2/account",
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},

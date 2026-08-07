@@ -783,6 +783,13 @@ async def add_service(request: Request):
             return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         if extra_headers:
             secrets_d["extra_headers"] = extra_headers
+        # Services with extra_secret (e.g. Alpaca) need a second encrypted header.
+        if tpl.get("extra_secret"):
+            api_secret = (form.get("api_secret") or "").strip()
+            if api_secret:
+                eh = dict(secrets_d.get("extra_headers") or {})
+                eh["APCA-API-SECRET-KEY"] = api_secret
+                secrets_d["extra_headers"] = eh
         if not base_url:
             return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
 
@@ -843,6 +850,14 @@ async def update_service(request: Request):
             secrets_d.pop("extra_headers", None)
         elif extra_headers:
             secrets_d["extra_headers"] = extra_headers
+    # Services with extra_secret (e.g. Alpaca): rotate the second encrypted header.
+    _conn_tpl = get_template(conn.get("service", "")) or {}
+    if _conn_tpl.get("extra_secret"):
+        api_secret = (form.get("api_secret") or "").strip()
+        if api_secret:
+            eh = dict(secrets_d.get("extra_headers") or {})
+            eh["APCA-API-SECRET-KEY"] = api_secret
+            secrets_d["extra_headers"] = eh
     # auth header name / prefix edits for header-kind (custom) connections
     # Semantics: None (field absent from POST) = unchanged; "" = explicit clear.
     # header_name blank → store "Authorization" explicitly (cleaner than relying
