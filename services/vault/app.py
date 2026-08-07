@@ -32,6 +32,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from apple_ops import AppleOpsError, run_apple_operation
 
+import custom_mcp
 import email_ops
 import google_ops
 import mac_ops
@@ -367,6 +368,15 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             view["has_client"] = bool(secrets_d.get("client_id"))
         elif view["auth_kind"] == "apple":
             view["connected"] = bool(secrets_d.get("apple_id") and secrets_d.get("app_password"))
+        elif view["auth_kind"] == "mcp_bearer":
+            view["connected"] = bool(secrets_d.get("api_key"))
+            # Include cached tool list so vault_tools.py can register native tools
+            raw_tools = r.get(f"vault:conn:{conn['id']}:mcp_tools")
+            try:
+                view["mcp_tools"] = json.loads(raw_tools) if raw_tools else []
+            except (ValueError, TypeError):
+                view["mcp_tools"] = []
+            view["mcp_tool_count"] = len(view["mcp_tools"])
         elif view["auth_kind"] == "macincloud":
             view["connected"] = bool(secrets_d.get("ssh_host") and secrets_d.get("ssh_password"))
             # Expose non-secret fields to the edit form JS (ssh_host, user, ports)
@@ -743,6 +753,19 @@ async def add_service(request: Request):
             return RedirectResponse(
                 url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         base_url = ""
+    elif auth["kind"] == "mcp_bearer":
+        api_key = (form.get("api_key") or "").strip()
+        if not api_key:
+            return RedirectResponse(
+                url="/services?error=Bearer+token+required+for+MCP+connections",
+                status_code=303)
+        if not base_url:
+            return RedirectResponse(
+                url="/services?error=MCP+server+URL+required", status_code=303)
+        if not base_url.startswith("https://"):
+            return RedirectResponse(
+                url="/services?error=MCP+server+URL+must+use+HTTPS", status_code=303)
+        secrets_d = {"api_key": api_key}
     else:
         api_key = (form.get("api_key") or "").strip()
         if not api_key:
@@ -768,9 +791,24 @@ async def add_service(request: Request):
     )
     audit_log("admin", conn_id, "connection_created", f"Service: {service}")
 
+    # For MCP connections: eagerly sync the tool manifest from the remote server.
+    if auth["kind"] == "mcp_bearer":
+        try:
+            tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
+            r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            logger.info("Synced %d MCP tools for connection %s", len(tools), conn_id)
+        except Exception as exc:
+            logger.warning("MCP tool sync failed for %s: %s", conn_id, exc)
+            # Non-fatal: connection is saved; user can manually sync later.
+
     if status == "needs_login":
         return RedirectResponse(url=f"/services/{conn_id}/connect", status_code=303)
-    return RedirectResponse(url="/services?notice=Connection+added", status_code=303)
+    mcp_notice = ""
+    if auth["kind"] == "mcp_bearer":
+        count = len(json.loads(r.get(f"vault:conn:{conn_id}:mcp_tools") or "[]"))
+        mcp_notice = f"+({count}+MCP+tools+registered)"
+    notice = f"Connection+added{mcp_notice}"
+    return RedirectResponse(url=f"/services?notice={notice}", status_code=303)
 
 
 @app.post("/services/update")
@@ -859,6 +897,10 @@ async def update_service(request: Request):
             val = (form.get(secret_fld) or "").strip()
             if val:
                 secrets_d[secret_fld] = val
+    if (conn.get("auth") or {}).get("kind") == "mcp_bearer":
+        new_token = (form.get("api_key") or "").strip()
+        if new_token:
+            secrets_d["api_key"] = new_token
     if (conn.get("auth") or {}).get("kind") == "email":
         email_address = (form.get("email_address") or "").strip()
         app_password = (form.get("email_app_password") or "").strip()
@@ -1109,6 +1151,16 @@ async def list_connections(request: Request):
                 '"has_attachment": true}, '
                 '{"action": "read", "uid": "..."}, or '
                 '{"action": "send", "to": "a@b.com", "subject": "...", "body": "..."}'
+            )
+        elif view.get("auth_kind") == "mcp_bearer":
+            tool_names = [t.get("name") for t in (view.get("mcp_tools") or []) if t.get("name")]
+            view["how_to_call"] = (
+                f"Use the native vault_{cid.lower()}_<tool> tools in your schema — "
+                "they are registered automatically from the MCP server's tools/list. "
+                + (f"Available tools: {', '.join(tool_names[:20])}." if tool_names else
+                   "No tools cached yet — ask admin to click Sync or call vault(action='refresh').")
+                + f" Or call POST {{vault}}/api/vault/mcp/{cid} with "
+                  '{"tool": "<tool_name>", "arguments": {...}} directly.'
             )
         else:
             view["how_to_call"] = (
@@ -1691,6 +1743,110 @@ async def proxy_request(conn_id: str, request: Request):
     audit_log(agent_name, cid, "proxy_call",
               f"{method} {httpx.URL(url).path} -> {upstream.status_code}")
     return JSONResponse(result, status_code=200)
+
+
+@app.post("/api/vault/mcp/{conn_id}")
+async def mcp_tool_call(conn_id: str, request: Request):
+    """Call a named tool on a custom MCP bearer-token connection.
+
+    Body: {"tool": "<tool_name>", "arguments": {...}}
+    The vault fetches the stored bearer token and server URL, runs the full
+    MCP session (initialize → initialized → tools/call), and returns the
+    result.  The token never leaves the vault.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "mcp_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "mcp_bearer":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not an MCP bearer connection. "
+                   "Use POST /api/vault/proxy/{conn_id} for HTTP proxy connections.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    tool_name = str(body.get("tool") or "").strip()
+    if not tool_name:
+        raise HTTPException(status_code=400, detail="'tool' is required")
+    arguments = body.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        raise HTTPException(status_code=400, detail="'arguments' must be a JSON object")
+
+    secrets_d = store.get_secrets(cid)
+    bearer_token = secrets_d.get("api_key", "")
+    server_url = conn.get("base_url", "")
+    if not bearer_token:
+        raise HTTPException(status_code=409, detail="No bearer token stored — update the connection")
+    if not server_url:
+        raise HTTPException(status_code=409, detail="No MCP server URL stored — update the connection")
+
+    audit_log(agent_name, cid, "mcp_call", f"tool={tool_name}")
+    try:
+        result = await custom_mcp.call_tool(server_url, bearer_token, tool_name, arguments)
+    except custom_mcp.CustomMCPError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MCP call failed: {exc}")
+    return result
+
+
+@app.post("/api/admin/mcp-bearer/{conn_id}/sync-tools")
+async def mcp_sync_tools(conn_id: str, request: Request):
+    """Admin: re-discover the MCP server's tool list and update the cache.
+
+    Calls tools/list against the stored server URL, saves the manifest to
+    Redis, and returns a summary so the admin can verify what tools are now
+    available.  Agents pick up the new manifest on their next vault sync
+    (within 5 minutes) or immediately via vault(action='refresh').
+    """
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "mcp_bearer":
+        raise HTTPException(status_code=409,
+                            detail=f"'{cid}' is not an MCP bearer connection")
+    secrets_d = store.get_secrets(cid)
+    bearer_token = secrets_d.get("api_key", "")
+    server_url = conn.get("base_url", "")
+    if not bearer_token:
+        raise HTTPException(status_code=409, detail="No bearer token stored")
+    if not server_url:
+        raise HTTPException(status_code=409, detail="No server URL stored")
+
+    try:
+        tools = await custom_mcp.list_tools(server_url, bearer_token)
+    except custom_mcp.CustomMCPError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MCP tool sync failed: {exc}")
+
+    r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(tools))
+    audit_log("admin", cid, "mcp_sync_tools", f"{len(tools)} tools")
+    logger.info("MCP tool sync for %s: %d tools", cid, len(tools))
+    return {
+        "connection": cid,
+        "server_url": server_url,
+        "tool_count": len(tools),
+        "tools": [
+            {"name": t.get("name"), "description": (t.get("description") or "")[:120]}
+            for t in tools
+        ],
+        "note": "Agents will pick up the updated tools within 5 minutes, "
+                "or call vault(action='refresh') to sync immediately.",
+    }
 
 
 @app.post("/api/vault/email/{conn_id}")

@@ -614,6 +614,113 @@ def _build_email_schema(conn: dict, tool_name: str) -> dict:
 GOOGLE_PRODUCTS = ["gmail", "drive", "sheets", "docs", "slides", "forms",
                    "tasks", "chat", "people", "calendar"]
 
+# ---------------------------------------------------------------------------
+# MCP bearer-token connection tools
+# ---------------------------------------------------------------------------
+
+def _mcp_call(conn_id: str, tool_name: str, args: dict) -> str:
+    """Call a named tool on an MCP bearer connection through the vault."""
+    payload = {"tool": tool_name, "arguments": args or {}}
+    try:
+        resp = _vault_http("POST", f"/api/vault/mcp/{conn_id}", payload, timeout=125)
+        return json.dumps(resp, ensure_ascii=False, default=str)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return json.dumps({"error": f"Vault MCP error ({e.code}): {detail}"})
+    except Exception as e:
+        return json.dumps({"error": f"MCP call failed: {e}"})
+
+
+def _make_mcp_tool_handler(conn_id: str, remote_tool_name: str):
+    def _handler(args: dict, **_kw) -> str:
+        return _mcp_call(conn_id, remote_tool_name, args or {})
+    return _handler
+
+
+def _build_mcp_tool_schema(tool_name: str, mcp_tool: dict) -> dict:
+    """Build a tool schema from an MCP tools/list entry."""
+    input_schema = mcp_tool.get("inputSchema") or {}
+    # MCP uses inputSchema; normalise to 'parameters' for the registry.
+    params = {
+        "type": input_schema.get("type", "object"),
+        "properties": input_schema.get("properties", {}),
+    }
+    if input_schema.get("required"):
+        params["required"] = input_schema["required"]
+    desc = (mcp_tool.get("description") or "").strip()
+    if len(desc) > 1500:
+        desc = desc[:1500] + "…"
+    return {
+        "name": tool_name,
+        "description": desc or f"MCP tool: {mcp_tool.get('name', tool_name)}",
+        "parameters": params,
+    }
+
+
+def _sync_mcp_tools(conn_id: str, conn: dict, base_tool_name: str,
+                    claimed: Dict[str, str]) -> None:
+    """Register one native tool per remote MCP tool for *conn_id*.
+
+    Uses the cached tool manifest stored in conn["mcp_tools"] by the vault's
+    list endpoint.  If the manifest is empty, deregisters any stale tools.
+    Called from _sync_connection_tools while holding _registered_lock.
+    """
+    mcp_tools: List[dict] = conn.get("mcp_tools") or []
+    old_suite = _registered_suite.get(conn_id, [])
+
+    new_suite: List[str] = []
+    for mcp_tool in mcp_tools:
+        remote_name = str(mcp_tool.get("name") or "").strip()
+        if not remote_name:
+            continue
+        safe = re.sub(r"[^a-z0-9_]+", "_", remote_name.lower()).strip("_")
+        pname = f"{base_tool_name}_{safe}"
+        # Collision check
+        if claimed.get(pname) not in (None, conn_id):
+            logger.warning(
+                "MCP tool name collision: %r already claimed by %r — "
+                "skipping %r for connection %r",
+                pname, claimed[pname], remote_name, conn_id,
+            )
+            continue
+        claimed[pname] = conn_id
+
+        pschema = _build_mcp_tool_schema(pname, mcp_tool)
+        pexisting = registry.get_entry(pname)
+        if pname in old_suite and pexisting is not None and pexisting.schema == pschema:
+            new_suite.append(pname)
+            continue
+        try:
+            registry.register(
+                name=pname,
+                toolset=TOOLSET,
+                schema=pschema,
+                handler=_make_mcp_tool_handler(conn_id, remote_name),
+                description=f"MCP tool {remote_name!r} via vault connection {conn_id}",
+                emoji="🔐",
+            )
+            new_suite.append(pname)
+        except Exception:
+            logger.exception(
+                "Failed to register MCP tool %r for connection %s", pname, conn_id)
+
+    # Deregister stale tools that are no longer in the manifest.
+    for stale in old_suite:
+        if stale not in new_suite:
+            try:
+                registry.deregister(stale)
+            except Exception:
+                pass
+    _registered_suite[conn_id] = new_suite
+
 GOOGLE_OPERATIONS: Dict[str, str] = {
     "gmail": "search (q, limit), read (id), send (to, subject, body, cc, bcc), "
              "modify (id, add_labels, remove_labels), labels",
@@ -782,6 +889,15 @@ def _sync_connection_tools() -> Optional[Dict[str, int]]:
             for n in wanted_names:
                 claimed[n] = conn_id
 
+            is_mcp = (conn.get("service") or "").lower() in {"mcp_bearer", "vowsok"} \
+                     or auth_kind == "mcp_bearer"
+            if is_mcp:
+                # MCP connections: register one tool per remote tool in the
+                # cached manifest, not a single generic HTTP proxy tool.
+                _sync_mcp_tools(conn_id, conn, tool_name, claimed)
+                # Mark as registered using the base name so deregister works.
+                _registered[conn_id] = tool_name
+                continue
             if auth_kind == "email":
                 schema = _build_email_schema(conn, tool_name)
             else:

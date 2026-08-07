@@ -276,6 +276,39 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "(actions: folders, list, read, send)"
         ),
     },
+    "vowsok": {
+        "label": "Vowsok",
+        "auth": {"kind": "mcp_bearer"},
+        "is_mcp": True,
+        "base_url": "https://app.vowsok.com/api/mcp",
+        "allowed_hosts": ["app.vowsok.com"],
+        "setup_help": (
+            "Connect to Vowsok via MCP. Paste your Vowsok MCP bearer token below. "
+            "After saving, the vault will call tools/list and register each Vowsok "
+            "tool as a native vault_<name>_<tool> tool that agents can call directly. "
+            "Get your token from the Vowsok dashboard → API / Integrations."
+        ),
+        "example_call": "Use the native vault_<name>_<tool> tools registered from Vowsok",
+    },
+    "mcp_bearer": {
+        "label": "Custom MCP (bearer token)",
+        "auth": {"kind": "mcp_bearer"},
+        "is_mcp": True,
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "MCP server URL",
+             "placeholder": "https://your-mcp-server.com/api/mcp", "required": True},
+        ],
+        "setup_help": (
+            "Connect any MCP server that accepts a static bearer token. "
+            "Enter the full MCP endpoint URL and your bearer token. "
+            "The vault will call tools/list and register each remote tool as a "
+            "native vault_<name>_<tool> that agents can call without seeing credentials. "
+            "Only HTTPS endpoints are accepted."
+        ),
+        "example_call": "Use the native vault_<name>_<tool> tools registered from the MCP server",
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},

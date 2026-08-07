@@ -389,6 +389,13 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
             '(e.g. {"operation": "screenshot"} or {"operation": "run_command", "args": {"command": "..."}}). '
             "Visit /vnc/{connection} for the interactive desktop viewer."
         )
+    elif kind == "mcp_bearer":
+        raise AuthInjectionError(
+            "This is a custom MCP connection — it cannot be used with the HTTP proxy. "
+            "Call POST /api/vault/mcp/{connection} instead with "
+            '{"tool": "<tool_name>", "arguments": {...}}. '
+            "Use vault(action='list') to see registered vault_<name>_<tool> native tools."
+        )
     else:
         raise AuthInjectionError(f"Unknown auth kind: {kind}")
 
