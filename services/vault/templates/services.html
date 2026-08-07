@@ -617,6 +617,11 @@ function openEdit(c) {
         document.getElementById('e_lbl_api_key').textContent =
             _editTpl.api_key_label ? ('New ' + _editTpl.api_key_label + ' (leave blank to keep)')
                                    : 'New API Key ID (leave blank to keep)';
+    } else if (!isMcp) {
+        // Reset the label — a previous edit dialog (Plaid/Alpaca/MCP) may
+        // have left service-specific text behind.
+        document.getElementById('e_lbl_api_key').textContent =
+            'New API key (leave blank to keep current)';
     }
     document.getElementById('e_grp_alpaca_secret').style.display = hasExtraSecretEdit ? '' : 'none';
     // Alpaca env selector: derive paper/live from stored base_url; hide raw base_url.

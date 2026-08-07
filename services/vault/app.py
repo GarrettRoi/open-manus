@@ -2685,6 +2685,20 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
             raise HTTPException(status_code=400, detail=hdr_err)
         if extra_headers:
             secrets_d["extra_headers"] = extra_headers
+        # Services with extra_secret (e.g. Alpaca, Plaid) need a second
+        # encrypted header — same catalog-driven logic as the HTML add form.
+        # Required here: a two-secret connection without its second secret
+        # can never authenticate.
+        if tpl.get("extra_secret"):
+            api_secret = (str(form.get("api_secret") or "")).strip()
+            if not api_secret:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"api_secret is required for {tpl['label']} "
+                           "(second secret, stored as an encrypted header)")
+            eh = dict(secrets_d.get("extra_headers") or {})
+            eh[tpl.get("extra_secret_header", "APCA-API-SECRET-KEY")] = api_secret
+            secrets_d["extra_headers"] = eh
 
     store.save(
         conn_id, service=service, label=form.get("label") or tpl["label"],
