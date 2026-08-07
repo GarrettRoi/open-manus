@@ -351,6 +351,17 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
     _pk_secrets = store.get_secrets(conn["id"])
     if _pk_secrets.get("public_key"):
         view["public_key"] = _pk_secrets["public_key"]
+    # MCP tool manifest is always included — it is cached/public metadata, not
+    # a credential.  vault_tools.py reads it via /api/vault/list which calls
+    # _conn_view(include_secret_state=False), so it must live outside that gate.
+    if view["auth_kind"] == "mcp_bearer":
+        raw_tools = r.get(f"vault:conn:{conn['id']}:mcp_tools")
+        try:
+            view["mcp_tools"] = json.loads(raw_tools) if raw_tools else []
+        except (ValueError, TypeError):
+            view["mcp_tools"] = []
+        view["mcp_tool_count"] = len(view["mcp_tools"])
+
     if include_secret_state:
         secrets_d = _pk_secrets
         if isinstance(secrets_d.get("extra_headers"), dict):
@@ -370,13 +381,6 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
             view["connected"] = bool(secrets_d.get("apple_id") and secrets_d.get("app_password"))
         elif view["auth_kind"] == "mcp_bearer":
             view["connected"] = bool(secrets_d.get("api_key"))
-            # Include cached tool list so vault_tools.py can register native tools
-            raw_tools = r.get(f"vault:conn:{conn['id']}:mcp_tools")
-            try:
-                view["mcp_tools"] = json.loads(raw_tools) if raw_tools else []
-            except (ValueError, TypeError):
-                view["mcp_tools"] = []
-            view["mcp_tool_count"] = len(view["mcp_tools"])
         elif view["auth_kind"] == "macincloud":
             view["connected"] = bool(secrets_d.get("ssh_host") and secrets_d.get("ssh_password"))
             # Expose non-secret fields to the edit form JS (ssh_host, user, ports)

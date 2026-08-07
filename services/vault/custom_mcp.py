@@ -5,14 +5,21 @@ https://app.vowsok.com/api/mcp).  Uses the same JSON-RPC / Streamable-HTTP
 MCP protocol sequence as replit_mcp.py but authenticates with a static
 bearer token stored encrypted in the vault rather than OAuth.
 
+SSRF protection: _validate_server_url rejects non-HTTPS schemes, then
+resolves the hostname and rejects loopback, private, link-local, reserved,
+and multicast IP addresses so the vault cannot be weaponised to reach
+internal services.
+
 Redis key for the cached tool manifest (written by sync_tools):
   vault:conn:{conn_id}:mcp_tools   JSON list of MCP tool dicts
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import socket
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -30,16 +37,59 @@ class CustomMCPError(Exception):
     pass
 
 
+def _is_ip_safe(addr: str) -> bool:
+    """Return False if *addr* is a loopback/private/link-local/reserved IP."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False  # can't parse → treat as unsafe
+    return not (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def _validate_server_url(url: str) -> None:
-    """Raise CustomMCPError if the URL is not a safe HTTPS endpoint."""
+    """Raise CustomMCPError if the URL is not a safe public HTTPS endpoint.
+
+    Checks performed in order:
+      1. Non-empty
+      2. HTTPS scheme only
+      3. Has a hostname
+      4. DNS-resolved IPs are all public (no loopback / private / link-local /
+         reserved / multicast addresses)
+    """
     if not url:
         raise CustomMCPError("MCP server URL is not configured")
     parts = urlsplit(url)
     if parts.scheme not in _ALLOWED_SCHEMES:
         raise CustomMCPError(
             f"MCP server URL must use HTTPS (got scheme {parts.scheme!r})")
-    if not parts.netloc:
+    hostname = parts.hostname
+    if not hostname:
         raise CustomMCPError("MCP server URL has no host")
+
+    # Resolve the hostname and verify every returned IP is public.
+    try:
+        results = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise CustomMCPError(
+            f"MCP server hostname {hostname!r} could not be resolved: {exc}"
+        )
+    if not results:
+        raise CustomMCPError(
+            f"MCP server hostname {hostname!r} returned no addresses")
+    for _family, _type, _proto, _canonname, sockaddr in results:
+        ip_str = sockaddr[0]
+        if not _is_ip_safe(ip_str):
+            raise CustomMCPError(
+                f"MCP server URL resolves to a non-public IP ({ip_str}) — "
+                "only public internet endpoints are permitted"
+            )
 
 
 def _mcp_headers(bearer_token: str) -> Dict[str, str]:
@@ -51,7 +101,6 @@ def _mcp_headers(bearer_token: str) -> Dict[str, str]:
     }
 
 
-@staticmethod
 def _parse_mcp_response(resp: httpx.Response) -> Optional[Dict[str, Any]]:
     """Parse a Streamable HTTP response (JSON or SSE) into the JSON-RPC msg."""
     ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()

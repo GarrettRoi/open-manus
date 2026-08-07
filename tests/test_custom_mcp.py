@@ -1,6 +1,7 @@
 """Unit tests for custom_mcp.py — bearer-token MCP connections."""
 
 import asyncio
+import ipaddress
 import json
 import sys
 import types
@@ -76,14 +77,49 @@ class TestParseResponse(unittest.TestCase):
             custom_mcp._parse_mcp_response(resp)
 
 
+class TestIsIpSafe(unittest.TestCase):
+    """_is_ip_safe correctly classifies addresses."""
+
+    def test_public_ipv4_allowed(self):
+        self.assertTrue(custom_mcp._is_ip_safe("93.184.216.34"))   # example.com
+
+    def test_loopback_rejected(self):
+        self.assertFalse(custom_mcp._is_ip_safe("127.0.0.1"))
+        self.assertFalse(custom_mcp._is_ip_safe("::1"))
+
+    def test_private_rfc1918_rejected(self):
+        self.assertFalse(custom_mcp._is_ip_safe("10.0.0.1"))
+        self.assertFalse(custom_mcp._is_ip_safe("192.168.1.1"))
+        self.assertFalse(custom_mcp._is_ip_safe("172.16.0.1"))
+
+    def test_link_local_rejected(self):
+        self.assertFalse(custom_mcp._is_ip_safe("169.254.1.1"))
+        self.assertFalse(custom_mcp._is_ip_safe("fe80::1"))
+
+    def test_multicast_rejected(self):
+        self.assertFalse(custom_mcp._is_ip_safe("224.0.0.1"))
+
+    def test_unspecified_rejected(self):
+        self.assertFalse(custom_mcp._is_ip_safe("0.0.0.0"))
+
+    def test_malformed_returns_false(self):
+        self.assertFalse(custom_mcp._is_ip_safe("not-an-ip"))
+
+
 class TestValidateServerUrl(unittest.TestCase):
 
-    def test_https_ok(self):
-        custom_mcp._validate_server_url("https://app.vowsok.com/api/mcp")  # no raise
+    def _resolve_public(self, hostname, *_):
+        """Fake getaddrinfo returning a public IP."""
+        return [(2, 1, 6, '', ('93.184.216.34', 0))]
+
+    def test_https_public_host_ok(self):
+        with patch("socket.getaddrinfo", self._resolve_public):
+            custom_mcp._validate_server_url("https://app.vowsok.com/api/mcp")
 
     def test_http_rejected(self):
-        with self.assertRaises(custom_mcp.CustomMCPError):
+        with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
             custom_mcp._validate_server_url("http://app.vowsok.com/api/mcp")
+        self.assertIn("HTTPS", str(ctx.exception))
 
     def test_empty_rejected(self):
         with self.assertRaises(custom_mcp.CustomMCPError):
@@ -93,11 +129,44 @@ class TestValidateServerUrl(unittest.TestCase):
         with self.assertRaises(custom_mcp.CustomMCPError):
             custom_mcp._validate_server_url("https:///api/mcp")
 
+    def test_loopback_ip_rejected(self):
+        def _resolve_loopback(hostname, *_):
+            return [(2, 1, 6, '', ('127.0.0.1', 0))]
+        with patch("socket.getaddrinfo", _resolve_loopback):
+            with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
+                custom_mcp._validate_server_url("https://internal.example.com/mcp")
+        self.assertIn("non-public IP", str(ctx.exception))
+
+    def test_private_ip_rejected(self):
+        def _resolve_private(hostname, *_):
+            return [(2, 1, 6, '', ('10.0.0.1', 0))]
+        with patch("socket.getaddrinfo", _resolve_private):
+            with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
+                custom_mcp._validate_server_url("https://private.internal/mcp")
+        self.assertIn("non-public IP", str(ctx.exception))
+
+    def test_link_local_ip_rejected(self):
+        def _resolve_ll(hostname, *_):
+            return [(2, 1, 6, '', ('169.254.1.1', 0))]
+        with patch("socket.getaddrinfo", _resolve_ll):
+            with self.assertRaises(custom_mcp.CustomMCPError):
+                custom_mcp._validate_server_url("https://ll.example.com/mcp")
+
+    def test_dns_failure_rejected(self):
+        import socket as _socket
+        with patch("socket.getaddrinfo", side_effect=_socket.gaierror("NXDOMAIN")):
+            with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
+                custom_mcp._validate_server_url("https://nonexistent.invalid/mcp")
+        self.assertIn("could not be resolved", str(ctx.exception))
+
 
 class TestListTools(unittest.TestCase):
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _resolve_public(self, hostname, *_):
+        return [(2, 1, 6, '', ('93.184.216.34', 0))]
 
     def _make_client(self, init_body, tools_body):
         """Build a mock async HTTP client that returns init_body then tools_body."""
@@ -127,7 +196,8 @@ class TestListTools(unittest.TestCase):
             },
         }
         client = self._make_client(init_body, tools_body)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             tools = self._run(custom_mcp.list_tools(
                 "https://app.vowsok.com/api/mcp", "test-token"))
         self.assertEqual(len(tools), 2)
@@ -141,21 +211,31 @@ class TestListTools(unittest.TestCase):
         client.post = AsyncMock(return_value=resp_401)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
                 self._run(custom_mcp.list_tools(
                     "https://example.com/api/mcp", "bad-token"))
         self.assertIn("401", str(ctx.exception))
 
-    def test_list_tools_validates_url(self):
+    def test_list_tools_rejects_http_url(self):
         with self.assertRaises(custom_mcp.CustomMCPError):
             self._run(custom_mcp.list_tools("http://insecure.com/mcp", "tok"))
+
+    def test_list_tools_rejects_private_ip(self):
+        def _resolve_private(hostname, *_):
+            return [(2, 1, 6, '', ('192.168.1.1', 0))]
+        with patch("socket.getaddrinfo", _resolve_private):
+            with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
+                self._run(custom_mcp.list_tools("https://internal.corp/mcp", "tok"))
+        self.assertIn("non-public IP", str(ctx.exception))
 
     def test_list_tools_unexpected_shape_raises(self):
         init_body = {"jsonrpc": "2.0", "id": 1, "result": {}}
         bad_tools_body = {"jsonrpc": "2.0", "id": 2, "result": {"tools": "not-a-list"}}
         client = self._make_client(init_body, bad_tools_body)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             with self.assertRaises(custom_mcp.CustomMCPError):
                 self._run(custom_mcp.list_tools("https://x.com/mcp", "tok"))
 
@@ -164,6 +244,9 @@ class TestCallTool(unittest.TestCase):
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _resolve_public(self, hostname, *_):
+        return [(2, 1, 6, '', ('93.184.216.34', 0))]
 
     def _make_client(self, init_body, call_body):
         init_resp = _make_response(json_body=init_body)
@@ -186,7 +269,8 @@ class TestCallTool(unittest.TestCase):
             },
         }
         client = self._make_client(init_body, call_body)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             result = self._run(custom_mcp.call_tool(
                 "https://app.vowsok.com/api/mcp", "tok", "create_task",
                 {"title": "Hello"}))
@@ -203,7 +287,8 @@ class TestCallTool(unittest.TestCase):
             },
         }
         client = self._make_client(init_body, call_body)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
                 self._run(custom_mcp.call_tool(
                     "https://app.vowsok.com/api/mcp", "tok", "create_task",
@@ -217,11 +302,127 @@ class TestCallTool(unittest.TestCase):
             "error": {"code": -32600, "message": "Invalid request"},
         }
         client = self._make_client(init_body, call_body)
-        with patch("httpx.AsyncClient", return_value=client):
+        with patch("httpx.AsyncClient", return_value=client), \
+             patch("socket.getaddrinfo", self._resolve_public):
             with self.assertRaises(custom_mcp.CustomMCPError) as ctx:
                 self._run(custom_mcp.call_tool(
                     "https://app.vowsok.com/api/mcp", "tok", "bad_tool", {}))
         self.assertIn("Invalid request", str(ctx.exception))
+
+    def test_call_tool_rejects_loopback(self):
+        def _resolve_loopback(hostname, *_):
+            return [(2, 1, 6, '', ('127.0.0.1', 0))]
+        with patch("socket.getaddrinfo", _resolve_loopback):
+            with self.assertRaises(custom_mcp.CustomMCPError):
+                self._run(custom_mcp.call_tool(
+                    "https://localhost/mcp", "tok", "any", {}))
+
+
+class TestMCPToolRegistration(unittest.TestCase):
+    """Verify synced manifest → registered native vault tools in vault_tools.py."""
+
+    def setUp(self):
+        # We need the tools module without a live vault; patch the vault fetch.
+        sys.path.insert(0, ".")
+
+    def test_mcp_manifest_produces_registered_tools(self):
+        """A connection with mcp_tools in its view should produce suite tools."""
+        import importlib
+        import tools.vault_tools as vt
+
+        fake_manifest = [
+            {"name": "list_clients",
+             "description": "List CRM clients",
+             "inputSchema": {"type": "object", "properties": {"status": {"type": "string"}}}},
+            {"name": "create_task",
+             "description": "Create a task",
+             "inputSchema": {"type": "object",
+                             "properties": {"title": {"type": "string"}},
+                             "required": ["title"]}},
+        ]
+        fake_conn = {
+            "id": "VOWSOK_TEST",
+            "service": "vowsok",
+            "label": "Vowsok Test",
+            "auth_kind": "mcp_bearer",
+            "base_url": "https://app.vowsok.com/api/mcp",
+            "description": "",
+            "skill_description": "",
+            "example_call": "",
+            "email_address": "",
+            "mcp_tools": fake_manifest,
+        }
+
+        # Call _sync_mcp_tools under the lock and check what it registers.
+        registered_tools = {}
+        claimed: dict = {}
+
+        original_register = vt.registry.register
+        def _capture_register(name, toolset, schema, handler, **kw):
+            registered_tools[name] = schema
+            return original_register(name=name, toolset=toolset, schema=schema,
+                                     handler=handler, **kw)
+
+        with vt._registered_lock:
+            # Clear any prior state for this connection.
+            vt._registered_suite.pop("VOWSOK_TEST", None)
+            with patch.object(vt.registry, "register", side_effect=_capture_register):
+                vt._sync_mcp_tools(
+                    "VOWSOK_TEST", fake_conn,
+                    vt._tool_name_for("VOWSOK_TEST"),
+                    claimed,
+                )
+
+        # Should have registered one tool per manifest entry.
+        self.assertIn("vault_vowsok_test_list_clients", registered_tools)
+        self.assertIn("vault_vowsok_test_create_task", registered_tools)
+
+        # Schemas should use the MCP inputSchema.
+        create_schema = registered_tools["vault_vowsok_test_create_task"]
+        self.assertIn("title", create_schema["parameters"]["properties"])
+        self.assertIn("title", create_schema["parameters"].get("required", []))
+
+        # Suite is tracked for later deregister.
+        self.assertIn("vault_vowsok_test_list_clients",
+                      vt._registered_suite.get("VOWSOK_TEST", []))
+
+    def test_mcp_tool_names_are_sanitised(self):
+        """Remote tool names with dashes/spaces are normalised to underscores."""
+        import tools.vault_tools as vt
+
+        fake_manifest = [
+            {"name": "get-client-by-id",
+             "description": "Fetch a client",
+             "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        fake_conn = {
+            "id": "MCP_DASH_TEST",
+            "service": "mcp_bearer",
+            "label": "Dash Test",
+            "auth_kind": "mcp_bearer",
+            "base_url": "https://mcp.example.com/api",
+            "description": "", "skill_description": "", "example_call": "", "email_address": "",
+            "mcp_tools": fake_manifest,
+        }
+        registered_tools = {}
+        claimed: dict = {}
+
+        original_register = vt.registry.register
+        def _capture_register(name, **kw):
+            registered_tools[name] = True
+            return original_register(name=name, **kw)
+
+        with vt._registered_lock:
+            vt._registered_suite.pop("MCP_DASH_TEST", None)
+            with patch.object(vt.registry, "register", side_effect=_capture_register):
+                vt._sync_mcp_tools(
+                    "MCP_DASH_TEST", fake_conn,
+                    vt._tool_name_for("MCP_DASH_TEST"),
+                    claimed,
+                )
+
+        # Dashes normalised to underscores in the registered tool name.
+        self.assertIn("vault_mcp_dash_test_get_client_by_id", registered_tools)
 
 
 if __name__ == "__main__":
