@@ -35,6 +35,38 @@ LIST_MAX = 20
 PENDING_MAX = 200            # bound the pending queue — agents can't flood Redis
 ITEM_TTL = 90 * 24 * 3600    # requests expire from Redis after 90 days
 
+# ---------------------------------------------------------------------------
+# Atomic dispatch enqueue — must stay in sync with services/vault/replit_mcp.py
+#
+# SETNX claim + LPUSH in a single Lua transaction so approval, sweep, and the
+# manual /dispatch endpoint can never double-queue the same request.
+# ---------------------------------------------------------------------------
+_DISPATCH_QUEUE = "devreq:dispatch"
+_CLAIM_PREFIX = "replitmcp:claim:"
+_CLAIM_TTL = 300  # seconds — matches replit_mcp.CLAIM_TTL
+
+_ENQUEUE_LUA = """
+local claimed = redis.call("SET", KEYS[1], "1", "NX", "EX", tonumber(ARGV[1]))
+if claimed then
+    redis.call("LPUSH", KEYS[2], ARGV[2])
+    return 1
+end
+return 0
+"""
+
+
+def _enqueue_if_unclaimed(r, req_id: str) -> bool:
+    """Atomic SETNX+LPUSH via Lua. Returns True if enqueued, False if already claimed."""
+    result = r.eval(
+        _ENQUEUE_LUA,
+        2,
+        _CLAIM_PREFIX + req_id,
+        _DISPATCH_QUEUE,
+        str(_CLAIM_TTL),
+        req_id,
+    )
+    return bool(result)
+
 
 def _redis():
     url = os.getenv("REDIS_URL", "").strip()
@@ -124,9 +156,11 @@ def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[
     if status == "approved":
         r.rpush("devreq:approved", req_id)
         r.ltrim("devreq:approved", -PENDING_MAX, -1)
-        # Auto-dispatch: the vault's Replit MCP bridge pops this queue and
-        # starts a Replit Agent run for the request — approve once, done.
-        r.lpush("devreq:dispatch", req_id)
+        # Auto-dispatch: atomic Lua claim+LPUSH so concurrent sweep or manual
+        # retry can't double-queue the same request.
+        queued = _enqueue_if_unclaimed(r, req_id)
+        if not queued:
+            logger.info("Dev request %s already claimed/queued at approval time", req_id)
     return item
 
 

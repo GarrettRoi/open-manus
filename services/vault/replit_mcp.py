@@ -51,6 +51,28 @@ PKCE_TTL = 600
 CLAIM_TTL = 300       # seconds — long enough to cover a full MCP round-trip
 _SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5 s/tick)
 
+# ---------------------------------------------------------------------------
+# Atomic enqueue: SETNX claim + LPUSH in a single Lua transaction.
+# Shared by ALL three producers (approval, sweep, manual /dispatch endpoint)
+# so no two of them can double-queue the same request regardless of timing.
+#
+# KEYS[1] = claim key   (replitmcp:claim:{id})
+# KEYS[2] = queue name  (devreq:dispatch)
+# ARGV[1] = claim TTL   (seconds, int)
+# ARGV[2] = req_id      (value pushed onto the queue)
+#
+# Returns 1 if the claim was acquired and the item enqueued, 0 if already
+# claimed (already in queue or currently being dispatched).
+# ---------------------------------------------------------------------------
+_ENQUEUE_SCRIPT = """
+local claimed = redis.call("SET", KEYS[1], "1", "NX", "EX", tonumber(ARGV[1]))
+if claimed then
+    redis.call("LPUSH", KEYS[2], ARGV[2])
+    return 1
+end
+return 0
+"""
+
 
 class ReplitMCPError(Exception):
     pass
@@ -374,13 +396,33 @@ class ReplitMCP:
 # Dispatcher: devreq:dispatch queue -> Replit Agent run
 # ---------------------------------------------------------------------------
 
+def enqueue_if_unclaimed(r, req_id: str) -> bool:
+    """Atomically claim + enqueue a dev request for dispatch.
+
+    Uses a single Lua script so the SETNX and LPUSH are one Redis operation —
+    no window exists between them for a concurrent producer to duplicate the
+    entry. Returns True if the request was claimed and pushed, False if it was
+    already claimed (already in queue or actively being dispatched).
+    """
+    result = r.eval(
+        _ENQUEUE_SCRIPT,
+        2,                        # numkeys
+        K_CLAIM + req_id,         # KEYS[1] — claim key
+        DISPATCH_QUEUE,           # KEYS[2] — dispatch queue
+        str(CLAIM_TTL),           # ARGV[1] — claim TTL in seconds
+        req_id,                   # ARGV[2] — value pushed onto queue
+    )
+    return bool(result)
+
+
 def sweep_dispatch_backlog(r) -> list:
     """Re-queue approved dev requests that were never dispatched or failed.
 
     Dedup guards:
-    - Skips items whose dispatch_status is already "started".
-    - Uses a short-TTL SETNX claim key (K_CLAIM + req_id) so a concurrent
-      sweep or a request still sitting in the queue cannot be double-queued.
+    - Skips items whose dispatch_status is "started" (run already underway).
+    - Delegates the claim+enqueue step to enqueue_if_unclaimed(), which uses
+      a Lua script to make SETNX+LPUSH atomic — safe to call concurrently
+      with approval and manual /dispatch without producing duplicates.
 
     Returns the list of req_ids that were pushed onto devreq:dispatch.
     """
@@ -394,20 +436,18 @@ def sweep_dispatch_backlog(r) -> list:
             item = json.loads(raw if isinstance(raw, str) else raw.decode())
         except (ValueError, AttributeError):
             continue
-        # Never re-queue an item that is already in flight or done.
-        ds = item.get("dispatch_status")
-        if ds == "started":
+        # dispatch_status=="started" means an Agent run is already underway —
+        # never re-queue, even if the claim key has since expired.
+        if item.get("dispatch_status") == "started":
             logger.debug("Sweep: request %s already started, skipping", req_id)
             continue
-        # SETNX claim key prevents double-queuing across concurrent sweeps.
-        claimed = r.set(K_CLAIM + req_id, "1", nx=True, ex=CLAIM_TTL)
-        if not claimed:
-            logger.debug("Sweep: request %s already claimed, skipping", req_id)
+        # Atomic claim+enqueue via Lua; returns False if already claimed.
+        if not enqueue_if_unclaimed(r, req_id):
+            logger.debug("Sweep: request %s already claimed/queued, skipping", req_id)
             continue
-        r.lpush(DISPATCH_QUEUE, req_id)
         requeued.append(req_id)
         logger.info("Sweep: re-queued dev request %s (prior dispatch_status=%s)",
-                    req_id, ds or "never dispatched")
+                    req_id, item.get("dispatch_status") or "never dispatched")
     return requeued
 
 
@@ -486,6 +526,15 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                 await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
                 continue
             item = json.loads(raw)
+            # Final guard: re-read from Redis just before calling the MCP so
+            # a duplicate queue entry (e.g. from a stale manual re-queue before
+            # the atomic enqueue migration) cannot start a second Agent run.
+            if item.get("dispatch_status") == "started":
+                logger.info(
+                    "Dispatch: request %s already started (concurrent entry) — skipping",
+                    req_id)
+                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
+                continue
             try:
                 result = await mcp.start_agent_run(_build_prompt(item))
                 item["dispatch_status"] = "started"
@@ -500,10 +549,11 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
             kwargs = {"ex": ttl} if ttl and ttl > 0 else {}
             await asyncio.to_thread(
                 mcp.r.set, f"devreq:item:{req_id}", json.dumps(item), **kwargs)
-            # Release the claim key so a future sweep can re-queue this item
-            # if it failed (dispatch_status=="started" guards against re-queuing
-            # a successfully launched run).
-            await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
+            # On failure: release claim so the next sweep can retry.
+            # On success: claim key is left to expire naturally — sweep skips
+            # items with dispatch_status=="started" before touching the claim.
+            if item.get("dispatch_status") != "started":
+                await asyncio.to_thread(mcp.r.delete, K_CLAIM + req_id)
         except asyncio.CancelledError:
             raise
         except Exception:

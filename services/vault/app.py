@@ -2520,7 +2520,13 @@ async def replit_mcp_dispatch(req_id: str, request: Request):
         raise HTTPException(status_code=409,
                             detail=f"Request '{rid}' is {item.get('status')!r}, "
                                    "not approved — approve it in Discord first")
-    r.lpush(replit_mcp_mod.DISPATCH_QUEUE, rid)
+    # Atomic claim+LPUSH — same helper used by approval and sweep so all three
+    # producers can't race each other into a double-queue.
+    import asyncio as _asyncio
+    queued = await _asyncio.to_thread(replit_mcp_mod.enqueue_if_unclaimed, r, rid)
+    if not queued:
+        return {"ok": False, "queued": False, "rid": rid,
+                "detail": "already queued or in flight — claim key exists"}
     audit_log("admin", "REPLIT_MCP", "replit_mcp_requeued", f"request={rid}")
     return {"ok": True, "queued": rid}
 
