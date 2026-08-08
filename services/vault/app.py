@@ -1903,8 +1903,7 @@ async def vnc_viewer(conn_id: str, request: Request):
     ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_base}/vnc-ws/{cid}?token={vnc_token}"
 
-    return templates.TemplateResponse("vnc_viewer.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "vnc_viewer.html", {
         "label": label,
         "vnc_host": vnc_host,
         "vnc_port": vnc_port,
