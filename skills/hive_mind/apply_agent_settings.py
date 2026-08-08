@@ -90,6 +90,75 @@ def _apply_home_voice(raw: str) -> None:
     print(f"[agent-settings] Restored home voice channel: {data['channel_id']}")
 
 
+def _apply_model(raw: str) -> None:
+    """Apply a persisted per-agent model override to config.yaml.
+
+    Reads the JSON payload from Redis key ``agent:{name}:settings:model``
+    and writes ``model.default`` / ``model.provider`` (and optionally
+    ``model.base_url``) into ``~/.hermes/config.yaml`` so the gateway
+    starts with the user's last chosen model rather than the baked-in
+    deploy config.  The write is atomic (temp-file replace).
+    """
+    import yaml
+
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "model" not in data:
+            raise ValueError("bad payload")
+        model = str(data.get("model", "")).strip()
+        provider = str(data.get("provider", "openrouter")).strip()
+        base_url = str(data.get("base_url", "")).strip()
+    except ValueError:
+        print(
+            f"[agent-settings] Ignoring malformed model value: {raw!r}",
+            file=sys.stderr,
+        )
+        return
+
+    if not model:
+        print("[agent-settings] model value is empty — skipping", file=sys.stderr)
+        return
+
+    path = HERMES_HOME / "config.yaml"
+    try:
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        print("[agent-settings] config.yaml is not a mapping — skipping model", file=sys.stderr)
+        return
+
+    raw_model = cfg.get("model")
+    if isinstance(raw_model, dict):
+        model_cfg = raw_model
+    elif isinstance(raw_model, str) and raw_model.strip():
+        model_cfg = {"default": raw_model.strip()}
+        cfg["model"] = model_cfg
+    else:
+        model_cfg = {}
+        cfg["model"] = model_cfg
+
+    if model_cfg.get("default") == model and model_cfg.get("provider") == provider:
+        print(f"[agent-settings] model already {model} ({provider}) — nothing to do")
+        return
+
+    model_cfg["default"] = model
+    model_cfg["provider"] = provider
+    if base_url:
+        model_cfg["base_url"] = base_url
+    elif "base_url" in model_cfg and provider.lower() != "custom":
+        # Remove stale base_url when switching back to a hosted provider.
+        model_cfg.pop("base_url", None)
+
+    import yaml as _yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(_yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    tmp.replace(path)
+    print(f"[agent-settings] Restored model {model!r} (provider: {provider}) into config.yaml")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", required=True)
@@ -103,6 +172,7 @@ def main() -> int:
         r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=10)
         vid = r.get(settings_key(args.agent, "voice_id"))
         home = r.get(settings_key(args.agent, "home_voice_channel"))
+        model_raw = r.get(settings_key(args.agent, "model"))
     except Exception as e:
         print(f"[agent-settings] Redis unavailable ({e}) — skipping", file=sys.stderr)
         return 0
@@ -113,9 +183,17 @@ def main() -> int:
         except Exception as e:
             print(f"[agent-settings] Failed to apply voice_id: {e}", file=sys.stderr)
     if home:
-        _apply_home_voice(home)
-    if not vid and not home:
-        print("[agent-settings] No persisted voice settings for this agent")
+        try:
+            _apply_home_voice(home)
+        except Exception as e:
+            print(f"[agent-settings] Failed to apply home_voice_channel: {e}", file=sys.stderr)
+    if model_raw:
+        try:
+            _apply_model(model_raw)
+        except Exception as e:
+            print(f"[agent-settings] Failed to apply model: {e}", file=sys.stderr)
+    if not vid and not home and not model_raw:
+        print("[agent-settings] No persisted settings for this agent")
     return 0
 
 

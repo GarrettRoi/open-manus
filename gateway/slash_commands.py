@@ -54,6 +54,41 @@ logger = logging.getLogger("gateway.run")
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
 
+def _persist_agent_model_to_redis(model: str, provider: str, base_url: str = "") -> None:
+    """Best-effort write of the chosen model to the per-agent Redis settings key.
+
+    Key: ``agent:{AGENT_NAME}:settings:model``
+    Value: JSON ``{"model": "...", "provider": "...", "base_url": "..."}``
+
+    Mirrors the voice-settings pattern in ``skills/hive_mind/apply_agent_settings.py``
+    so ``entrypoint.sh`` can restore the model on the next container start via
+    ``apply_agent_settings.py --agent <name>``.
+
+    Silently no-ops if ``AGENT_NAME`` or ``REDIS_URL`` are absent; all errors
+    are swallowed so a Redis blip never breaks the model-switch confirmation.
+    """
+    import json as _json
+
+    agent_name = os.getenv("AGENT_NAME", "").strip()
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if not agent_name or not redis_url:
+        return
+    try:
+        import redis as _redis
+
+        r = _redis.from_url(redis_url, decode_responses=True, socket_timeout=5)
+        key = f"agent:{agent_name.lower()}:settings:model"
+        payload = _json.dumps({
+            "model": model,
+            "provider": provider,
+            "base_url": base_url or "",
+        })
+        r.set(key, payload)
+        logger.debug("Persisted agent model to Redis: %s → %s (%s)", key, model, provider)
+    except Exception as exc:
+        logger.debug("Failed to persist agent model to Redis: %s", exc)
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -1482,6 +1517,22 @@ class GatewaySlashCommandsMixin:
                 except Exception:
                     providers = []
 
+                # Fetch the OpenRouter live catalog for the company-first
+                # picker, iff an API key is present (no key → picker would
+                # offer models the agent can't actually call).
+                openrouter_catalog: dict = {}
+                if os.getenv("OPENROUTER_API_KEY", "").strip():
+                    try:
+                        from hermes_cli.models import fetch_openrouter_catalog_by_author
+                        _refresh = force_refresh  # honour --refresh from the same command
+                        openrouter_catalog = await asyncio.to_thread(
+                            fetch_openrouter_catalog_by_author,
+                            force_refresh=_refresh,
+                        )
+                    except Exception as _cat_exc:
+                        logger.debug("OpenRouter catalog fetch failed: %s", _cat_exc)
+                        openrouter_catalog = {}
+
                 if providers:
                     # Build a callback closure for when the user picks a model.
                     # Captures self + locals needed for the switch logic.
@@ -1652,6 +1703,15 @@ class GatewaySlashCommandsMixin:
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
 
+                            # Persist to Redis so the chosen model survives
+                            # container redeploys (restored by apply_agent_settings.py).
+                            await asyncio.to_thread(
+                                _persist_agent_model_to_redis,
+                                result.new_model,
+                                result.target_provider,
+                                result.base_url or "",
+                            )
+
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
                         lines = [t("gateway.model.switched", model=result.new_model)]
@@ -1700,6 +1760,7 @@ class GatewaySlashCommandsMixin:
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
+                        openrouter_catalog=openrouter_catalog or {},
                     )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
@@ -1901,6 +1962,15 @@ class GatewaySlashCommandsMixin:
                     save_config(cfg)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
+
+                # Persist to Redis so the chosen model survives container
+                # redeploys (restored by apply_agent_settings.py at startup).
+                await asyncio.to_thread(
+                    _persist_agent_model_to_redis,
+                    result.new_model,
+                    result.target_provider,
+                    result.base_url or "",
+                )
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider

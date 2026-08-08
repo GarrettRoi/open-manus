@@ -6629,10 +6629,19 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        openrouter_catalog: "dict | None" = None,
     ) -> SendResult:
         """Send an interactive select-menu model picker.
 
-        Two-step drill-down: provider dropdown → model dropdown.
+        When ``openrouter_catalog`` is provided (and non-empty), the picker opens
+        with a company-first flow: the user selects an OpenRouter author (e.g.
+        "Anthropic") then picks a specific model from that company's live catalog.
+        An "Other providers" button lets the user reach non-OpenRouter providers
+        (Nous, custom, etc.) via the existing multi-provider drilldown.
+
+        Without ``openrouter_catalog`` the picker falls back to the original
+        two-step provider → model drilldown.
+
         Uses Discord embeds + Select menus via ``ModelPickerView``.
         """
         if not self._client or not DISCORD_AVAILABLE:
@@ -6648,19 +6657,28 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
 
-            try:
-                from hermes_cli.providers import get_label
-                provider_label = get_label(current_provider)
-            except Exception:
-                provider_label = current_provider
+            use_catalog = bool(openrouter_catalog)
 
-            embed = discord.Embed(
-                title="⚙ Model Configuration",
-                description=(
+            if use_catalog:
+                description = (
+                    f"Current model: `{current_model or 'unknown'}`\n\n"
+                    f"Select a company to browse OpenRouter models:"
+                )
+            else:
+                try:
+                    from hermes_cli.providers import get_label
+                    provider_label = get_label(current_provider)
+                except Exception:
+                    provider_label = current_provider
+                description = (
                     f"Current model: `{current_model or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
                     f"Select a provider:"
-                ),
+                )
+
+            embed = discord.Embed(
+                title="⚙ Model Configuration",
+                description=description,
                 color=discord.Color.blue(),
             )
 
@@ -6672,6 +6690,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 on_model_selected=on_model_selected,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                openrouter_catalog=openrouter_catalog,
             )
 
             msg = await channel.send(embed=embed, view=view)
@@ -7926,6 +7945,10 @@ def _define_discord_view_classes() -> None:
         Times out after 2 minutes.
         """
 
+        # Max options per Select menu page (Discord hard limit is 25).
+        _COMPANIES_PER_PAGE = 25
+        _MODELS_PER_PAGE = 25
+
         def __init__(
             self,
             providers: list,
@@ -7935,6 +7958,7 @@ def _define_discord_view_classes() -> None:
             on_model_selected,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            openrouter_catalog: "dict | None" = None,
         ):
             super().__init__(timeout=120)
             self.providers = providers
@@ -7948,7 +7972,26 @@ def _define_discord_view_classes() -> None:
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
 
-            self._build_provider_select()
+            # OpenRouter company-first picker state
+            self._openrouter_catalog: dict = openrouter_catalog or {}
+            self._sorted_companies: list = []
+            self._company_page: int = 0
+            self._current_company: str = ""
+            self._model_page: int = 0
+            self._in_other_providers_mode: bool = False
+
+            if self._openrouter_catalog:
+                try:
+                    from hermes_cli.models import sort_authors_for_picker
+                    self._sorted_companies = sort_authors_for_picker(
+                        list(self._openrouter_catalog.keys()),
+                        catalog=self._openrouter_catalog,
+                    )
+                except Exception:
+                    self._sorted_companies = sorted(self._openrouter_catalog.keys())
+                self._build_company_select(page=0)
+            else:
+                self._build_provider_select()
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
@@ -7987,8 +8030,175 @@ def _define_discord_view_classes() -> None:
             cancel_btn.callback = self._on_cancel
             self.add_item(cancel_btn)
 
+        def _build_company_select(self, page: int = 0) -> None:
+            """Build the OpenRouter company (author) dropdown — stage 1 of the
+            company-first picker.
+
+            Shows up to ``_COMPANIES_PER_PAGE`` companies per page.  Prev/Next
+            paging buttons are added when the list overflows.  An "Other
+            providers" button always appears so the user can reach non-OpenRouter
+            providers (Nous, custom, etc.) via the existing multi-provider flow.
+            """
+            self.clear_items()
+            self._company_page = page
+
+            companies = self._sorted_companies
+            total = len(companies)
+            start = page * self._COMPANIES_PER_PAGE
+            end = start + self._COMPANIES_PER_PAGE
+            page_companies = companies[start:end]
+
+            try:
+                from hermes_cli.models import author_display_name as _adn
+            except Exception:
+                def _adn(s):
+                    return s.capitalize()
+
+            options = []
+            for author in page_companies:
+                models = self._openrouter_catalog.get(author, [])
+                count = len(models)
+                display = _adn(author)
+                label = f"{display} ({count} models)"
+                is_current = (
+                    self.current_provider == "openrouter"
+                    and bool(self.current_model)
+                    and self.current_model.startswith(f"{author}/")
+                )
+                options.append(
+                    discord.SelectOption(
+                        label=label[:100],
+                        value=author,
+                        description="current" if is_current else None,
+                    )
+                )
+
+            if not options:
+                return
+
+            select = discord.ui.Select(
+                placeholder="Choose a company...",
+                options=options,
+                custom_id="model_company_select",
+            )
+            select.callback = self._on_company_selected
+            self.add_item(select)
+
+            has_prev = page > 0
+            has_next = end < total
+
+            if has_prev:
+                prev_btn = discord.ui.Button(
+                    label="← Prev",
+                    style=discord.ButtonStyle.grey,
+                    custom_id="model_company_prev",
+                )
+                prev_btn.callback = self._on_company_prev
+                self.add_item(prev_btn)
+
+            if has_next:
+                next_btn = discord.ui.Button(
+                    label="Next →",
+                    style=discord.ButtonStyle.grey,
+                    custom_id="model_company_next",
+                )
+                next_btn.callback = self._on_company_next
+                self.add_item(next_btn)
+
+            other_btn = discord.ui.Button(
+                label="🔌 Other providers",
+                style=discord.ButtonStyle.grey,
+                custom_id="model_other_providers",
+            )
+            other_btn.callback = self._on_other_providers
+            self.add_item(other_btn)
+
+            cancel_btn = discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.red,
+                custom_id="model_cancel_co",
+            )
+            cancel_btn.callback = self._on_cancel
+            self.add_item(cancel_btn)
+
+        def _build_model_select_for_company(self, company: str, page: int = 0) -> None:
+            """Build the model dropdown for a specific OpenRouter company — stage 2."""
+            self.clear_items()
+            self._current_company = company
+            self._model_page = page
+            self._selected_provider = "openrouter"
+
+            all_models = self._openrouter_catalog.get(company, [])
+            total = len(all_models)
+            start = page * self._MODELS_PER_PAGE
+            end = start + self._MODELS_PER_PAGE
+            page_models = all_models[start:end]
+
+            try:
+                from hermes_cli.models import author_display_name as _adn
+            except Exception:
+                def _adn(s):
+                    return s.capitalize()
+
+            options = []
+            for mid, desc in page_models:
+                short = mid.split("/")[-1] if "/" in mid else mid
+                is_current = mid == self.current_model
+                option = discord.SelectOption(
+                    label=short[:100],
+                    value=mid[:100],
+                    description=("✓ current" if is_current else (desc[:100] if desc else None)),
+                )
+                options.append(option)
+
+            if not options:
+                return
+
+            company_display = _adn(company)
+            select = discord.ui.Select(
+                placeholder=f"Choose a model from {company_display}...",
+                options=options,
+                custom_id="model_model_select_co",
+            )
+            select.callback = self._on_model_selected
+            self.add_item(select)
+
+            back_btn = discord.ui.Button(
+                label="◀ Back",
+                style=discord.ButtonStyle.grey,
+                custom_id="model_back_co",
+            )
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+            if page > 0:
+                prev_btn = discord.ui.Button(
+                    label="← Prev",
+                    style=discord.ButtonStyle.grey,
+                    custom_id="model_model_prev",
+                )
+                prev_btn.callback = self._on_model_prev
+                self.add_item(prev_btn)
+
+            if end < total:
+                next_btn = discord.ui.Button(
+                    label="Next →",
+                    style=discord.ButtonStyle.grey,
+                    custom_id="model_model_next",
+                )
+                next_btn.callback = self._on_model_next
+                self.add_item(next_btn)
+
+            cancel_btn = discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.red,
+                custom_id="model_cancel_co2",
+            )
+            cancel_btn.callback = self._on_cancel
+            self.add_item(cancel_btn)
+
         def _build_model_select(self, provider_slug: str):
-            """Build the model dropdown for a specific provider."""
+            """Build the model dropdown for a specific provider (non-OpenRouter path)."""
             self.clear_items()
             provider = next(
                 (p for p in self.providers if p["slug"] == provider_slug), None
@@ -8063,6 +8273,164 @@ def _define_discord_view_classes() -> None:
                 )
             except Exception:
                 return None
+
+        async def _on_company_selected(self, interaction: discord.Interaction):
+            """Handle selection of an OpenRouter company — advance to model select."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            company = interaction.data["values"][0]
+            self._in_other_providers_mode = False
+            self._build_model_select_for_company(company, page=0)
+
+            try:
+                from hermes_cli.models import author_display_name as _adn
+            except Exception:
+                def _adn(s):
+                    return s.capitalize()
+
+            company_display = _adn(company)
+            all_models = self._openrouter_catalog.get(company, [])
+            total = len(all_models)
+            shown = min(total, self._MODELS_PER_PAGE)
+            pages = (total + self._MODELS_PER_PAGE - 1) // self._MODELS_PER_PAGE
+            extra = f"\n*Page 1 of {pages} — use Next/Prev to browse all {total} models*" if pages > 1 else ""
+
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=f"Company: **{company_display}** ({total} models)\nSelect a model:{extra}",
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_other_providers(self, interaction: discord.Interaction):
+            """Switch to the existing multi-provider picker view."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            self._in_other_providers_mode = True
+            self._build_provider_select()
+
+            try:
+                from hermes_cli.providers import get_label
+                provider_label = get_label(self.current_provider)
+            except Exception:
+                provider_label = self.current_provider
+
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Current model: `{self.current_model or 'unknown'}`\n"
+                        f"Provider: {provider_label}\n\n"
+                        f"Select a provider:"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_company_prev(self, interaction: discord.Interaction):
+            """Go to the previous page of the company list."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            page = max(0, self._company_page - 1)
+            self._build_company_select(page)
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Current model: `{self.current_model or 'unknown'}`\n\n"
+                        f"Select a company (page {page + 1}):"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_company_next(self, interaction: discord.Interaction):
+            """Go to the next page of the company list."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            page = self._company_page + 1
+            self._build_company_select(page)
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Current model: `{self.current_model or 'unknown'}`\n\n"
+                        f"Select a company (page {page + 1}):"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_model_prev(self, interaction: discord.Interaction):
+            """Go to the previous page of the model list for the current company."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            page = max(0, self._model_page - 1)
+            self._build_model_select_for_company(self._current_company, page)
+
+            try:
+                from hermes_cli.models import author_display_name as _adn
+            except Exception:
+                def _adn(s):
+                    return s.capitalize()
+
+            company_display = _adn(self._current_company)
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=f"Company: **{company_display}**\nSelect a model (page {page + 1}):",
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_model_next(self, interaction: discord.Interaction):
+            """Go to the next page of the model list for the current company."""
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            page = self._model_page + 1
+            self._build_model_select_for_company(self._current_company, page)
+
+            try:
+                from hermes_cli.models import author_display_name as _adn
+            except Exception:
+                def _adn(s):
+                    return s.capitalize()
+
+            company_display = _adn(self._current_company)
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=f"Company: **{company_display}**\nSelect a model (page {page + 1}):",
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
 
         async def _on_provider_selected(self, interaction: discord.Interaction):
             if not self._check_auth(interaction):
@@ -8189,6 +8557,25 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            # Company-first flow: "Back" from model-select returns to company-
+            # select.  "Back" from provider-select (Other providers mode) also
+            # returns to company-select if a catalog is available.
+            if self._openrouter_catalog and not self._in_other_providers_mode:
+                self._build_company_select(self._company_page)
+                await interaction.response.edit_message(
+                    embed=discord.Embed(
+                        title="⚙ Model Configuration",
+                        description=(
+                            f"Current model: `{self.current_model or 'unknown'}`\n\n"
+                            f"Select a company:"
+                        ),
+                        color=discord.Color.blue(),
+                    ),
+                    view=self,
+                )
+                return
+
+            # Fallback / Other-providers mode: go back to provider select.
             self._build_provider_select()
 
             try:

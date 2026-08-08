@@ -88,7 +88,174 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
 
+# ---------------------------------------------------------------------------
+# Company-first OpenRouter catalog — for the two-stage Discord picker
+# ---------------------------------------------------------------------------
 
+# Per-author catalog cache: {author_slug: [(model_id, desc), ...]}
+_openrouter_author_catalog_cache: dict[str, list[tuple[str, str]]] | None = None
+_openrouter_author_catalog_ts: float = 0.0
+_OPENROUTER_AUTHOR_CATALOG_TTL: float = 7 * 60  # 7 minutes
+
+# Companies surfaced first in the picker regardless of model count.
+_PRIORITY_AUTHORS: list[str] = [
+    "anthropic", "openai", "google", "meta-llama",
+    "mistralai", "deepseek", "x-ai", "qwen",
+]
+
+# Human-readable display names for known OpenRouter author slugs.
+_AUTHOR_DISPLAY_NAMES: dict[str, str] = {
+    "anthropic":    "Anthropic",
+    "openai":       "OpenAI",
+    "google":       "Google",
+    "meta-llama":   "Meta (Llama)",
+    "mistralai":    "Mistral AI",
+    "deepseek":     "DeepSeek",
+    "x-ai":         "xAI (Grok)",
+    "qwen":         "Qwen (Alibaba)",
+    "moonshotai":   "MoonshotAI (Kimi)",
+    "nvidia":       "NVIDIA",
+    "minimax":      "MiniMax",
+    "cohere":       "Cohere",
+    "microsoft":    "Microsoft",
+    "amazon":       "Amazon",
+    "01-ai":        "01.AI",
+    "bytedance":    "ByteDance",
+    "databricks":   "Databricks",
+    "z-ai":         "Z-AI (GLM)",
+    "tencent":      "Tencent",
+    "openrouter":   "OpenRouter",
+    "mistral":      "Mistral",
+    "nousresearch": "Nous Research",
+    "together":     "Together AI",
+    "opencode":     "OpenCode",
+    "perplexity":   "Perplexity",
+    "inflection":   "Inflection AI",
+    "01ai":         "01.AI",
+    "stepfun":      "StepFun",
+    "zhipuai":      "ZhipuAI",
+    "xiaomi":       "Xiaomi",
+    "poolside":     "Poolside",
+    "sakana":       "Sakana AI",
+    "inclusionai":  "InclusionAI",
+}
+
+
+def author_display_name(author_slug: str) -> str:
+    """Return a human-readable display name for an OpenRouter author slug."""
+    name = _AUTHOR_DISPLAY_NAMES.get(author_slug)
+    if name:
+        return name
+    # Capitalise each hyphen/underscore-separated word as a best-effort fallback.
+    return " ".join(w.capitalize() for w in author_slug.replace("_", "-").split("-"))
+
+
+def sort_authors_for_picker(
+    authors: list[str],
+    catalog: "dict[str, list] | None" = None,
+) -> list[str]:
+    """Sort author slugs for the company picker.
+
+    Priority authors (anthropic, openai, google …) appear first in the
+    defined order.  The remainder are sorted by model count (descending)
+    so the most populated companies appear at the top of subsequent pages.
+    Alphabetical sort is used as a stable tiebreaker.
+    """
+    author_set = set(authors)
+    priority = [a for a in _PRIORITY_AUTHORS if a in author_set]
+    priority_set = set(priority)
+    rest = sorted(
+        [a for a in authors if a not in priority_set],
+        key=lambda a: (-(len(catalog.get(a, [])) if catalog else 0), a),
+    )
+    return priority + rest
+
+
+def fetch_openrouter_catalog_by_author(
+    timeout: float = 10.0,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, list[tuple[str, str]]]:
+    """Fetch the full OpenRouter catalog grouped by author prefix.
+
+    Returns ``{author_slug: [(model_id, description), ...]}`` where model IDs
+    are sorted alphabetically within each group.  Only tool-capable models are
+    included (same gate as ``fetch_openrouter_models``).
+
+    Results are cached for ``_OPENROUTER_AUTHOR_CATALOG_TTL`` seconds (~7 min).
+    On any fetch failure the previous cache, or as a last resort a grouping of
+    the curated ``OPENROUTER_MODELS`` snapshot, is returned so the picker always
+    has something to show.
+
+    ``force_refresh=True`` bypasses the TTL and issues a fresh HTTP request.
+    """
+    global _openrouter_author_catalog_cache, _openrouter_author_catalog_ts
+
+    now = time.time()
+    if (
+        not force_refresh
+        and _openrouter_author_catalog_cache is not None
+        and (now - _openrouter_author_catalog_ts) < _OPENROUTER_AUTHOR_CATALOG_TTL
+    ):
+        return dict(_openrouter_author_catalog_cache)
+
+    def _fallback() -> dict[str, list[tuple[str, str]]]:
+        """Group the curated snapshot by author prefix."""
+        out: dict[str, list[tuple[str, str]]] = {}
+        for mid, desc in OPENROUTER_MODELS:
+            author = mid.split("/")[0] if "/" in mid else mid
+            out.setdefault(author, []).append((mid, desc))
+        return out
+
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return (
+            dict(_openrouter_author_catalog_cache)
+            if _openrouter_author_catalog_cache is not None
+            else _fallback()
+        )
+
+    live_items = payload.get("data", [])
+    if not isinstance(live_items, list) or not live_items:
+        return (
+            dict(_openrouter_author_catalog_cache)
+            if _openrouter_author_catalog_cache is not None
+            else _fallback()
+        )
+
+    by_author: dict[str, list[tuple[str, str]]] = {}
+    for item in live_items:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid or "/" not in mid:
+            continue
+        if not _openrouter_model_supports_tools(item):
+            continue
+        author = mid.split("/")[0]
+        desc = "free" if _openrouter_model_is_free(item.get("pricing")) else ""
+        by_author.setdefault(author, []).append((mid, desc))
+
+    if not by_author:
+        return (
+            dict(_openrouter_author_catalog_cache)
+            if _openrouter_author_catalog_cache is not None
+            else _fallback()
+        )
+
+    # Sort models within each author group alphabetically by ID.
+    for author in by_author:
+        by_author[author].sort(key=lambda x: x[0])
+
+    _openrouter_author_catalog_cache = by_author
+    _openrouter_author_catalog_ts = now
+    return dict(by_author)
 
 
 def _codex_curated_models() -> list[str]:
