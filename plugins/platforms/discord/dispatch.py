@@ -556,6 +556,20 @@ class DispatchManager:
             await asyncio.to_thread(
                 lambda: r.set("dispatch:roster_msg", str(msg.id)))
 
+    def owner_steering_bypass(self, author_id: str, channel_ids) -> bool:
+        """Fail-closed allowlist exception for owner steering.
+
+        True only when: dispatch is enabled, the message's channel-id set
+        (channel + thread parent) contains the dispatch channel, an owner id
+        is configured, and the author IS that owner.
+        """
+        if not self.enabled or not channel_ids:
+            return False
+        if self.channel_id not in {str(c) for c in channel_ids}:
+            return False
+        oid = _owner_id()
+        return bool(oid) and bool(author_id) and str(author_id) == oid
+
     # ------------------------------------------------------------------
     # owner steering / gate helper (called from adapter._handle_message)
     # ------------------------------------------------------------------

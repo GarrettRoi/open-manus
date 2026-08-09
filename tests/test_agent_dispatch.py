@@ -338,6 +338,66 @@ def test_gate_owner_steer_routes_to_assignee_only():
         assert _run(mgr2.gate(_msg("555", "42"), "777", True)) == "drop"
 
 
+def test_owner_steering_bypass_fail_closed():
+    """The on_message allowlist exception admits ONLY the configured owner,
+    ONLY in dispatch territory (channel or its threads)."""
+    disp, mgr = _mk_manager(channel="777")
+    with patch.object(type(mgr), "enabled", property(lambda s: True)), \
+         patch.object(disp, "_owner_id", return_value="42"):
+        # owner in dispatch channel root / in a thread under it (parent id in set)
+        assert mgr.owner_steering_bypass("42", {"777"}) is True
+        assert mgr.owner_steering_bypass("42", {"555", "777"}) is True
+        # non-owner never passes
+        assert mgr.owner_steering_bypass("99", {"777"}) is False
+        # owner outside dispatch territory never passes
+        assert mgr.owner_steering_bypass("42", {"123"}) is False
+        # DMs (no channel-id set) never pass
+        assert mgr.owner_steering_bypass("42", None) is False
+        assert mgr.owner_steering_bypass("", {"777"}) is False
+    # no owner configured → fail closed
+    with patch.object(type(mgr), "enabled", property(lambda s: True)), \
+         patch.object(disp, "_owner_id", return_value=""):
+        assert mgr.owner_steering_bypass("42", {"777"}) is False
+    # dispatch disabled → fail closed
+    with patch.object(type(mgr), "enabled", property(lambda s: False)), \
+         patch.object(disp, "_owner_id", return_value="42"):
+        assert mgr.owner_steering_bypass("42", {"777"}) is False
+
+
+def test_adapter_dispatch_owner_bypass_helper():
+    """Adapter-side wrapper: no manager / manager error → fail closed."""
+    import importlib
+    _ensure_pkg = importlib.import_module("plugins.platforms.discord.dispatch")
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    fake_adapter = MagicMock(spec=[])  # bare object
+    fake_adapter.name = "test"
+    fake_adapter._dispatch_manager = None
+    assert DiscordAdapter._dispatch_owner_bypass(
+        fake_adapter, _msg("777", "42"), {"777"}) is False
+
+    mgr = MagicMock()
+    mgr.owner_steering_bypass.return_value = True
+    fake_adapter._dispatch_manager = mgr
+    assert DiscordAdapter._dispatch_owner_bypass(
+        fake_adapter, _msg("777", "42"), {"777"}) is True
+    mgr.owner_steering_bypass.assert_called_once_with("42", {"777"})
+
+    mgr.owner_steering_bypass.side_effect = RuntimeError("redis down")
+    assert DiscordAdapter._dispatch_owner_bypass(
+        fake_adapter, _msg("777", "42"), {"777"}) is False
+
+
+def test_gate_drops_bot_authored_protocol_posts():
+    """Bot-authored posts in dispatch threads (order posts, results) must
+    never trigger a turn even if bot filtering is loosened: the gate drops
+    every non-owner author, bots included."""
+    disp, mgr = _mk_manager()
+    with patch.object(type(mgr), "enabled", property(lambda s: True)), \
+         patch.object(disp, "_owner_id", return_value="42"):
+        assert _run(mgr.gate(_msg("555", "888", bot=True), "777", True)) == "drop"
+
+
 def test_gate_owner_answer_resumes_asker():
     r = _r()
     chain = {"id": "6", "root_id": "6", "parent_id": "", "depth": 0,

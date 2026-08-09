@@ -1175,7 +1175,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         is_dm=_is_dm,
                         channel_ids=_msg_channel_ids,
                     ):
-                        return
+                        # Narrow fail-closed exception: the dispatch OWNER's
+                        # messages in dispatch territory (the dispatch channel
+                        # or its threads) must reach _handle_message so owner
+                        # steering works even when the owner is not in this
+                        # agent's DISCORD_ALLOWED_USERS. The dispatch gate in
+                        # _handle_message then routes/drops them per chain
+                        # state. Everyone else stays rejected here.
+                        if not adapter_self._dispatch_owner_bypass(message, _msg_channel_ids):
+                            return
                     _role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
                 
                 # Multi-agent filtering: if the message mentions specific bots
@@ -6905,6 +6913,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
+
+    def _dispatch_owner_bypass(self, message: Any, channel_ids) -> bool:
+        """True only for the dispatch owner's messages in dispatch territory.
+
+        Used by on_message to let owner steering past the user allowlist —
+        fail-closed: requires an enabled dispatch manager, a configured owner
+        id, and the dispatch channel among the message's channel ids (the
+        set includes a thread's parent, so chain threads qualify).
+        """
+        mgr = getattr(self, "_dispatch_manager", None)
+        if mgr is None:
+            return False
+        try:
+            return mgr.owner_steering_bypass(
+                str(getattr(getattr(message, "author", None), "id", "") or ""),
+                channel_ids,
+            )
+        except Exception:
+            logger.exception("[%s] dispatch owner bypass check failed", self.name)
+            return False
 
     async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
         """Handle incoming Discord messages."""
