@@ -60,6 +60,28 @@ def _redis():
     return store._redis()
 
 
+# Exclusive, versioned namespace for this manager's UI state. The legacy
+# ``skills/task_board`` CLI owns the bare ``taskboard:*`` prefix
+# (taskboard:task:*, taskboard:index, taskboard:counter) — never write there.
+_NS = "discord:taskboard:v1"
+
+
+def _k(name: str, agent: str) -> str:
+    return f"{_NS}:{name}:{agent}"
+
+
+def in_board_territory(channel_ids) -> bool:
+    """True when a message's channel-id set (channel + thread parent)
+    touches the task-board channel. Used by the adapter to drop ALL
+    conversation in board territory — the board is a read-only mirror, so
+    no author (agent, bot, or human) may trigger turns there. Fail-closed
+    and independent of DISCORD_ALLOW_BOTS / free-response settings."""
+    cid = task_board_channel_id()
+    if not cid or not channel_ids:
+        return False
+    return cid in {str(c) for c in channel_ids}
+
+
 # ----------------------------------------------------------------------
 # snapshot collection (sync helpers, always called via asyncio.to_thread)
 # ----------------------------------------------------------------------
@@ -375,7 +397,7 @@ class TaskBoardManager:
         snapshot = {snapshot_key(i): i for i in (goals + disp + kb + legacy)}
 
         r = await asyncio.to_thread(_redis)
-        raw_old = await asyncio.to_thread(r.get, f"taskboard:snapshot:{agent}")
+        raw_old = await asyncio.to_thread(r.get, _k("snapshot", agent))
         first_run = raw_old is None
         try:
             old = json.loads(raw_old) if raw_old else {}
@@ -395,21 +417,21 @@ class TaskBoardManager:
 
         # Board message: edit in place; only touch Discord when it changed.
         board = render_board(agent, snapshot)
-        prev_board = await asyncio.to_thread(r.get, f"taskboard:board_render:{agent}")
+        prev_board = await asyncio.to_thread(r.get, _k("board_render", agent))
         # strip the volatile timestamp line before comparing
         strip = lambda s: "\n".join((s or "").splitlines()[:-1])
         if strip(prev_board) != strip(board) or first_run:
             await self._upsert_board_message(r, thread, board)
-            await asyncio.to_thread(r.set, f"taskboard:board_render:{agent}", board)
+            await asyncio.to_thread(r.set, _k("board_render", agent), board)
 
         await asyncio.to_thread(
-            r.set, f"taskboard:snapshot:{agent}",
+            r.set, _k("snapshot", agent),
             json.dumps(snapshot, ensure_ascii=False))
 
     # ------------------------------------------------------------------
     async def _ensure_thread(self, r):
         """Fetch (or create) this agent's thread in the board channel."""
-        tid = await asyncio.to_thread(r.get, f"taskboard:thread:{self.agent}")
+        tid = await asyncio.to_thread(r.get, _k("thread", self.agent))
         if tid:
             try:
                 return await self._get_channel(tid)
@@ -427,13 +449,13 @@ class TaskBoardManager:
             type=self._public_thread_type(),
             auto_archive_duration=10080,
         )
-        await asyncio.to_thread(r.set, f"taskboard:thread:{self.agent}", str(thread.id))
+        await asyncio.to_thread(r.set, _k("thread", self.agent), str(thread.id))
         # thread changed → the old board message id is useless
-        await asyncio.to_thread(r.delete, f"taskboard:board_msg:{self.agent}")
+        await asyncio.to_thread(r.delete, _k("board_msg", self.agent))
         return thread
 
     async def _upsert_board_message(self, r, thread, board: str) -> None:
-        msg_id = await asyncio.to_thread(r.get, f"taskboard:board_msg:{self.agent}")
+        msg_id = await asyncio.to_thread(r.get, _k("board_msg", self.agent))
         if msg_id:
             try:
                 msg = await thread.fetch_message(int(msg_id))
@@ -447,7 +469,7 @@ class TaskBoardManager:
             await msg.pin()
         except Exception:
             logger.debug("[%s] taskboard: could not pin board message", self.agent)
-        await asyncio.to_thread(r.set, f"taskboard:board_msg:{self.agent}", str(msg.id))
+        await asyncio.to_thread(r.set, _k("board_msg", self.agent), str(msg.id))
 
     async def _get_channel(self, channel_id: str):
         client = self.adapter._client

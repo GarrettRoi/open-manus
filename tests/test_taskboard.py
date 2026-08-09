@@ -145,6 +145,24 @@ def test_collect_goals_reads_active_and_paused_only(tmp_path):
     assert titles == {"Active goal", "Paused goal"}
 
 
+def test_redis_keys_use_exclusive_namespace():
+    # Must never collide with the legacy skills/task_board `taskboard:*` keys.
+    for name in ("thread", "snapshot", "board_render", "board_msg"):
+        key = tb._k(name, "lexi")
+        assert key.startswith("discord:taskboard:v1:")
+        assert not key.startswith("taskboard:")
+
+
+def test_in_board_territory_gate():
+    with patch.dict("os.environ", {"TASK_BOARD_CHANNEL_ID": "999"}):
+        assert tb.in_board_territory({"999"}) is True          # board root
+        assert tb.in_board_territory({"555", "999"}) is True   # thread under it
+        assert tb.in_board_territory({"123"}) is False         # elsewhere
+        assert tb.in_board_territory(None) is False            # DMs
+    with patch.dict("os.environ", {"TASK_BOARD_CHANNEL_ID": ""}):
+        assert tb.in_board_territory({"999"}) is False         # disabled
+
+
 def test_manager_disabled_without_channel_or_redis():
     with patch.dict("os.environ", {"TASK_BOARD_CHANNEL_ID": "", "REDIS_URL": "x"}):
         assert tb.TaskBoardManager(MagicMock()).enabled is False

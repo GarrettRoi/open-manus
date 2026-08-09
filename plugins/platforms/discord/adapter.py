@@ -6977,6 +6977,26 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
+        # Task-board gate: the task-board channel and its threads are a
+        # read-only mirror maintained by TaskBoardManager. NO message there
+        # — bot, agent, or human — may trigger a turn, independent of
+        # DISCORD_ALLOW_BOTS / free-response / participated-thread settings.
+        # Fail-closed against feedback loops across the 15-agent fleet.
+        if self._taskboard_manager is not None and self._taskboard_manager.enabled:
+            try:
+                _tb_ids = {str(message.channel.id)}
+                if parent_channel_id:
+                    _tb_ids.add(str(parent_channel_id))
+                from taskboard import in_board_territory as _in_board
+            except ImportError:
+                from .taskboard import in_board_territory as _in_board
+            try:
+                if _in_board(_tb_ids):
+                    return
+            except Exception:
+                logger.exception("[%s] taskboard gate failed; dropping message", self.name)
+                return
+
         # Inter-agent dispatch gate: dispatch-channel threads are
         # reaction/tool-only for agents. Only the owner's steering messages
         # (and answers to this agent's pending question) trigger a turn, and
