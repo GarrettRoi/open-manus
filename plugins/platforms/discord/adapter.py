@@ -856,6 +856,17 @@ class DiscordAdapter(BasePlatformAdapter):
             self._dispatch_manager = _DispatchManager(self)
         except Exception:
             logger.exception("[%s] Failed to init dispatch manager", self.name)
+        # Per-agent task-board thread (kanban + goal + dispatch mirror). Only
+        # active when TASK_BOARD_CHANNEL_ID + REDIS_URL are configured.
+        self._taskboard_manager = None
+        try:
+            try:
+                from taskboard import TaskBoardManager as _TaskBoardManager
+            except ImportError:
+                from .taskboard import TaskBoardManager as _TaskBoardManager
+            self._taskboard_manager = _TaskBoardManager(self)
+        except Exception:
+            logger.exception("[%s] Failed to init taskboard manager", self.name)
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1108,6 +1119,12 @@ class DiscordAdapter(BasePlatformAdapter):
                         adapter_self._dispatch_manager.start()
                     except Exception:
                         logger.exception("[%s] dispatch manager start failed", adapter_self.name)
+                # Task-board thread mirror (idempotent across reconnects).
+                if adapter_self._taskboard_manager is not None:
+                    try:
+                        adapter_self._taskboard_manager.start()
+                    except Exception:
+                        logger.exception("[%s] taskboard manager start failed", adapter_self.name)
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1478,6 +1495,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._dispatch_manager.stop()
             except Exception:
                 logger.debug("[%s] dispatch manager stop failed", self.name)
+        if self._taskboard_manager is not None:
+            try:
+                self._taskboard_manager.stop()
+            except Exception:
+                logger.debug("[%s] taskboard manager stop failed", self.name)
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
