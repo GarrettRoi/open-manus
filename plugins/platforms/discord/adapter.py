@@ -845,6 +845,17 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Inter-agent task dispatch (Discord-native, Redis-backed). Only
+        # active when DISPATCH_CHANNEL_ID + REDIS_URL are configured.
+        self._dispatch_manager = None
+        try:
+            try:
+                from dispatch import DispatchManager as _DispatchManager
+            except ImportError:
+                from .dispatch import DispatchManager as _DispatchManager
+            self._dispatch_manager = _DispatchManager(self)
+        except Exception:
+            logger.exception("[%s] Failed to init dispatch manager", self.name)
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1090,6 +1101,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 asyncio.create_task(adapter_self.check_designated_voice_channel())
                 # Non-blocking Redis reachability check for /devrequests.
                 asyncio.create_task(adapter_self._warn_if_devreq_redis_unhealthy())
+                # Inter-agent dispatch: roster publish + outbox/intake watchers
+                # (+ Harmony PM watcher). Idempotent across reconnects.
+                if adapter_self._dispatch_manager is not None:
+                    try:
+                        adapter_self._dispatch_manager.start()
+                    except Exception:
+                        logger.exception("[%s] dispatch manager start failed", adapter_self.name)
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -6904,6 +6922,23 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
+        # Inter-agent dispatch gate: dispatch-channel threads are
+        # reaction/tool-only for agents. Only the owner's steering messages
+        # (and answers to this agent's pending question) trigger a turn, and
+        # only on the chain's current assignee — everything else is dropped
+        # here so agents can never loop each other through Discord text.
+        _dispatch_steer = False
+        if self._dispatch_manager is not None and self._dispatch_manager.enabled:
+            try:
+                _gate = self._dispatch_manager.gate(message, parent_channel_id, is_thread)
+            except Exception:
+                logger.exception("[%s] dispatch gate failed; dropping message", self.name)
+                _gate = "drop"
+            if _gate == "drop":
+                return
+            if _gate == "steer":
+                _dispatch_steer = True
+
         is_voice_linked_channel = False
 
         # Save mention-stripped text before auto-threading since create_thread()
@@ -6974,7 +7009,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if require_mention and not is_free_channel and not in_bot_thread and not _dispatch_steer:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return
         # Auto-thread: when enabled, automatically create a thread for every
