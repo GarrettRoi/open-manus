@@ -116,6 +116,18 @@ class DispatchManager:
     # roster
     # ------------------------------------------------------------------
     async def _publish_roster(self) -> None:
+        """Publish this agent's roster entry, then refresh periodically so it
+        never TTLs out while the agent is alive."""
+        while True:
+            try:
+                await self._publish_roster_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[%s] dispatch roster publish failed", self.agent)
+            await asyncio.sleep(6 * 3600)
+
+    async def _publish_roster_once(self) -> None:
         client = getattr(self.adapter, "_client", None)
         user = getattr(client, "user", None) if client else None
         tools: list[str] = []
@@ -153,6 +165,8 @@ class DispatchManager:
     async def _outbox_loop(self) -> None:
         key = f"dispatch:outbox:{self.agent}"
         while True:
+            action = None
+            r = None
             try:
                 r = await asyncio.to_thread(self._redis)
                 raw = await asyncio.to_thread(r.lpop, key)
@@ -168,6 +182,21 @@ class DispatchManager:
                 raise
             except Exception:
                 logger.exception("[%s] dispatch outbox action failed", self.agent)
+                # Requeue with a bounded retry count so a transient Discord
+                # failure doesn't permanently lose the action.
+                if r is not None and isinstance(action, dict):
+                    retries = int(action.get("retries", 0)) + 1
+                    if retries <= 5:
+                        action["retries"] = retries
+                        try:
+                            await asyncio.to_thread(
+                                r.rpush, key, json.dumps(action, ensure_ascii=False))
+                        except Exception:
+                            logger.exception("[%s] dispatch outbox requeue failed",
+                                             self.agent)
+                    else:
+                        logger.error("[%s] dispatch: dropping outbox action after "
+                                     "%d retries: %s", self.agent, retries, action)
                 await asyncio.sleep(POLL_SECONDS)
 
     async def _perform_action(self, r, action: Dict[str, Any]) -> None:
@@ -203,7 +232,15 @@ class DispatchManager:
         return ch
 
     async def _open_chain(self, r, store, chain: Dict[str, Any]) -> None:
-        """Create the chain thread in the dispatch channel and post the order."""
+        """Create the chain thread in the dispatch channel and post the order.
+
+        Idempotent: a retry after a partial failure reuses the existing
+        thread instead of opening a duplicate; the assignee-side SETNX ack
+        claim dedups a re-pushed order event.
+        """
+        if chain.get("thread_id"):
+            store.push_inbox(r, chain["to"], {"kind": "order", "chain_id": chain["id"]})
+            return
         channel = await self._get_channel(self.channel_id)
         title = f"#{chain['id']} {chain['from']}→{chain['to']}: {chain['task'][:60]}"
         thread = await channel.create_thread(
@@ -278,6 +315,8 @@ class DispatchManager:
     async def _intake_loop(self) -> None:
         key = f"dispatch:inbox:{self.agent}"
         while True:
+            event = None
+            r = None
             try:
                 r = await asyncio.to_thread(self._redis)
                 raw = await asyncio.to_thread(r.lpop, key)
@@ -293,6 +332,19 @@ class DispatchManager:
                 raise
             except Exception:
                 logger.exception("[%s] dispatch intake failed", self.agent)
+                if r is not None and isinstance(event, dict):
+                    retries = int(event.get("retries", 0)) + 1
+                    if retries <= 5:
+                        event["retries"] = retries
+                        try:
+                            await asyncio.to_thread(
+                                r.rpush, key, json.dumps(event, ensure_ascii=False))
+                        except Exception:
+                            logger.exception("[%s] dispatch intake requeue failed",
+                                             self.agent)
+                    else:
+                        logger.error("[%s] dispatch: dropping inbox event after "
+                                     "%d retries: %s", self.agent, retries, event)
                 await asyncio.sleep(POLL_SECONDS)
 
     async def _handle_inbox_event(self, r, event: Dict[str, Any]) -> None:
@@ -312,7 +364,16 @@ class DispatchManager:
                 return
             await self._swap_reaction(chain, "👀", None)
             chain["status"] = "acked"
-            store.save_chain(r, chain)
+            try:
+                # Guarded: only a still-pending order becomes acked. If the
+                # dispatcher cancelled (or anything else raced us), skip the
+                # injection instead of resurrecting a terminal chain.
+                await asyncio.to_thread(
+                    store.save_chain_guarded, r, chain, {"pending"})
+            except RuntimeError as e:
+                logger.info("[%s] dispatch: not injecting order %s: %s",
+                            self.agent, chain["id"], e)
+                return
             text = (
                 f"[Dispatch order #{chain['id']} from {chain['from']}]\n"
                 f"{chain['task']}\n\n"
@@ -498,8 +559,8 @@ class DispatchManager:
     # ------------------------------------------------------------------
     # owner steering / gate helper (called from adapter._handle_message)
     # ------------------------------------------------------------------
-    def gate(self, message: Any, parent_channel_id: Optional[str],
-             is_thread: bool) -> Optional[str]:
+    async def gate(self, message: Any, parent_channel_id: Optional[str],
+                   is_thread: bool) -> Optional[str]:
         """Decide what to do with a Discord message in dispatch territory.
 
         Returns:
@@ -528,11 +589,17 @@ class DispatchManager:
             # (mention rules apply) — only threads carry chain semantics.
             return None
         # Owner message inside a chain thread → route to the current assignee.
+        # All Redis I/O off the event loop (a Redis timeout must not stall
+        # Discord message handling).
         try:
             store = _store()
-            r = store._redis()
-            chain_id = r.get(f"dispatch:thread:{chan_id}")
-            chain = store.get_chain(r, chain_id) if chain_id else None
+
+            def _lookup():
+                r = store._redis()
+                chain_id = r.get(f"dispatch:thread:{chan_id}")
+                return r, (store.get_chain(r, chain_id) if chain_id else None)
+
+            r, chain = await asyncio.to_thread(_lookup)
         except Exception:
             logger.exception("[%s] dispatch gate: Redis lookup failed", self.agent)
             return "drop"
@@ -545,7 +612,13 @@ class DispatchManager:
                 return "drop"
             chain["status"] = "working" if asker == chain.get("to") else "acked"
             chain["waiting_on"] = ""
-            store.save_chain(r, chain)
+            try:
+                await asyncio.to_thread(
+                    store.save_chain_guarded, r, chain, {"waiting"})
+            except RuntimeError:
+                # Raced with the tool-side answer path — the chain already
+                # moved on; still steer so the owner's text reaches the agent.
+                pass
             return "steer"
         # General steering (redirect / cancel / extra instructions) →
         # exactly one agent responds: the assignee.

@@ -1465,6 +1465,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._dispatch_manager is not None:
+            try:
+                self._dispatch_manager.stop()
+            except Exception:
+                logger.debug("[%s] dispatch manager stop failed", self.name)
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
@@ -6930,7 +6935,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _dispatch_steer = False
         if self._dispatch_manager is not None and self._dispatch_manager.enabled:
             try:
-                _gate = self._dispatch_manager.gate(message, parent_channel_id, is_thread)
+                _gate = await self._dispatch_manager.gate(message, parent_channel_id, is_thread)
             except Exception:
                 logger.exception("[%s] dispatch gate failed; dropping message", self.name)
                 _gate = "drop"

@@ -111,6 +111,45 @@ def save_chain(r, chain: Dict[str, Any]) -> None:
         r.srem("dispatch:active", chain["id"])
 
 
+def save_chain_guarded(r, chain: Dict[str, Any],
+                       expected_statuses: set) -> Dict[str, Any]:
+    """Compare-and-save: persist *chain* only if the stored status is still in
+    *expected_statuses* (WATCH/MULTI optimistic lock).
+
+    Prevents concurrent complete/cancel/answer/ack from silently overwriting
+    a terminal state. Raises RuntimeError on conflict.
+    """
+    import redis as _redis_mod
+    key = f"dispatch:chain:{chain['id']}"
+    with r.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                current = None
+                if raw:
+                    try:
+                        current = json.loads(raw).get("status")
+                    except ValueError:
+                        current = None
+                if current is not None and current not in expected_statuses:
+                    pipe.unwatch()
+                    raise RuntimeError(
+                        f"Chain {chain['id']} is already {current}; "
+                        f"refusing transition to {chain['status']}.")
+                chain["updated_at"] = int(time.time())
+                pipe.multi()
+                pipe.set(key, json.dumps(chain, ensure_ascii=False), ex=CHAIN_TTL)
+                if chain.get("status") in _ACTIVE_STATUSES:
+                    pipe.sadd("dispatch:active", chain["id"])
+                else:
+                    pipe.srem("dispatch:active", chain["id"])
+                pipe.execute()
+                return chain
+            except _redis_mod.WatchError:
+                continue
+
+
 def push_inbox(r, agent: str, event: Dict[str, Any]) -> None:
     key = f"dispatch:inbox:{agent.lower()}"
     r.rpush(key, json.dumps(event, ensure_ascii=False))
@@ -162,12 +201,27 @@ def create_chain(r, from_agent: str, to_agent: str, task: str,
             f"Unknown agent '{to_agent}'. Known agents in the dispatch roster: "
             f"{', '.join(sorted(str(k) for k in known if k)) or '(roster empty)'}."
         )
+    # Rail enforcement: parent lineage cannot be opted out of. If the
+    # dispatcher is currently working a dispatched order and gave no parent,
+    # its dispatch IS a sub-task of that order — auto-attach it so the depth
+    # and fan-out rails apply to the whole chain, not just cooperating agents.
+    if not parent_id:
+        assigned = [c for c in list_chains_for(r, from_agent)
+                    if c.get("to") == from_agent
+                    and c.get("status") in ("acked", "working", "waiting")]
+        if assigned:
+            assigned.sort(key=lambda c: c.get("updated_at", 0), reverse=True)
+            parent_id = assigned[0]["id"]
     depth = 0
     root_id = ""
     if parent_id:
         parent = get_chain(r, parent_id)
         if not parent:
             raise RuntimeError(f"Parent chain {parent_id} not found.")
+        if from_agent not in (parent.get("from"), parent.get("to")):
+            raise RuntimeError(
+                f"You are not a participant in chain {parent_id}; you cannot "
+                "attach sub-tasks to it.")
         depth = int(parent.get("depth", 0)) + 1
         root_id = parent.get("root_id") or parent["id"]
         if depth >= _max_depth():
@@ -228,7 +282,7 @@ def mark_working(r, chain_id: str, agent: str) -> Dict[str, Any]:
     if chain["status"] in ("done", "failed", "cancelled"):
         raise RuntimeError(f"Chain {chain_id} is already {chain['status']}.")
     chain["status"] = "working"
-    save_chain(r, chain)
+    save_chain_guarded(r, chain, _ACTIVE_STATUSES)
     push_outbox(r, agent, {"kind": "react", "chain_id": chain_id,
                            "add": "🔧", "remove": "👀"})
     return chain
@@ -249,7 +303,7 @@ def ask_question(r, chain_id: str, agent: str, to: str, question: str) -> Dict[s
     chain["waiting_on"] = to
     chain["question"] = question[:QUESTION_MAX]
     chain["asked_by"] = agent
-    save_chain(r, chain)
+    save_chain_guarded(r, chain, _ACTIVE_STATUSES)
     push_outbox(r, agent, {
         "kind": "post", "chain_id": chain_id, "mention": to,
         "text": f"❓ {question[:QUESTION_MAX]}",
@@ -272,7 +326,7 @@ def answer_question(r, chain_id: str, agent: str, answer: str) -> Dict[str, Any]
     chain["status"] = "working" if asked_by == chain["to"] else "acked"
     chain["waiting_on"] = ""
     chain["answer"] = answer[:QUESTION_MAX]
-    save_chain(r, chain)
+    save_chain_guarded(r, chain, {"waiting"})
     push_outbox(r, agent, {
         "kind": "post", "chain_id": chain_id, "mention": asked_by,
         "text": f"💬 {answer[:QUESTION_MAX]}",
@@ -301,7 +355,7 @@ def complete_chain(r, chain_id: str, agent: str, result: str,
             f"{', '.join(open_children)}. Wait for them or cancel them first.")
     chain["status"] = "done" if success else "failed"
     chain["result"] = result[:RESULT_MAX]
-    save_chain(r, chain)
+    save_chain_guarded(r, chain, _ACTIVE_STATUSES)
     emoji = "✅" if success else "❌"
     push_outbox(r, agent, {
         "kind": "post", "chain_id": chain_id, "mention": chain["from"],
@@ -317,11 +371,15 @@ def complete_chain(r, chain_id: str, agent: str, result: str,
 
 def cancel_chain(r, chain_id: str, by: str, reason: str = "") -> Dict[str, Any]:
     chain = _require_chain(r, chain_id)
+    if by not in (chain.get("from"), chain.get("to"), "owner"):
+        raise RuntimeError(
+            f"Only the dispatcher ({chain.get('from')}), the assignee "
+            f"({chain.get('to')}), or the owner may cancel chain {chain_id}.")
     if chain["status"] in ("done", "failed", "cancelled"):
         return chain
     chain["status"] = "cancelled"
     chain["result"] = (reason or "cancelled")[:RESULT_MAX]
-    save_chain(r, chain)
+    save_chain_guarded(r, chain, _ACTIVE_STATUSES)
     push_inbox(r, chain["to"], {"kind": "cancelled", "chain_id": chain_id, "by": by,
                                 "reason": reason})
     return chain

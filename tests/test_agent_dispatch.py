@@ -89,6 +89,46 @@ def test_fanout_rail():
             store.create_chain(r, "b", "c", "s3", parent_id=parent["id"])
 
 
+def test_auto_parent_inference_while_working_an_order():
+    """An agent working a dispatched order can't escape the rails by omitting
+    parent_chain_id — its dispatch auto-attaches as a sub-task."""
+    r = _r()
+    _seed_roster(r, "a", "b", "c")
+    order = store.create_chain(r, "a", "b", "root order")
+    store.mark_working(r, order["id"], "b")
+    sub = store.create_chain(r, "b", "c", "sub work")  # no parent given
+    assert sub["parent_id"] == order["id"]
+    assert sub["depth"] == 1
+
+
+def test_parent_requires_participation():
+    r = _r()
+    _seed_roster(r, "a", "b", "c", "d")
+    chain = store.create_chain(r, "a", "b", "t")
+    with pytest.raises(RuntimeError, match="not a participant"):
+        store.create_chain(r, "c", "d", "hijack", parent_id=chain["id"])
+
+
+def test_cancel_requires_participant_or_owner():
+    r = _r()
+    _seed_roster(r, "a", "b", "c")
+    chain = store.create_chain(r, "a", "b", "t")
+    with pytest.raises(RuntimeError, match="may cancel"):
+        store.cancel_chain(r, chain["id"], "c")
+    assert store.cancel_chain(r, chain["id"], "owner")["status"] == "cancelled"
+
+
+def test_guarded_save_rejects_terminal_overwrite():
+    r = _r()
+    _seed_roster(r, "a", "b")
+    chain = store.create_chain(r, "a", "b", "t")
+    store.complete_chain(r, chain["id"], "b", "done")
+    stale = dict(chain)
+    stale["status"] = "acked"
+    with pytest.raises(RuntimeError, match="already done"):
+        store.save_chain_guarded(r, stale, {"pending"})
+
+
 def test_multi_agent_root_tracks_participants():
     r = _r()
     _seed_roster(r, "a", "b", "c")
@@ -245,24 +285,29 @@ def _msg(channel_id, author_id, bot=False):
     return m
 
 
+def _run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
 def test_gate_ignores_non_dispatch_channels():
     disp, mgr = _mk_manager()
     with patch.object(type(mgr), "enabled", property(lambda s: True)):
-        assert mgr.gate(_msg("123", "1"), None, False) is None
+        assert _run(mgr.gate(_msg("123", "1"), None, False)) is None
 
 
 def test_gate_drops_non_owner_in_dispatch_thread():
     disp, mgr = _mk_manager()
     with patch.object(type(mgr), "enabled", property(lambda s: True)), \
          patch.object(disp, "_owner_id", return_value="42"):
-        assert mgr.gate(_msg("555", "99"), "777", True) == "drop"
+        assert _run(mgr.gate(_msg("555", "99"), "777", True)) == "drop"
 
 
 def test_gate_owner_root_channel_normal():
     disp, mgr = _mk_manager()
     with patch.object(type(mgr), "enabled", property(lambda s: True)), \
          patch.object(disp, "_owner_id", return_value="42"):
-        assert mgr.gate(_msg("777", "42"), None, False) is None
+        assert _run(mgr.gate(_msg("777", "42"), None, False)) is None
 
 
 def test_gate_owner_steer_routes_to_assignee_only():
@@ -278,18 +323,19 @@ def test_gate_owner_steer_routes_to_assignee_only():
     fake_store._redis.return_value = r
     fake_store.get_chain = store.get_chain
     fake_store.save_chain = store.save_chain
+    fake_store.save_chain_guarded = store.save_chain_guarded
 
     disp, mgr = _mk_manager(agent="lexi")
     with patch.object(type(mgr), "enabled", property(lambda s: True)), \
          patch.object(disp, "_owner_id", return_value="42"), \
          patch.object(disp, "_store", return_value=fake_store):
-        assert mgr.gate(_msg("555", "42"), "777", True) == "steer"
+        assert _run(mgr.gate(_msg("555", "42"), "777", True)) == "steer"
     # non-assignee agent drops the same steering message
     disp2, mgr2 = _mk_manager(agent="aria")
     with patch.object(type(mgr2), "enabled", property(lambda s: True)), \
          patch.object(disp2, "_owner_id", return_value="42"), \
          patch.object(disp2, "_store", return_value=fake_store):
-        assert mgr2.gate(_msg("555", "42"), "777", True) == "drop"
+        assert _run(mgr2.gate(_msg("555", "42"), "777", True)) == "drop"
 
 
 def test_gate_owner_answer_resumes_asker():
@@ -306,11 +352,12 @@ def test_gate_owner_answer_resumes_asker():
     fake_store._redis.return_value = r
     fake_store.get_chain = store.get_chain
     fake_store.save_chain = store.save_chain
+    fake_store.save_chain_guarded = store.save_chain_guarded
 
     disp, mgr = _mk_manager(agent="lexi")
     with patch.object(type(mgr), "enabled", property(lambda s: True)), \
          patch.object(disp, "_owner_id", return_value="42"), \
          patch.object(disp, "_store", return_value=fake_store):
-        assert mgr.gate(_msg("556", "42"), "777", True) == "steer"
+        assert _run(mgr.gate(_msg("556", "42"), "777", True)) == "steer"
     updated = store.get_chain(r, "6")
     assert updated["status"] == "working" and updated["waiting_on"] == ""
