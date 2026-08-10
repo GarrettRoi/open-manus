@@ -283,3 +283,44 @@ def test_failed_answer_injection_not_consumed(r, monkeypatch):
     asyncio.get_event_loop().run_until_complete(
         manager._question_tick(store, r, mgr))
     assert len(injected) == 1
+
+
+def test_charter_manager_stop_start_lifecycle(monkeypatch):
+    """Disconnect/reconnect: stop cancels the task and start() re-arms."""
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("REDIS_URL", "redis://fake")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    import asyncio
+
+    async def scenario():
+        manager = cm.CharterManager(adapter=MagicMock())
+        assert manager.enabled
+        manager.start()
+        task1 = manager._task
+        assert manager._started and task1 is not None
+        # idempotent while running
+        manager.start()
+        assert manager._task is task1
+
+        manager.stop()  # disconnect path
+        assert not manager._started and manager._task is None
+        await asyncio.sleep(0)
+        assert task1.cancelled() or task1.done()
+
+        manager.start()  # reconnect path
+        task2 = manager._task
+        assert manager._started and task2 is not None and task2 is not task1
+        manager.stop()
+        await asyncio.sleep(0)
+
+    asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_adapter_disconnect_stops_charter_manager():
+    """disconnect() must stop the charter manager (source-level guard)."""
+    import inspect
+    from plugins.platforms.discord import adapter as ad
+    src = inspect.getsource(ad.DiscordAdapter.disconnect)
+    assert "_charter_manager" in src and ".stop()" in src

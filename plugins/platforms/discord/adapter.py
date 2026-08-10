@@ -1518,6 +1518,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._taskboard_manager.stop()
             except Exception:
                 logger.debug("[%s] taskboard manager stop failed", self.name)
+        if self._charter_manager is not None:
+            try:
+                self._charter_manager.stop()
+            except Exception:
+                logger.debug("[%s] charter manager stop failed", self.name)
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
