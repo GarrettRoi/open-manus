@@ -2,6 +2,7 @@
 
 import json
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import fakeredis
@@ -398,3 +399,100 @@ def test_answer_delivery_ignores_kick_cooldown(r, monkeypatch):
     # exactly once
     loop.run_until_complete(manager._question_tick(store, r, mgr))
     assert len(injected) == 1
+
+
+# ----------------------------------------------------------------------
+# _inject_turn delivery acknowledgement (fire-and-forget handle_message)
+# ----------------------------------------------------------------------
+
+class _FakeAdapter:
+    """Mimics BasePlatformAdapter's fire-and-forget handle_message: spawns
+    the turn as a background task in _session_tasks and returns at once."""
+
+    def __init__(self, turn_coro_factory):
+        self._turn_coro_factory = turn_coro_factory
+        self._session_tasks = {}
+        self.config = types.SimpleNamespace(extra={})
+        self.turns_completed = 0
+
+    def build_source(self, **kw):
+        from gateway.platforms.base import MessageSource
+        return MessageSource(platform="discord", chat_id=kw["chat_id"],
+                             chat_type=kw.get("chat_type", "channel"),
+                             chat_name=kw.get("chat_name"),
+                             user_id=kw.get("user_id"),
+                             user_name=kw.get("user_name"))
+
+    async def handle_message(self, event):
+        import asyncio
+        from gateway.platforms.base import build_session_key
+        key = build_session_key(event.source, group_sessions_per_user=True,
+                                thread_sessions_per_user=False)
+        self._session_tasks[key] = asyncio.create_task(
+            self._turn_coro_factory(self))
+        # returns immediately — turn still running
+
+
+def test_inject_turn_awaits_real_turn_completion(monkeypatch):
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    async def turn(adapter):
+        await asyncio.sleep(0.05)
+        adapter.turns_completed += 1
+
+    adapter = _FakeAdapter(turn)
+    manager = cm.CharterManager(adapter=adapter)
+
+    async def scenario():
+        await manager._inject_turn("hello")
+        # ack means the turn actually finished before _inject_turn returned
+        assert adapter.turns_completed == 1
+
+    asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_inject_turn_raises_when_turn_fails(monkeypatch):
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    async def failing_turn(adapter):
+        raise RuntimeError("session conflict")
+
+    adapter = _FakeAdapter(failing_turn)
+    manager = cm.CharterManager(adapter=adapter)
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            await manager._inject_turn("hello")
+
+    asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_inject_turn_raises_when_not_scheduled(monkeypatch):
+    """Dropped/queued injection (no session task) must raise, not ack."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    adapter = _FakeAdapter(lambda a: None)
+
+    async def swallow(event):
+        return None  # queued/dropped — never registers a session task
+
+    adapter.handle_message = swallow
+    manager = cm.CharterManager(adapter=adapter)
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            await manager._inject_turn("hello")
+
+    asyncio.get_event_loop().run_until_complete(scenario())

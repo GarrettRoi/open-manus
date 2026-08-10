@@ -286,8 +286,19 @@ class CharterManager:
 
     # ------------------------------------------------------------------
     async def _inject_turn(self, text: str) -> None:
-        """Inject an internal MessageEvent keyed to the home channel."""
-        from gateway.platforms.base import MessageEvent, MessageType
+        """Inject an internal MessageEvent and wait for the turn to finish.
+
+        ``adapter.handle_message()`` is fire-and-forget — it spawns the turn
+        as a background task and returns immediately. Returning here without
+        an acknowledgement would let callers persist their durable markers
+        (applied rev / consumed flag) for a turn that never actually ran.
+        The charter uses a synthetic user ("charter"), so its session key is
+        private: the task registered under that key after handle_message()
+        is OUR injected turn. Await it (bounded) as the delivery ack; any
+        failure raises so the caller's deliver-then-mark ordering retries on
+        a later tick.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType, build_session_key
         source = self.adapter.build_source(
             chat_id=_home_channel_id(),
             chat_name="home",
@@ -301,4 +312,23 @@ class CharterManager:
             source=source,
             internal=True,
         )
+        cfg_extra = getattr(getattr(self.adapter, "config", None), "extra", {}) or {}
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=cfg_extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=cfg_extra.get("thread_sessions_per_user", False),
+        )
         await self.adapter.handle_message(event)
+        task = getattr(self.adapter, "_session_tasks", {}).get(session_key)
+        if task is None:
+            # Not scheduled (queued behind an unexpected active session or
+            # dropped) — treat as undelivered so the caller retries.
+            raise RuntimeError(
+                f"charter injection for {session_key} was not scheduled"
+            )
+        # Bounded wait: a wedged turn must not freeze the tick loop forever.
+        # shield() keeps the turn itself alive if we time out.
+        await asyncio.wait_for(asyncio.shield(task), timeout=15 * 60)
+        exc = task.exception() if task.done() else None
+        if exc is not None:
+            raise exc
