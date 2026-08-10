@@ -1,0 +1,210 @@
+"""Tests for the persistent goal charter store + owner-question queue."""
+
+import json
+import sys
+from unittest.mock import MagicMock, patch
+
+import fakeredis
+import pytest
+
+sys.modules.setdefault("discord", MagicMock())
+
+from tools import goal_charter as store
+
+
+@pytest.fixture
+def r():
+    return fakeredis.FakeRedis(decode_responses=True)
+
+
+# ----------------------------------------------------------------------
+# charter records
+# ----------------------------------------------------------------------
+
+def test_charter_roundtrip_and_rev_bump(r):
+    assert store.load_charter(r, "jade") is None
+    saved = store.save_charter(r, "jade", {
+        "objectives": ["Run Vows & Vinyl end to end"],
+        "phase": "discovery", "status": "active",
+    })
+    assert saved["rev"] == 1
+    loaded = store.load_charter(r, "jade")
+    assert loaded["objectives"] == ["Run Vows & Vinyl end to end"]
+    assert loaded["mandate"]  # default mandate filled in
+    saved2 = store.save_charter(r, "jade", loaded)
+    assert saved2["rev"] == 2
+
+
+def test_load_charter_rejects_empty_objectives(r):
+    r.set("goalcharter:v1:charter:jade", json.dumps({"objectives": []}))
+    assert store.load_charter(r, "jade") is None
+
+
+def test_charter_namespace_is_exclusive(r):
+    store.save_charter(r, "jade", {"objectives": ["x"]})
+    keys = r.keys("*")
+    assert all(k.startswith("goalcharter:v1:") for k in keys)
+
+
+# ----------------------------------------------------------------------
+# goal text render
+# ----------------------------------------------------------------------
+
+def test_render_goal_text_tagged_and_phased(r):
+    charter = store.save_charter(r, "jade", {
+        "objectives": ["Fast client responses"], "phase": "discovery",
+    })
+    text = store.render_goal_text("jade", charter)
+    assert store.is_charter_goal(text)
+    assert "Fast client responses" in text
+    assert "ask_owner" in text
+    assert "discovery" in text
+    charter["phase"] = "execution"
+    text2 = store.render_goal_text("jade", charter)
+    assert "execution" in text2 and "Phase 'execution'" in text2
+
+
+def test_is_charter_goal_rejects_manual_goal():
+    assert not store.is_charter_goal("build a rocket")
+    assert not store.is_charter_goal("")
+
+
+# ----------------------------------------------------------------------
+# question queue
+# ----------------------------------------------------------------------
+
+def test_question_lifecycle(r):
+    q = store.file_question(r, "jade", "Which DJ packages do we sell?")
+    assert q["id"] == 1 and q["status"] == "pending"
+    assert not q["posted"] and not q["consumed"]
+
+    pending = store.list_questions(r, "jade", status="pending")
+    assert [p["id"] for p in pending] == [1]
+
+    ans = store.answer_question(r, "jade", 1, "Three tiers: basic/plus/premium")
+    assert ans["status"] == "answered"
+    assert store.list_questions(r, "jade", status="pending") == []
+    assert store.list_questions(r, "jade", status="answered")[0]["answer"].startswith("Three tiers")
+
+    with pytest.raises(RuntimeError):
+        store.answer_question(r, "jade", 1, "again")
+    with pytest.raises(KeyError):
+        store.answer_question(r, "jade", 99, "nope")
+
+
+def test_file_question_caps_pending(r):
+    for i in range(store.QUESTIONS_OPEN_MAX):
+        store.file_question(r, "jade", f"q{i}")
+    with pytest.raises(RuntimeError):
+        store.file_question(r, "jade", "one too many")
+    # answering one frees a slot
+    store.answer_question(r, "jade", 1, "a")
+    store.file_question(r, "jade", "now it fits")
+
+
+def test_file_question_requires_text(r):
+    with pytest.raises(ValueError):
+        store.file_question(r, "jade", "   ")
+
+
+def test_ask_owner_tool_files_question(r, monkeypatch):
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    with patch.object(store, "_redis", return_value=r):
+        out = json.loads(store.ask_owner_tool({"question": "Who is our venue contact?"}))
+    assert out["ok"] and out["question_id"] == 1
+    assert store.list_questions(r, "jade", status="pending")
+
+
+# ----------------------------------------------------------------------
+# CharterManager pure logic
+# ----------------------------------------------------------------------
+
+def test_charter_manager_never_clobbers_manual_goal(r, monkeypatch):
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+    monkeypatch.setenv("REDIS_URL", "redis://fake")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+
+    mgr = MagicMock()
+    state = MagicMock()
+    state.status = "active"
+    state.goal = "manual goal typed by Garrett"
+    mgr.state = state
+
+    manager = cm.CharterManager(adapter=MagicMock())
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.set.assert_not_called()
+
+
+def test_charter_manager_arms_when_no_goal(r, monkeypatch):
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+
+    mgr = MagicMock()
+    mgr.state = None
+
+    manager = cm.CharterManager(adapter=MagicMock())
+    injected = []
+
+    async def fake_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = fake_inject
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.set.assert_called_once()
+    assert store.is_charter_goal(mgr.set.call_args[0][0])
+    assert injected and "standing mission" in injected[0]
+    # applied marker written → second tick is a no-op
+    mgr.reset_mock()
+    state = MagicMock()
+    state.status = "active"
+    state.goal = store.render_goal_text("jade", charter)
+    state.paused_reason = None
+    mgr.state = state
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.set.assert_not_called()
+
+
+def test_charter_manager_rearms_on_rev_change(r, monkeypatch):
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+    manager = cm.CharterManager(adapter=MagicMock())
+
+    async def fake_inject(text):
+        pass
+
+    manager._inject_turn = fake_inject
+
+    mgr = MagicMock()
+    mgr.state = None
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.set.assert_called_once()
+
+    # owner edits the charter → rev bumps → re-arm even though goal active
+    charter2 = store.save_charter(r, "jade", charter)
+    state = MagicMock()
+    state.status = "active"
+    state.goal = store.render_goal_text("jade", charter)
+    mgr.reset_mock()
+    mgr.state = state
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter2))
+    mgr.set.assert_called_once()

@@ -2462,6 +2462,110 @@ class GatewaySlashCommandsMixin:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"
 
+    async def _handle_charter_command(self, event: "MessageEvent") -> str:
+        """Handle /charter — owner controls for the persistent goal charter.
+
+        Subcommands: ``status`` (default) / ``pause`` / ``resume`` /
+        ``phase <discovery|execution>`` / ``set <objectives, one per line>`` /
+        ``questions`` / ``answer <id> <text>``.
+
+        The charter lives in Redis (fleet-shared) — the plugin-side
+        CharterManager reads it every tick, so edits here take effect within
+        a poll cycle without a restart. Control-plane only; never touches
+        the running turn.
+        """
+        try:
+            from tools import goal_charter as store
+            r = store._redis()
+        except Exception as exc:
+            return f"/charter unavailable: {exc}"
+        agent = store._agent_name()
+        args = (event.get_command_args() or "").strip()
+        tokens = args.split(None, 1)
+        verb = tokens[0].lower() if tokens else "status"
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        charter = store.load_charter(r, agent)
+
+        if verb in {"status", "show", ""}:
+            if charter is None:
+                return ("No charter set for this agent. Seed one with "
+                        "/charter set <objectives, one per line>.")
+            pending = store.list_questions(r, agent, status="pending")
+            lines = [
+                f"📜 Charter for **{agent}** — {charter.get('status')} "
+                f"(phase: {charter.get('phase')}, rev {charter.get('rev')})",
+            ]
+            lines += [f"• {o}" for o in charter.get("objectives", [])]
+            if charter.get("mandate"):
+                lines.append(f"-# {charter['mandate']}")
+            if pending:
+                lines.append(f"❓ {len(pending)} question(s) pending — /charter questions")
+            return "\n".join(lines)
+
+        if verb in {"pause", "resume"}:
+            if charter is None:
+                return "No charter set."
+            charter["status"] = "active" if verb == "resume" else "paused"
+            store.save_charter(r, agent, charter)
+            return f"{'▶' if verb == 'resume' else '⏸'} Charter {charter['status']}. Takes effect within a minute."
+
+        if verb == "phase":
+            if charter is None:
+                return "No charter set."
+            phase = rest.lower().strip()
+            if phase not in {"discovery", "execution"}:
+                return "Usage: /charter phase <discovery|execution>"
+            charter["phase"] = phase
+            store.save_charter(r, agent, charter)
+            return f"✓ Charter phase → {phase}. The goal re-arms within a minute."
+
+        if verb == "set":
+            if not rest:
+                return "Usage: /charter set <objectives — one per line or ';'-separated>"
+            parts = [p.strip(" -•\t") for p in rest.replace(";", "\n").splitlines()]
+            objectives = [p for p in parts if p]
+            if not objectives:
+                return "No objectives found in that text."
+            base = charter or {"phase": "discovery", "status": "active",
+                               "mandate": store.DEFAULT_MANDATE, "rev": 0}
+            base["objectives"] = objectives
+            base["status"] = "active"
+            saved = store.save_charter(r, agent, base)
+            return (f"✓ Charter updated (rev {saved['rev']}) with "
+                    f"{len(objectives)} objective(s). The goal re-arms within a minute.")
+
+        if verb in {"questions", "q"}:
+            qs = store.list_questions(r, agent)
+            if not qs:
+                return "No owner questions filed."
+            lines = []
+            for q in qs[-15:]:
+                icon = "❓" if q["status"] == "pending" else "✅"
+                lines.append(f"{icon} #{q['id']}: {q['question'][:160]}")
+                if q["status"] == "answered":
+                    lines.append(f"   ↳ {q['answer'][:160]}")
+            return "\n".join(lines)
+
+        if verb == "answer":
+            wtokens = rest.split(None, 1)
+            if len(wtokens) < 2:
+                return "Usage: /charter answer <id> <answer text>"
+            try:
+                qid = int(wtokens[0].lstrip("#"))
+            except ValueError:
+                return "/charter answer: <id> must be a number."
+            try:
+                rec = store.answer_question(r, agent, qid, wtokens[1])
+            except (KeyError, RuntimeError) as exc:
+                return f"/charter answer: {exc}"
+            return (f"✓ Answer recorded for #{rec['id']}. The agent picks it "
+                    "up and resumes within a minute.")
+
+        return ("Usage: /charter [status | pause | resume | phase "
+                "<discovery|execution> | set <objectives> | questions | "
+                "answer <id> <text>]")
+
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo [N] — back up N user turns (default 1), soft-deleting
         the truncated rows on disk and echoing the backed-up message text so

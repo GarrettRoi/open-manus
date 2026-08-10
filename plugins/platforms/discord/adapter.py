@@ -867,6 +867,17 @@ class DiscordAdapter(BasePlatformAdapter):
             self._taskboard_manager = _TaskBoardManager(self)
         except Exception:
             logger.exception("[%s] Failed to init taskboard manager", self.name)
+        # Persistent goal charter (arm/resume standing /goal from Redis +
+        # owner-question loop). Only active with REDIS_URL + home channel.
+        self._charter_manager = None
+        try:
+            try:
+                from charter import CharterManager as _CharterManager
+            except ImportError:
+                from .charter import CharterManager as _CharterManager
+            self._charter_manager = _CharterManager(self)
+        except Exception:
+            logger.exception("[%s] Failed to init charter manager", self.name)
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1125,6 +1136,13 @@ class DiscordAdapter(BasePlatformAdapter):
                         adapter_self._taskboard_manager.start()
                     except Exception:
                         logger.exception("[%s] taskboard manager start failed", adapter_self.name)
+                # Persistent goal charter: boot resume + owner-question loop
+                # (idempotent across reconnects).
+                if adapter_self._charter_manager is not None:
+                    try:
+                        adapter_self._charter_manager.start()
+                    except Exception:
+                        logger.exception("[%s] charter manager start failed", adapter_self.name)
 
             @self._client.event
             async def on_message(message: DiscordMessage):

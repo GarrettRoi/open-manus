@@ -9239,6 +9239,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
                 return await self._handle_subgoal_command(event)
 
+            # /charter is safe mid-run — it only reads/writes the Redis
+            # charter + question store; the CharterManager applies changes
+            # at its next poll tick, never mid-turn. Answering an owner
+            # question mid-run is often exactly what unblocks the agent.
+            if _cmd_def_inner and _cmd_def_inner.name == "charter":
+                return await self._handle_charter_command(event)
+
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -9777,6 +9784,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
+
+        if canonical == "charter":
+            return await self._handle_charter_command(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
