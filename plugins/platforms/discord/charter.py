@@ -255,7 +255,11 @@ class CharterManager:
                     logger.debug("[%s] charter: wait refresh failed", self.agent,
                                  exc_info=True)
 
-        if fresh_answers and await self._kick_allowed(r):
+        # Owner answers are delivered promptly, NOT gated on the kick
+        # cooldown: they are owner-initiated (rate-limited by Garrett
+        # himself) and cannot feed a restart loop. The cooldown exists to
+        # stop boot/re-arm kickoffs from re-firing every crash cycle.
+        if fresh_answers:
             # Clear OUR barrier (only ours) and hand the answers to the agent.
             if goal_active and mgr.is_waiting() and \
                     (state.waiting_reason or "").startswith(WAIT_REASON_PREFIX):

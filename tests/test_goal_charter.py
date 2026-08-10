@@ -368,7 +368,9 @@ def test_kick_cooldown_throttles_rearm(r, monkeypatch):
     assert len(injected) == 2
 
 
-def test_kick_cooldown_defers_answer_delivery(r, monkeypatch):
+def test_answer_delivery_ignores_kick_cooldown(r, monkeypatch):
+    """An owner answer filed right after a kickoff resumes on the NEXT tick —
+    it must not wait out the 10-minute kick cooldown."""
     from plugins.platforms.discord import charter as cm
 
     monkeypatch.setenv("AGENT_NAME", "jade")
@@ -391,10 +393,8 @@ def test_kick_cooldown_defers_answer_delivery(r, monkeypatch):
     import asyncio
     loop = asyncio.get_event_loop()
     loop.run_until_complete(manager._question_tick(store, r, mgr))
-    assert injected == []  # deferred, not lost
-    assert not store.get_question(r, "jade", 1)["consumed"]
-
-    r.set("goalcharter:v1:lastkick:jade", "0")
+    assert len(injected) == 1 and "a" in injected[0]
+    assert store.get_question(r, "jade", 1)["consumed"]
+    # exactly once
     loop.run_until_complete(manager._question_tick(store, r, mgr))
     assert len(injected) == 1
-    assert store.get_question(r, "jade", 1)["consumed"]
