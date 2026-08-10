@@ -199,6 +199,8 @@ def test_charter_manager_rearms_on_rev_change(r, monkeypatch):
     mgr.set.assert_called_once()
 
     # owner edits the charter → rev bumps → re-arm even though goal active
+    # (clear the kick cooldown so this test exercises rev logic, not throttle)
+    r.set("goalcharter:v1:lastkick:jade", "0")
     charter2 = store.save_charter(r, "jade", charter)
     state = MagicMock()
     state.status = "active"
