@@ -208,3 +208,78 @@ def test_charter_manager_rearms_on_rev_change(r, monkeypatch):
     asyncio.get_event_loop().run_until_complete(
         manager._ensure_goal_armed(store, r, mgr, charter2))
     mgr.set.assert_called_once()
+
+
+def test_failed_kickoff_injection_retries_next_tick(r, monkeypatch):
+    """Applied marker must not persist when the kickoff turn fails."""
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+    manager = cm.CharterManager(adapter=MagicMock())
+
+    async def failing_inject(text):
+        raise RuntimeError("home channel down")
+
+    manager._inject_turn = failing_inject
+    mgr = MagicMock()
+    mgr.state = None
+    import asyncio
+    with pytest.raises(RuntimeError):
+        asyncio.get_event_loop().run_until_complete(
+            manager._ensure_goal_armed(store, r, mgr, charter))
+    assert r.get("goalcharter:v1:applied:jade") is None  # marker not written
+
+    # next tick: injection recovers → marker written
+    injected = []
+
+    async def ok_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = ok_inject
+    asyncio.get_event_loop().run_until_complete(
+        manager._ensure_goal_armed(store, r, mgr, charter))
+    assert injected and r.get("goalcharter:v1:applied:jade") == "1"
+
+
+def test_failed_answer_injection_not_consumed(r, monkeypatch):
+    """Answers must stay unconsumed (retryable) when injection fails."""
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    store.file_question(r, "jade", "which venues?")
+    store.answer_question(r, "jade", 1, "the usual three")
+
+    manager = cm.CharterManager(adapter=MagicMock())
+
+    async def failing_inject(text):
+        raise RuntimeError("adapter down")
+
+    manager._inject_turn = failing_inject
+    mgr = MagicMock()
+    mgr.state = None
+    import asyncio
+    with pytest.raises(RuntimeError):
+        asyncio.get_event_loop().run_until_complete(
+            manager._question_tick(store, r, mgr))
+    assert not store.get_question(r, "jade", 1)["consumed"]
+
+    # recovery tick: delivered exactly once, then consumed
+    injected = []
+
+    async def ok_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = ok_inject
+    asyncio.get_event_loop().run_until_complete(
+        manager._question_tick(store, r, mgr))
+    assert len(injected) == 1 and "the usual three" in injected[0]
+    assert store.get_question(r, "jade", 1)["consumed"]
+    # a further tick injects nothing new
+    asyncio.get_event_loop().run_until_complete(
+        manager._question_tick(store, r, mgr))
+    assert len(injected) == 1

@@ -166,8 +166,10 @@ class CharterManager:
         except ValueError as exc:
             logger.warning("[%s] charter: goal set rejected: %s", self.agent, exc)
             return
-        await asyncio.to_thread(r.set, applied_key, rev)
-        logger.info("[%s] charter: goal armed (rev %s)", self.agent, rev)
+        # Inject the kickoff turn BEFORE finalizing the applied marker: if
+        # delivery fails (adapter/home channel hiccup) the next tick re-arms
+        # and retries instead of leaving a goal that never takes a turn.
+        # mgr.set() is safe to repeat — it just resets the same goal text.
         await self._inject_turn(
             "[Charter] Your standing mission was (re)armed after a restart or "
             "charter update:\n\n" + rendered +
@@ -176,6 +178,8 @@ class CharterManager:
             "new. If you are in the discovery phase, file information gaps "
             "with the ask_owner tool.]"
         )
+        await asyncio.to_thread(r.set, applied_key, rev)
+        logger.info("[%s] charter: goal armed (rev %s)", self.agent, rev)
 
     # ------------------------------------------------------------------
     async def _question_tick(self, store, r, mgr) -> None:
@@ -225,15 +229,18 @@ class CharterManager:
                 lines.append(f"Q#{q['id']}: {q['question']}")
                 lines.append(f"A: {q['answer']}")
                 lines.append("")
-                q["consumed"] = True
-                await asyncio.to_thread(store.save_question, r, self.agent, q)
             lines.append(
                 "[Fold these answers into your understanding of the business "
                 "(update your notes/memory), then continue your standing "
                 "mission. If everything you needed for the discovery phase is "
                 "now answered, move on to execution.]"
             )
+            # Deliver FIRST, then mark consumed — a failed injection must be
+            # retried on the next tick, never silently swallow an answer.
             await self._inject_turn("\n".join(lines))
+            for q in fresh_answers:
+                q["consumed"] = True
+                await asyncio.to_thread(store.save_question, r, self.agent, q)
 
     # ------------------------------------------------------------------
     async def _inject_turn(self, text: str) -> None:
