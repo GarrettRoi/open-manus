@@ -388,6 +388,34 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
 )
 
 
+# Pause reason set on an active goal when a turn ends in a provider-error
+# envelope. The charter manager treats this reason as auto-resumable (under
+# its kick cooldown), so standing goals self-heal once the provider recovers.
+GOAL_PROVIDER_PAUSE_REASON = "model provider failing"
+
+# Sanitized provider-failure replies produced by _gateway_provider_error_reply.
+# The raw-envelope detector below doesn't match these (they're user-safe
+# rewrites, not provider text), but the goal loop must treat them as provider
+# failures too — depending on the call path, the final response may already
+# be sanitized.
+_GATEWAY_SANITIZED_PROVIDER_ERROR_PREFIXES = (
+    "⚠️ The model provider failed after retries.",
+    "⚠️ Provider authentication failed.",
+    "⚠️ The model provider rejected the request.",
+    "⏱️ The model provider is rate-limiting requests.",
+)
+
+
+def _is_provider_failure_response(text: str) -> bool:
+    """True for raw provider-error envelopes AND sanitized gateway rewrites."""
+    body = str(text or "").strip()
+    if not body:
+        return False
+    if body.startswith(_GATEWAY_SANITIZED_PROVIDER_ERROR_PREFIXES):
+        return True
+    return _looks_like_gateway_provider_error(body)
+
+
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is infrastructure/provider failure, not normal content.
 
@@ -12442,6 +12470,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         if not mgr.is_active():
+            return
+
+        # Provider failure guard: when the turn's final response is a
+        # provider-error envelope (credits exhausted, auth failure, rate
+        # limit ...), the model produced nothing — judging it and enqueuing
+        # a continuation just burns the turn budget and spams the channel
+        # with one error + one "Continuing toward goal" line per tick.
+        # Pause the goal instead; the charter manager re-arms provider
+        # pauses under its kick cooldown, so the goal self-heals once the
+        # provider recovers (at most one probe per cooldown window).
+        if _is_provider_failure_response(final_response or ""):
+            mgr.pause(reason=GOAL_PROVIDER_PAUSE_REASON)
+            notice = (
+                "⏸ Goal paused — the model provider is failing (see gateway "
+                "logs). It will retry automatically once the provider recovers."
+            )
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, notice)
             return
 
         try:

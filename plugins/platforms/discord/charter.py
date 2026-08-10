@@ -194,13 +194,16 @@ class CharterManager:
         if goal_active and applied_rev == rev:
             # Resume a goal the engine auto-paused (budget) so the standing
             # mission keeps going; owner pauses go through charter status.
-            # Resume goals WE paused: the engine's own turn-budget pause and
+            # Resume goals WE (or the engine) paused: turn-budget pauses,
             # the owner's /charter pause (charter status is back to active
-            # here, so the owner has un-paused). Any other pause reason means
+            # here, so the owner has un-paused), and provider-failure pauses
+            # (retried under the kick cooldown so a dead provider costs at
+            # most one probe per window). Any other pause reason means
             # someone else paused the goal — leave it alone.
             if (state.status == "paused"
                     and ((state.paused_reason or "").startswith("turn budget")
-                         or (state.paused_reason or "") == "charter paused by owner")):
+                         or (state.paused_reason or "") == "charter paused by owner"
+                         or (state.paused_reason or "").startswith("model provider failing"))):
                 if not await self._kick_allowed(r):
                     return
                 mgr.resume()

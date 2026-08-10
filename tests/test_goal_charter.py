@@ -3,7 +3,7 @@
 import json
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis
 import pytest
@@ -707,3 +707,37 @@ def test_question_post_failure_retries(r, monkeypatch):
     # posted questions are not re-sent
     loop.run_until_complete(manager._question_tick(store, r, mgr))
     assert len(sent) == 1
+
+
+def test_charter_resumes_provider_failure_pause(r, monkeypatch):
+    """A goal paused for 'model provider failing' is retried under cooldown."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+    manager = cm.CharterManager(adapter=MagicMock())
+    manager._inject_turn = AsyncMock()
+    loop = asyncio.get_event_loop()
+
+    mgr = MagicMock()
+    mgr.state = None
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    rendered = mgr.set.call_args[0][0]
+
+    state = MagicMock()
+    state.status = "paused"
+    state.goal = rendered
+    state.paused_reason = "model provider failing"
+    mgr.reset_mock()
+    mgr.state = state
+
+    # cooldown active right after arm → no resume yet (at most one probe/window)
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_not_called()
+
+    r.set("goalcharter:v1:lastkick:jade", "0")
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_called_once()

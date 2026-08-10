@@ -219,3 +219,35 @@ async def test_goal_verdict_survives_adapter_without_send(hermes_home):
             final_response="whatever",
         )
         await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_goal_provider_error_pauses_instead_of_continuing(hermes_home):
+    """A provider-error final response must pause the goal (no judge, no
+    continuation, no per-turn spam) so a dead provider can't loop the goal."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id, default_max_turns=20)
+    mgr.set("standing mission")
+
+    with patch("hermes_cli.goals.judge_goal") as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response=(
+                "⚠️ The model provider failed after retries. I kept raw "
+                "provider details out of chat; check gateway logs for diagnostics."
+            ),
+        )
+        await asyncio.sleep(0.05)
+        judge.assert_not_called()
+
+    state = GoalManager(session_entry.session_id).state
+    assert state.status == "paused"
+    assert state.paused_reason.startswith("model provider failing")
+    assert not adapter._pending_messages, "no continuation may be enqueued"
+    # exactly one pause notice, not a per-turn error+continue pair
+    assert len(adapter.sends) == 1
+    assert "Goal paused" in adapter.sends[0]["content"]
