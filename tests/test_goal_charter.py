@@ -416,8 +416,9 @@ class _FakeAdapter:
         self.turns_completed = 0
 
     def build_source(self, **kw):
-        from gateway.platforms.base import MessageSource
-        return MessageSource(platform="discord", chat_id=kw["chat_id"],
+        from gateway.platforms.base import SessionSource
+        from gateway.session import Platform
+        return SessionSource(platform=Platform.DISCORD, chat_id=kw["chat_id"],
                              chat_type=kw.get("chat_type", "channel"),
                              chat_name=kw.get("chat_name"),
                              user_id=kw.get("user_id"),
