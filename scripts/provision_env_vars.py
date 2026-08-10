@@ -162,7 +162,7 @@ AGENT_VARS = {
         # Social media management
         "POSTIZ_URL": "https://postiz-production-14aa.up.railway.app",
         "POSTIZ_EMAIL": "sanctusmm@gmail.com",
-        "POSTIZ_API_KEY": "f7f1a1569d2e7714afb7c1c9694b8ed7342eb76ff26cc3095f7c723844168ea3",
+        "POSTIZ_API_KEY": os.environ.get("POSTIZ_API_KEY", ""),
         "AGENT_ROLE": "social_media_manager",
         "AGENT_CAPABILITIES": "social_media,content_scheduling,postiz,brand_content",
         "BRAND_FOCUS": "vows_vinyl,cana_collective,mcgarry_homes",

@@ -118,7 +118,7 @@ class DispatchManager:
     async def _publish_roster(self) -> None:
         """Publish this agent's roster entry, then refresh periodically so it
         never TTLs out while the agent is alive."""
-        first = True
+        boot_republishes = [180, 240]  # extra publishes at ~3min and ~7min
         while True:
             try:
                 await self._publish_roster_once()
@@ -126,12 +126,12 @@ class DispatchManager:
                 raise
             except Exception:
                 logger.exception("[%s] dispatch roster publish failed", self.agent)
-            if first:
-                # Re-publish once shortly after boot: the first publish races
-                # the vault grant sync, so vault_* tools are usually still
-                # missing from the registry at that point.
-                first = False
-                await asyncio.sleep(180)
+            if boot_republishes:
+                # Re-publish a few times shortly after boot: the first
+                # publish races the vault grant sync (default refresh 300s),
+                # so vault_* tools are usually still missing from the
+                # registry at that point.
+                await asyncio.sleep(boot_republishes.pop(0))
                 continue
             await asyncio.sleep(6 * 3600)
 
