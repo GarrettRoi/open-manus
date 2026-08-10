@@ -1,62 +1,40 @@
-# Agent Communication Protocol — Anti-Death-Spiral Rules
+# Agent Communication Protocol
 
-## The Core Problem
-When agents @mention each other in Discord, they trigger each other's LLM response loop.
-This creates infinite acknowledgment chains: "Got it" → "I see you got it" → "Yes I see you see I got it" → ...
+> **Authoritative fleet rule:** use the native `agent_dispatch` tool for all
+> live agent-to-agent communication. Read
+> `/app/skills/harmony_communication/SKILL.md` for the complete protocol.
 
-## The Solution: Async Task Dispatch (No @Mentions Between Agents)
+## System boundaries
 
-### Rule 1: NEVER @mention another agent
-- You may ONLY @mention Harmony (`<@1481029359757299922>`) and ONLY in `#harmony-communication`
-- You may NEVER @mention other worker agents (Cora, Samantha, Raven, etc.)
-- Garrett always bypasses this rule — always respond to Garrett
+1. **`agent_dispatch` is the only communication bus.** It creates a Redis-backed
+   chain, injects the assignee's turn, and mirrors the chain to a Discord
+   thread.
+2. **Discord dispatch threads are an audit surface, not a chat room.** Agents
+   use the tool for dispatch, working, questions, answers, completion, and
+   cancellation. They do not post instructions or acknowledgements there.
+3. **Task-board threads are read-only mirrors.** They show state and updates;
+   posting there never delegates work and must not trigger a response.
+4. **Hive Mind is memory, not messaging.** Use it for reusable lessons only.
+5. **Webhooks, `inter_agent_comm`, `n8n_task_dispatcher`, and `[REQUEST]`,
+   `[NOTIFY]`, `[END]`, and `[BLOCKED]` tag workflows are retired.** Do not
+   use them as fallbacks.
 
-### Rule 2: Use the Task Dispatcher for all cross-agent communication
-Instead of @mentioning, use the task dispatcher tool:
+## Minimal protocol
 
-```bash
-# Report completion to Harmony (NO Discord message, just Redis queue)
-python3 /app/skills/hive_mind/n8n_task_dispatcher.py complete \
-    --task-id "TASK-001" \
-    --result "Completed. Files at /workspace/output/" \
-    --from "[your_name]"
-
-# Report a blocker to Harmony
-python3 /app/skills/hive_mind/n8n_task_dispatcher.py blocked \
-    --task-id "TASK-001" \
-    --reason "Need Garrett's approval on color palette" \
-    --from "[your_name]"
+```text
+agent_dispatch(action="dispatch", to="<agent>", task="<self-contained task>")
+agent_dispatch(action="working", chain_id="<id>")
+agent_dispatch(action="question", chain_id="<id>", to="owner", text="<question>")
+agent_dispatch(action="answer", chain_id="<id>", text="<answer>")
+agent_dispatch(action="complete", chain_id="<id>", text="<result>", success=true)
 ```
 
-### Rule 3: [END] tag = STOP. No reply expected, no reply given.
-When you see `[END]` in a message, it means the task is done.
-- Do NOT reply with "Great job!" or "Thanks for the update!"
-- React with ✅ emoji only
-- Update the task board silently
+Use `status`, `list`, and `roster` for inspection; use `cancel` only for
+intentional cancellation. If `agent_dispatch` is unavailable, report the
+configuration problem rather than silently switching buses.
 
-### Rule 4: [NOTIFY] tag = Read-only. No reply.
-- React with 👀 emoji only
-- Do NOT reply
+## Historical note
 
-### Rule 5: [REQUEST] tag = ONE response only
-- Respond ONCE with your acknowledgment + plan
-- Then go work in your home channel
-- Do NOT send progress updates to #harmony-communication unless asked
-- When done, use the task dispatcher (Rule 2) or send `[END]` ONCE
-
-### Rule 6: Harmony checks Redis inbox, not Discord
-Harmony's cron job checks the Redis task board every 30 minutes.
-You do NOT need to ping Harmony in Discord when you finish a task.
-The task dispatcher handles it automatically.
-
-## Message Tag Quick Reference
-
-| Tag | Sender | Receiver Action | Reply? |
-|-----|--------|-----------------|--------|
-| `[REQUEST]` | Harmony | Acknowledge + work | Once only |
-| `[END]` | Any agent | React ✅, update board | NEVER |
-| `[NOTIFY]` | Any agent | React 👀 | NEVER |
-| `[BLOCKED]` | Any agent | Harmony investigates | Harmony only |
-
-## The Golden Rule
-**If you're about to type a message that starts with "I see that you..." or "Got it, I'll..." or "Understood, I will..." — STOP. Use the task dispatcher instead.**
+Older deployments used Discord tags, webhooks, and separate Redis inbox
+scripts. Those paths are retained only so historical messages and old files
+remain understandable. They are not part of the current protocol.
