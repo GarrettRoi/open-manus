@@ -497,3 +497,75 @@ def test_inject_turn_raises_when_not_scheduled(monkeypatch):
             await manager._inject_turn("hello")
 
     asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_inject_turn_refuses_busy_charter_session(monkeypatch):
+    """A still-running prior turn must defer injection, not ack the old task."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    async def slow_turn(adapter):
+        await asyncio.sleep(5)
+
+    adapter = _FakeAdapter(slow_turn)
+    manager = cm.CharterManager(adapter=adapter)
+    handled = []
+
+    async def scenario():
+        # occupy the charter session with a running task
+        from gateway.platforms.base import MessageEvent, MessageType
+        src = adapter.build_source(chat_id="42", chat_name="home",
+                                   chat_type="channel", user_id="charter",
+                                   user_name="charter")
+        ev = MessageEvent(text="first", message_type=MessageType.TEXT,
+                          source=src, internal=True)
+        await adapter.handle_message(ev)
+        orig_handle = adapter.handle_message
+
+        async def counting_handle(event):
+            handled.append(event)
+            await orig_handle(event)
+
+        adapter.handle_message = counting_handle
+        with pytest.raises(RuntimeError, match="busy"):
+            await manager._inject_turn("second")
+        # refused BEFORE calling handle_message — never queued/merged
+        assert handled == []
+        for t in adapter._session_tasks.values():
+            t.cancel()
+
+    asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_inject_turn_requires_new_task_not_prev(monkeypatch):
+    """If handle_message leaves the previous (done) task in place — event
+    queued/merged/dropped — the ack must fail, not reuse the old task."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    async def turn(adapter):
+        adapter.turns_completed += 1
+
+    adapter = _FakeAdapter(turn)
+    manager = cm.CharterManager(adapter=adapter)
+
+    async def scenario():
+        # first injection succeeds and leaves a completed task under the key
+        await manager._inject_turn("first")
+        assert adapter.turns_completed == 1
+
+        async def swallow(event):
+            return None  # queued/dropped — no new task registered
+
+        adapter.handle_message = swallow
+        with pytest.raises(RuntimeError, match="not scheduled"):
+            await manager._inject_turn("second")
+        assert adapter.turns_completed == 1
+
+    asyncio.get_event_loop().run_until_complete(scenario())

@@ -318,11 +318,21 @@ class CharterManager:
             group_sessions_per_user=cfg_extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=cfg_extra.get("thread_sessions_per_user", False),
         )
+        session_tasks = getattr(self.adapter, "_session_tasks", {})
+        # If a previous turn on the charter session is still running,
+        # handle_message would QUEUE this event instead of scheduling it —
+        # and completion of the old task is not delivery of ours. Refuse up
+        # front; durable markers stay unset and the next tick retries.
+        prev = session_tasks.get(session_key)
+        if prev is not None and not prev.done():
+            raise RuntimeError(
+                f"charter session {session_key} busy; deferring injection"
+            )
         await self.adapter.handle_message(event)
-        task = getattr(self.adapter, "_session_tasks", {}).get(session_key)
-        if task is None:
-            # Not scheduled (queued behind an unexpected active session or
-            # dropped) — treat as undelivered so the caller retries.
+        task = session_tasks.get(session_key)
+        if task is None or task is prev:
+            # No NEW task appeared for our event: it was queued, merged, or
+            # dropped — treat as undelivered so the caller retries.
             raise RuntimeError(
                 f"charter injection for {session_key} was not scheduled"
             )
