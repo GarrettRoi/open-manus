@@ -121,19 +121,33 @@ class CharterManager:
         await self._question_tick(store, r, mgr)
 
     # ------------------------------------------------------------------
+    def _charter_source(self):
+        """The ONE source identity for everything the charter does.
+
+        Session contract: the standing charter runs in a dedicated session
+        keyed by the home channel + the synthetic user ``charter`` (channel
+        sessions are per-user by default). The goal manager lookup and every
+        injected turn use THIS source, so the goal that gets armed and the
+        turns that drive it live in the exact same session — while Garrett's
+        own messages in the channel (his user_id) map to a different session,
+        which is why a charter can never collide with an owner-typed /goal
+        mid-conversation.
+        """
+        return self.adapter.build_source(
+            chat_id=_home_channel_id(),
+            chat_name="home",
+            chat_type="channel",
+            user_id="charter",
+            user_name="charter",
+        )
+
     def _goal_manager(self, runner):
-        """GoalManager bound to the home-channel session (or None)."""
+        """GoalManager bound to the charter session (or None)."""
         try:
             from gateway.platforms.base import MessageEvent, MessageType
-            source = self.adapter.build_source(
-                chat_id=_home_channel_id(),
-                chat_name="home",
-                chat_type="channel",
-                user_id="charter",
-                user_name="charter",
-            )
             event = MessageEvent(
-                text="", message_type=MessageType.TEXT, source=source, internal=True,
+                text="", message_type=MessageType.TEXT,
+                source=self._charter_source(), internal=True,
             )
             mgr, _entry = runner._get_goal_manager_for_event(event)
             return mgr
@@ -299,13 +313,7 @@ class CharterManager:
         a later tick.
         """
         from gateway.platforms.base import MessageEvent, MessageType, build_session_key
-        source = self.adapter.build_source(
-            chat_id=_home_channel_id(),
-            chat_name="home",
-            chat_type="channel",
-            user_id="charter",
-            user_name="charter",
-        )
+        source = self._charter_source()
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,

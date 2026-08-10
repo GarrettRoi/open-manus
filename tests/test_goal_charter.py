@@ -569,3 +569,50 @@ def test_inject_turn_requires_new_task_not_prev(monkeypatch):
         assert adapter.turns_completed == 1
 
     asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_charter_session_identity_contract(monkeypatch):
+    """Integration (real key functions): the goal-manager lookup and every
+    injected turn resolve to the SAME session key, and that key differs from
+    the owner's session in the same channel — so the armed goal, kickoffs,
+    and answers all land in one dedicated charter session that never
+    collides with Garrett's own conversation."""
+    from plugins.platforms.discord import charter as cm
+    from gateway.session import Platform, SessionSource, build_session_key
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    captured = []
+
+    class _SourceAdapter:
+        config = types.SimpleNamespace(extra={})
+
+        def build_source(self, **kw):
+            src = SessionSource(platform=Platform.DISCORD,
+                                chat_id=kw["chat_id"],
+                                chat_type=kw.get("chat_type", "channel"),
+                                chat_name=kw.get("chat_name"),
+                                user_id=kw.get("user_id"),
+                                user_name=kw.get("user_name"))
+            captured.append(src)
+            return src
+
+    manager = cm.CharterManager(adapter=_SourceAdapter())
+    s1 = manager._charter_source()   # used by _goal_manager
+    s2 = manager._charter_source()   # used by _inject_turn
+
+    # gateway SessionStore._generate_session_key and adapter handle_message
+    # both delegate to build_session_key(source, ...) — same pure function
+    k1 = build_session_key(s1, group_sessions_per_user=True,
+                           thread_sessions_per_user=False)
+    k2 = build_session_key(s2, group_sessions_per_user=True,
+                           thread_sessions_per_user=False)
+    assert k1 == k2
+
+    owner = SessionSource(platform=Platform.DISCORD, chat_id="42",
+                          chat_type="channel", user_id="garrett-user-id",
+                          user_name="Garrett")
+    k_owner = build_session_key(owner, group_sessions_per_user=True,
+                                thread_sessions_per_user=False)
+    assert k_owner != k1  # owner conversation is a separate session
