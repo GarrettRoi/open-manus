@@ -1,4 +1,9 @@
-# Inter-Agent Communication Skill
+# Legacy Inter-Agent Communication Skill
+
+> **RETIRED.** Do not use this skill for new work. The fleet's only live
+> agent-to-agent communication mechanism is the native `agent_dispatch` tool.
+> See `/app/skills/harmony_communication/SKILL.md`. This file remains only as
+> historical documentation while old deployments are retired.
 
 This skill enables agents to communicate with each other through a shared Redis message bus. Use this to delegate tasks to other agents, request information, or report status.
 

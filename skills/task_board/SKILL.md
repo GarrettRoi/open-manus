@@ -1,5 +1,11 @@
 # Task Board — Persistent Task Tracking for Open Manus
 
+> **Boundary:** this is task state, not live communication. The canonical
+> agent-to-agent communication mechanism is the native `agent_dispatch` tool
+> (`/app/skills/harmony_communication/SKILL.md`). Do not use task-board
+> commands to notify an agent, and do not post instructions in the automatic
+> per-agent Discord board threads.
+
 This skill provides a shared task board backed by Redis. Harmony uses it to track delegated work across all agents, and agents use it to report progress and completion.
 
 ## When to Use

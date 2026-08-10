@@ -1,4 +1,9 @@
-# Webhook Communication: Cross-Channel Orchestration
+# Retired Webhook Communication: Cross-Channel Orchestration
+
+> **RETIRED.** Do not use `webhook_comm.py` for new work. Use the native
+> `agent_dispatch` tool and read `/app/skills/harmony_communication/SKILL.md`.
+> This file is retained only to explain why old webhook messages may exist in
+> historical logs.
 
 The **Webhook Communication** tool allows agents to communicate across their private Discord channels without creating chat "doom loops." All communications are automatically logged to the `#harmony-communication` channel for a full team audit trail.
 
