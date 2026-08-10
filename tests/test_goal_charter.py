@@ -324,3 +324,75 @@ def test_adapter_disconnect_stops_charter_manager():
     from plugins.platforms.discord import adapter as ad
     src = inspect.getsource(ad.DiscordAdapter.disconnect)
     assert "_charter_manager" in src and ".stop()" in src
+
+
+def test_kick_cooldown_throttles_rearm(r, monkeypatch):
+    """A restart within the cooldown window must NOT re-kick the goal."""
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+    manager = cm.CharterManager(adapter=MagicMock())
+    injected = []
+
+    async def ok_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = ok_inject
+    mgr = MagicMock()
+    mgr.state = None
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    assert len(injected) == 1
+    assert r.get("goalcharter:v1:lastkick:jade") is not None
+
+    # simulate a crash-loop restart: applied marker wiped locally is
+    # irrelevant (it's in Redis), but even a rev bump within the cooldown
+    # must not inject again
+    charter2 = store.save_charter(r, "jade", charter)
+    mgr.reset_mock()
+    mgr.state = None
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter2))
+    mgr.set.assert_not_called()
+    assert len(injected) == 1
+
+    # cooldown elapsed → re-arm proceeds
+    r.set("goalcharter:v1:lastkick:jade", "0")
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter2))
+    mgr.set.assert_called_once()
+    assert len(injected) == 2
+
+
+def test_kick_cooldown_defers_answer_delivery(r, monkeypatch):
+    from plugins.platforms.discord import charter as cm
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    store.file_question(r, "jade", "q?")
+    store.answer_question(r, "jade", 1, "a")
+    import time as _time
+    r.set("goalcharter:v1:lastkick:jade", str(_time.time()))  # just kicked
+
+    manager = cm.CharterManager(adapter=MagicMock())
+    injected = []
+
+    async def ok_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = ok_inject
+    mgr = MagicMock()
+    mgr.state = None
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(manager._question_tick(store, r, mgr))
+    assert injected == []  # deferred, not lost
+    assert not store.get_question(r, "jade", 1)["consumed"]
+
+    r.set("goalcharter:v1:lastkick:jade", "0")
+    loop.run_until_complete(manager._question_tick(store, r, mgr))
+    assert len(injected) == 1
+    assert store.get_question(r, "jade", 1)["consumed"]

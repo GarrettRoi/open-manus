@@ -34,6 +34,10 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = float(os.getenv("CHARTER_POLL_SECONDS", "60"))
+# Minimum spacing between charter-initiated goal turns (kickoffs, answer
+# deliveries). Redis-backed so it survives restarts — this is what stops a
+# crash/redeploy loop from re-kicking the goal on every boot.
+KICK_COOLDOWN_SECONDS = float(os.getenv("CHARTER_KICK_COOLDOWN_SECONDS", "600"))
 WAIT_HORIZON_SECONDS = 6 * 3600   # park window; refreshed while questions pend
 WAIT_REASON_PREFIX = "awaiting owner answers (ask_owner)"
 
@@ -137,6 +141,30 @@ class CharterManager:
             logger.exception("[%s] charter: goal manager lookup failed", self.agent)
             return None
 
+    async def _kick_allowed(self, r) -> bool:
+        """True when the per-agent injection cooldown has elapsed.
+
+        The timestamp lives in Redis (``goalcharter:v1:lastkick:<agent>``),
+        NOT in process memory: a restart loop (crash → redeploy → boot) must
+        not reset the clock, or every boot re-kicks the goal and feeds the
+        loop. When cooling down we simply skip the injection this tick; the
+        durable state (applied marker / consumed flag) is not advanced, so
+        the next tick past the cooldown retries.
+        """
+        from tools import goal_charter as store
+        key = store._k("lastkick", self.agent)
+        last = await asyncio.to_thread(r.get, key)
+        try:
+            last_ts = float(last) if last else 0.0
+        except (TypeError, ValueError):
+            last_ts = 0.0
+        return (time.time() - last_ts) >= KICK_COOLDOWN_SECONDS
+
+    async def _record_kick(self, r) -> None:
+        from tools import goal_charter as store
+        key = store._k("lastkick", self.agent)
+        await asyncio.to_thread(r.set, key, str(time.time()))
+
     async def _ensure_goal_armed(self, store, r, mgr, charter: Dict[str, Any]) -> None:
         rendered = store.render_goal_text(self.agent, charter)
         applied_key = store._k("applied", self.agent)
@@ -154,13 +182,21 @@ class CharterManager:
             # mission keeps going; owner pauses go through charter status.
             if (state.status == "paused"
                     and (state.paused_reason or "").startswith("turn budget")):
+                if not await self._kick_allowed(r):
+                    return
                 mgr.resume()
                 await self._inject_turn(
                     "[Charter] Turn budget refreshed — continue your standing "
                     "mission. Review your goal and take the next concrete step."
                 )
+                await self._record_kick(r)
             return
 
+        # Throttle: at most one charter kickoff per cooldown window, tracked
+        # in Redis so restart loops can't re-kick on every boot. Skipping
+        # here leaves the applied marker unset, so a later tick retries.
+        if not await self._kick_allowed(r):
+            return
         try:
             mgr.set(rendered)
         except ValueError as exc:
@@ -179,6 +215,7 @@ class CharterManager:
             "with the ask_owner tool.]"
         )
         await asyncio.to_thread(r.set, applied_key, rev)
+        await self._record_kick(r)
         logger.info("[%s] charter: goal armed (rev %s)", self.agent, rev)
 
     # ------------------------------------------------------------------
@@ -218,7 +255,7 @@ class CharterManager:
                     logger.debug("[%s] charter: wait refresh failed", self.agent,
                                  exc_info=True)
 
-        if fresh_answers:
+        if fresh_answers and await self._kick_allowed(r):
             # Clear OUR barrier (only ours) and hand the answers to the agent.
             if goal_active and mgr.is_waiting() and \
                     (state.waiting_reason or "").startswith(WAIT_REASON_PREFIX):
@@ -241,6 +278,7 @@ class CharterManager:
             for q in fresh_answers:
                 q["consumed"] = True
                 await asyncio.to_thread(store.save_question, r, self.agent, q)
+            await self._record_kick(r)
 
     # ------------------------------------------------------------------
     async def _inject_turn(self, text: str) -> None:
