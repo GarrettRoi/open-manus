@@ -118,6 +118,7 @@ class DispatchManager:
     async def _publish_roster(self) -> None:
         """Publish this agent's roster entry, then refresh periodically so it
         never TTLs out while the agent is alive."""
+        first = True
         while True:
             try:
                 await self._publish_roster_once()
@@ -125,6 +126,13 @@ class DispatchManager:
                 raise
             except Exception:
                 logger.exception("[%s] dispatch roster publish failed", self.agent)
+            if first:
+                # Re-publish once shortly after boot: the first publish races
+                # the vault grant sync, so vault_* tools are usually still
+                # missing from the registry at that point.
+                first = False
+                await asyncio.sleep(180)
+                continue
             await asyncio.sleep(6 * 3600)
 
     # Shared core dispatch/communication tools every agent has, published
@@ -154,7 +162,10 @@ class DispatchManager:
         except Exception:
             names = set()
         tools = sorted(n for n in names if n.startswith("vault_"))
-        tools += [t for t in self.CORE_ROSTER_TOOLS if t in names or not names]
+        # Core tools are shared by every agent; include them unconditionally —
+        # at boot the roster can publish before tools.agent_dispatch/vault
+        # have registered, and an empty tool list misleads Harmony.
+        tools += list(self.CORE_ROSTER_TOOLS)
         return tools
 
     async def _publish_roster_once(self) -> None:
