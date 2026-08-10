@@ -216,11 +216,17 @@ def answer_question(r, agent: str, qid: int, answer: str) -> Dict[str, Any]:
 # native tool: ask_owner
 # ----------------------------------------------------------------------
 
-def ask_owner_tool(args: Dict[str, Any]) -> str:
+def ask_owner_tool(args: Optional[Dict[str, Any]] = None, **kw: Any) -> str:
+    # Tolerant signature: some dispatch paths pass the model's arguments as
+    # keyword args (and models occasionally invent extras like task_id).
+    merged: Dict[str, Any] = {}
+    if isinstance(args, dict):
+        merged.update(args)
+    merged.update(kw)
     try:
         r = _redis()
         agent = _agent_name()
-        rec = file_question(r, agent, str(args.get("question") or ""))
+        rec = file_question(r, agent, str(merged.get("question") or ""))
         return json.dumps({
             "ok": True,
             "question_id": rec["id"],
