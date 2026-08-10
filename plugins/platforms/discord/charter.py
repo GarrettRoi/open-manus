@@ -194,14 +194,19 @@ class CharterManager:
         if goal_active and applied_rev == rev:
             # Resume a goal the engine auto-paused (budget) so the standing
             # mission keeps going; owner pauses go through charter status.
+            # Resume goals WE paused: the engine's own turn-budget pause and
+            # the owner's /charter pause (charter status is back to active
+            # here, so the owner has un-paused). Any other pause reason means
+            # someone else paused the goal — leave it alone.
             if (state.status == "paused"
-                    and (state.paused_reason or "").startswith("turn budget")):
+                    and ((state.paused_reason or "").startswith("turn budget")
+                         or (state.paused_reason or "") == "charter paused by owner")):
                 if not await self._kick_allowed(r):
                     return
                 mgr.resume()
                 await self._inject_turn(
-                    "[Charter] Turn budget refreshed — continue your standing "
-                    "mission. Review your goal and take the next concrete step."
+                    "[Charter] Your standing mission is resumed — continue. "
+                    "Review your goal and take the next concrete step."
                 )
                 await self._record_kick(r)
             return

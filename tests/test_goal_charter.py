@@ -616,3 +616,56 @@ def test_charter_session_identity_contract(monkeypatch):
     k_owner = build_session_key(owner, group_sessions_per_user=True,
                                 thread_sessions_per_user=False)
     assert k_owner != k1  # owner conversation is a separate session
+
+
+def test_charter_pause_resume_lifecycle(r, monkeypatch):
+    """arm → /charter pause → /charter resume must resume the goal."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    charter = store.save_charter(r, "jade", {"objectives": ["obj"]})
+    manager = cm.CharterManager(adapter=MagicMock())
+    injected = []
+
+    async def ok_inject(text):
+        injected.append(text)
+
+    manager._inject_turn = ok_inject
+    loop = asyncio.get_event_loop()
+
+    # arm
+    mgr = MagicMock()
+    mgr.state = None
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.set.assert_called_once()
+    rendered = mgr.set.call_args[0][0]
+
+    # owner paused via /charter pause → tick paused the goal with our reason
+    state = MagicMock()
+    state.status = "paused"
+    state.goal = rendered
+    state.paused_reason = "charter paused by owner"
+    mgr.reset_mock()
+    mgr.state = state
+
+    # cooldown active right after arm: resume waits for the window
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_not_called()
+
+    # after cooldown, /charter resume (status back to active) resumes it
+    r.set("goalcharter:v1:lastkick:jade", "0")
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_called_once()
+    mgr.set.assert_not_called()  # resumed, not re-armed
+    assert any("resumed" in t for t in injected[1:])
+
+    # a goal paused by someone else is left alone
+    state.paused_reason = "manual pause by operator"
+    mgr.reset_mock()
+    r.set("goalcharter:v1:lastkick:jade", "0")
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_not_called()
+    mgr.set.assert_not_called()
