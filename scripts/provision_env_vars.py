@@ -39,8 +39,8 @@ AGENT_SERVICES = {
     "valentina": "ffe6a337-2475-47ab-83f0-8fceb80312b0",
     "addison":   "4fbd8c66-944b-46b5-83b2-ce2f1c8b6bd9",
     "lexi":      "08006723-2b99-4fa5-aec0-f4afe96a242c",
-    "victoria":  "",  # TODO: fill in once Victoria's Railway service exists
-    "vivian":    "",  # TODO: fill in once Vivian's Railway service exists
+    "victoria":  "f52fbe26-83e8-48e1-8397-969f84c467c8",
+    "vivian":    "ff1f2730-3eaf-43c6-8a27-4c176b354e8f",
 }
 
 # ============================================================
@@ -114,8 +114,8 @@ AGENT_VARS = {
         "HOSTINGER_EMAIL": "garrett@mcgarryhomes.com",
         "HOSTINGER_IMAP": "imap.hostinger.com",
         "HOSTINGER_SMTP": "smtp.hostinger.com",
-        "AGENT_ROLE": "tech_ops",
-        "AGENT_CAPABILITIES": "hosting,deployment,website_management,technical_support,railway_api",
+        "AGENT_ROLE": "real_estate_admin",
+        "AGENT_CAPABILITIES": "real_estate_admin,transaction_coordination,listing_paperwork,deadline_tracking,mcgarry_homes",
         "RAILWAY_ACCOUNT_API": os.environ.get("RAILWAY_ACCOUNT_API", ""),
     },
     
@@ -127,8 +127,8 @@ AGENT_VARS = {
         ]),
         "PRIMARY_EMAIL": "garrett@canaok.com",
         "GMAIL_ACCOUNTS": "garrett@canaok.com,garrett@vowsok.com",
-        "AGENT_ROLE": "cana_coordinator",
-        "AGENT_CAPABILITIES": "email,lead_management,vendor_coordination,cana_platform",
+        "AGENT_ROLE": "vows_vinyl_gm",
+        "AGENT_CAPABILITIES": "dj_company_management,booking_management,vendor_coordination,event_operations,vows_vinyl",
         "BRAND_FOCUS": "cana_collective",
     },
     
@@ -140,8 +140,8 @@ AGENT_VARS = {
         ]),
         "PRIMARY_EMAIL": "garrett@vowsok.com",
         "GMAIL_ACCOUNTS": "garrett@canaok.com,garrett@vowsok.com",
-        "AGENT_ROLE": "dj_coordinator",
-        "AGENT_CAPABILITIES": "email,booking_management,client_communication,dj_scheduling",
+        "AGENT_ROLE": "client_support",
+        "AGENT_CAPABILITIES": "client_support,client_communication,issue_resolution,relationship_nurture",
         "BRAND_FOCUS": "vows_vinyl",
     },
     
@@ -153,8 +153,8 @@ AGENT_VARS = {
         ]),
         "PRIMARY_EMAIL": "garrett@canaok.com",
         "GMAIL_ACCOUNTS": "garrett@canaok.com,garrett@vowsok.com",
-        "AGENT_ROLE": "sales_coordinator",
-        "AGENT_CAPABILITIES": "email,sales,lead_followup,client_onboarding",
+        "AGENT_ROLE": "sales_advisor",
+        "AGENT_CAPABILITIES": "sales,business_analysis,lead_followup,client_onboarding,proposals",
         "BRAND_FOCUS": "cana_collective,vows_vinyl",
     },
     
@@ -178,18 +178,18 @@ AGENT_VARS = {
     },
     
     "raven": {
-        "AGENT_ROLE": "researcher",
+        "AGENT_ROLE": "deep_researcher",
         "AGENT_CAPABILITIES": "web_research,data_analysis,market_research,competitor_analysis",
     },
     
     "bianca": {
-        "AGENT_ROLE": "copywriter",
-        "AGENT_CAPABILITIES": "copywriting,content_creation,seo,blog_writing,email_campaigns",
+        "AGENT_ROLE": "investment_cfo",
+        "AGENT_CAPABILITIES": "day_trading,investing,portfolio_management,crypto_analysis,alpaca",
     },
     
     "valentina": {
-        "AGENT_ROLE": "real_estate_coordinator",
-        "AGENT_CAPABILITIES": "real_estate,client_management,listing_support,first_time_buyers",
+        "AGENT_ROLE": "automation_developer",
+        "AGENT_CAPABILITIES": "automation_development,architecture,n8n_workflows,integrations,scripting",
         "BRAND_FOCUS": "mcgarry_homes",
         "EMAIL_ACCOUNTS": json.dumps([
             {"name": "McGarry Homes", "email": "garrett@mcgarryhomes.com", "type": "hostinger"},
@@ -200,13 +200,23 @@ AGENT_VARS = {
     },
     
     "addison": {
-        "AGENT_ROLE": "analytics",
-        "AGENT_CAPABILITIES": "analytics,reporting,metrics,performance_tracking",
+        "AGENT_ROLE": "advertising_manager",
+        "AGENT_CAPABILITIES": "paid_advertising,campaign_management,ad_analytics,facebook_google_youtube_ads",
     },
     
     "lexi": {
-        "AGENT_ROLE": "legal_compliance",
-        "AGENT_CAPABILITIES": "contracts,compliance,legal_review,terms_of_service",
+        "AGENT_ROLE": "librarian",
+        "AGENT_CAPABILITIES": "knowledge_management,hive_mind_curation,skill_registry,lesson_routing",
+    },
+
+    "victoria": {
+        "AGENT_ROLE": "web_developer",
+        "AGENT_CAPABILITIES": "web_development,vowsok.com,canaok.com,homesbyg.com,site_maintenance",
+    },
+
+    "vivian": {
+        "AGENT_ROLE": "workflow_automation",
+        "AGENT_CAPABILITIES": "process_automation,workflow_design,sop_automation,integration_glue",
     },
     
     "harmony": {

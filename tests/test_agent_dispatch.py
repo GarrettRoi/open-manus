@@ -421,3 +421,36 @@ def test_gate_owner_answer_resumes_asker():
         assert _run(mgr.gate(_msg("556", "42"), "777", True)) == "steer"
     updated = store.get_chain(r, "6")
     assert updated["status"] == "working" and updated["waiting_on"] == ""
+
+
+def test_roster_tools_filters_registry(monkeypatch):
+    """Roster publishes only granted vault_* tools + core dispatch tools,
+    never the full registry dump."""
+    from unittest.mock import MagicMock
+    from plugins.platforms.discord.dispatch import DispatchManager
+
+    mgr = DispatchManager(adapter=MagicMock())
+
+    class _E:
+        def __init__(self, name): self.name = name
+
+    fake_names = [
+        "terminal", "read_file", "web_search", "browser",  # local noise
+        "vault_openai", "vault_gmail_main",                # granted vault tools
+        "agent_dispatch", "vault", "ask_owner", "request_dev_modification",
+    ]
+
+    class _Reg:
+        def snapshot(self):
+            return [_E(n) for n in fake_names], None
+
+    import plugins.platforms.discord.dispatch as dmod
+    import tools.registry as regmod
+    monkeypatch.setattr(regmod, "registry", _Reg())
+
+    tools = mgr._roster_tools()
+    assert tools == [
+        "vault_gmail_main", "vault_openai",
+        "agent_dispatch", "vault", "ask_owner", "request_dev_modification",
+    ]
+    assert "terminal" not in tools and "web_search" not in tools

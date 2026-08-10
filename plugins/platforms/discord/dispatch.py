@@ -127,25 +127,43 @@ class DispatchManager:
                 logger.exception("[%s] dispatch roster publish failed", self.agent)
             await asyncio.sleep(6 * 3600)
 
+    # Shared core dispatch/communication tools every agent has, published
+    # alongside the agent's own granted vault_* tools. The full registry
+    # snapshot is deliberately NOT published — it listed identical local
+    # tooling for every agent and made Harmony route work by noise.
+    CORE_ROSTER_TOOLS = (
+        "agent_dispatch",
+        "vault",
+        "ask_owner",
+        "request_dev_modification",
+    )
+
+    def _roster_tools(self) -> list[str]:
+        """This agent's granted ``vault_*`` tools plus the shared core
+        dispatch tools — not the entire local tool registry."""
+        names: set[str] = set()
+        try:
+            from tools.registry import registry as _reg
+            entries = None
+            if hasattr(_reg, "snapshot"):
+                entries, _checks = _reg.snapshot()
+            if entries is not None:
+                names = {e.name for e in entries}
+            else:
+                names = set(getattr(_reg, "_tools", {}).keys())
+        except Exception:
+            names = set()
+        tools = sorted(n for n in names if n.startswith("vault_"))
+        tools += [t for t in self.CORE_ROSTER_TOOLS if t in names or not names]
+        return tools
+
     async def _publish_roster_once(self) -> None:
         client = getattr(self.adapter, "_client", None)
         user = getattr(client, "user", None) if client else None
-        tools: list[str] = []
-        try:
-            from tools.registry import registry as _reg
-            entries, checks = _reg.snapshot() if hasattr(_reg, "snapshot") else (None, None)
-            if entries is not None:
-                tools = sorted({e.name for e in entries})
-        except Exception:
-            pass
-        if not tools:
-            try:
-                from tools.registry import registry as _reg
-                tools = sorted(getattr(_reg, "_tools", {}).keys())
-            except Exception:
-                tools = []
+        tools = self._roster_tools()
         entry = {
             "agent": self.agent,
+            "_v": 2,
             "discord_user_id": str(getattr(user, "id", "") or ""),
             "role": (os.getenv("AGENT_ROLE") or "").strip(),
             "tools": tools[:120],
