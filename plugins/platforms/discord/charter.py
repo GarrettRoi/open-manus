@@ -249,13 +249,26 @@ class CharterManager:
             if q.get("posted"):
                 continue
             try:
-                await self.adapter.send(
+                result = await self.adapter.send(
                     _home_channel_id(),
                     f"❓ **Question for Garrett** (#{q['id']}):\n{q['question']}\n"
                     f"-# answer with `/charter answer {q['id']} <text>`",
                 )
-                q["posted"] = True
-                await asyncio.to_thread(store.save_question, r, self.agent, q)
+                # adapter.send() reports failures via SendResult, not by
+                # raising — only a confirmed success may mark the question
+                # posted, or a disconnected client / bad channel would
+                # silently swallow it forever. Unposted questions retry
+                # every tick.
+                if getattr(result, "success", False):
+                    q["posted"] = True
+                    await asyncio.to_thread(store.save_question, r, self.agent, q)
+                else:
+                    logger.warning(
+                        "[%s] charter: question #%s post NOT delivered "
+                        "(send failed: %s) — will retry next tick",
+                        self.agent, q["id"],
+                        getattr(result, "error", "unknown"),
+                    )
             except Exception:
                 logger.warning("[%s] charter: question post failed", self.agent,
                                exc_info=True)

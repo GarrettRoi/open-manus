@@ -669,3 +669,41 @@ def test_charter_pause_resume_lifecycle(r, monkeypatch):
     loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
     mgr.resume.assert_not_called()
     mgr.set.assert_not_called()
+
+
+def test_question_post_failure_retries(r, monkeypatch):
+    """A failed SendResult must leave the question unposted for retry."""
+    from plugins.platforms.discord import charter as cm
+    import asyncio
+
+    monkeypatch.setenv("AGENT_NAME", "jade")
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "42")
+
+    store.file_question(r, "jade", "which venues?")
+
+    adapter = MagicMock()
+
+    async def failed_send(chat_id, msg):
+        return types.SimpleNamespace(success=False, error="client closed")
+
+    adapter.send = failed_send
+    manager = cm.CharterManager(adapter=adapter)
+    mgr = MagicMock()
+    mgr.state = None
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(manager._question_tick(store, r, mgr))
+    assert not store.get_question(r, "jade", 1)["posted"]
+
+    sent = []
+
+    async def ok_send(chat_id, msg):
+        sent.append(msg)
+        return types.SimpleNamespace(success=True, message_id="1")
+
+    adapter.send = ok_send
+    loop.run_until_complete(manager._question_tick(store, r, mgr))
+    assert store.get_question(r, "jade", 1)["posted"]
+    assert len(sent) == 1
+    # posted questions are not re-sent
+    loop.run_until_complete(manager._question_tick(store, r, mgr))
+    assert len(sent) == 1
