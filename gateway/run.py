@@ -405,6 +405,14 @@ _GATEWAY_SANITIZED_PROVIDER_ERROR_PREFIXES = (
     "⏱️ The model provider is rate-limiting requests.",
 )
 
+# Raw terminal failure responses emitted by agent/conversation_loop.py when
+# retries are exhausted. "API call failed after N retries: ..." matches the
+# raw-envelope regex, but the billing branch ("Billing or credits exhausted:
+# ...") does not — anchor it explicitly.
+_GATEWAY_RAW_TERMINAL_FAILURE_PREFIXES = (
+    "Billing or credits exhausted:",
+)
+
 
 def _is_provider_failure_response(text: str) -> bool:
     """True for raw provider-error envelopes AND sanitized gateway rewrites."""
@@ -412,6 +420,8 @@ def _is_provider_failure_response(text: str) -> bool:
     if not body:
         return False
     if body.startswith(_GATEWAY_SANITIZED_PROVIDER_ERROR_PREFIXES):
+        return True
+    if body.startswith(_GATEWAY_RAW_TERMINAL_FAILURE_PREFIXES):
         return True
     return _looks_like_gateway_provider_error(body)
 

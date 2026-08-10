@@ -659,6 +659,13 @@ def test_charter_pause_resume_lifecycle(r, monkeypatch):
     r.set("goalcharter:v1:lastkick:jade", "0")
     loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
     mgr.resume.assert_called_once()
+    # successful resume+inject records the kick → a second provider pause
+    # within the cooldown window must NOT resume again
+    assert r.get("goalcharter:v1:lastkick:jade") != b"0"
+    mgr.reset_mock()
+    mgr.state = state
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_not_called()
     mgr.set.assert_not_called()  # resumed, not re-armed
     assert any("resumed" in t for t in injected[1:])
 
@@ -741,3 +748,10 @@ def test_charter_resumes_provider_failure_pause(r, monkeypatch):
     r.set("goalcharter:v1:lastkick:jade", "0")
     loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
     mgr.resume.assert_called_once()
+    # successful resume+inject records the kick → a second provider pause
+    # within the cooldown window must NOT resume again
+    assert r.get("goalcharter:v1:lastkick:jade") != b"0"
+    mgr.reset_mock()
+    mgr.state = state
+    loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
+    mgr.resume.assert_not_called()

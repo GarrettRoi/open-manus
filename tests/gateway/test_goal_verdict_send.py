@@ -251,3 +251,28 @@ async def test_goal_provider_error_pauses_instead_of_continuing(hermes_home):
     # exactly one pause notice, not a per-turn error+continue pair
     assert len(adapter.sends) == 1
     assert "Goal paused" in adapter.sends[0]["content"]
+
+
+def test_provider_failure_detector_shapes():
+    """Positive: raw billing + raw retry envelopes. Negative: normal prose
+    that merely discusses API errors."""
+    from gateway.run import _is_provider_failure_response
+
+    assert _is_provider_failure_response(
+        "Billing or credits exhausted: HTTP 402 from openrouter"
+    )
+    assert _is_provider_failure_response(
+        "API call failed after 3 retries: connection reset"
+    )
+    assert _is_provider_failure_response(
+        "⚠️ Provider authentication failed. Check the configured credentials; "
+        "raw provider details are in the gateway logs."
+    )
+    # Normal assistant text mentioning errors must NOT pause the goal.
+    assert not _is_provider_failure_response(
+        "I checked the endpoint and it returns HTTP 200 when the key is valid."
+    )
+    assert not _is_provider_failure_response(
+        "An HTTP 404 means the resource wasn't found — check the URL path."
+    )
+    assert not _is_provider_failure_response("Done — deployed and verified.")
