@@ -581,6 +581,26 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        # Dispatch context kwargs (task_id, session_id, user_task, ...) are
+        # passed to every handler, but many handlers only take (args).  Filter
+        # to what the handler's signature actually accepts so a context kwarg
+        # never causes "got an unexpected keyword argument" (devreq #32).
+        if kwargs:
+            try:
+                import inspect
+                sig = inspect.signature(entry.handler)
+                accepts_var_kw = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values())
+                if not accepts_var_kw:
+                    accepted = {
+                        pname for pname, p in sig.parameters.items()
+                        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                      inspect.Parameter.KEYWORD_ONLY)
+                    }
+                    kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+            except (ValueError, TypeError):
+                pass  # unintrospectable handler — pass kwargs through as before
         try:
             if entry.is_async:
                 from model_tools import _run_async

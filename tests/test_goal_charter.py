@@ -755,3 +755,31 @@ def test_charter_resumes_provider_failure_pause(r, monkeypatch):
     mgr.state = state
     loop.run_until_complete(manager._ensure_goal_armed(store, r, mgr, charter))
     mgr.resume.assert_not_called()
+
+
+def test_registry_dispatch_filters_context_kwargs_for_strict_handlers():
+    """Regression (devreq #32): dispatch context kwargs like task_id must
+    never reach handlers whose signature doesn't accept them."""
+    import json
+    from tools.registry import registry
+
+    def strict_handler(args):
+        return json.dumps({"ok": True})
+
+    def kw_handler(args=None, **kw):
+        return json.dumps({"kw": sorted(kw)})
+
+    registry.register(
+        name="_t_strict_sig", toolset="test",
+        schema={"name": "_t_strict_sig", "parameters": {"type": "object", "properties": {}}},
+        handler=strict_handler)
+    registry.register(
+        name="_t_kw_sig", toolset="test",
+        schema={"name": "_t_kw_sig", "parameters": {"type": "object", "properties": {}}},
+        handler=kw_handler)
+
+    out = registry.dispatch("_t_strict_sig", {}, task_id="t", session_id="s", user_task="u")
+    assert json.loads(out) == {"ok": True}, out  # no TypeError error envelope
+
+    out2 = registry.dispatch("_t_kw_sig", {}, task_id="t", session_id="s", user_task="u")
+    assert json.loads(out2)["kw"] == ["session_id", "task_id", "user_task"]
