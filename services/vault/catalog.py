@@ -538,7 +538,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     "alpaca": {
         "label": "Alpaca Markets",
         "auth": {"kind": "header", "header_name": "APCA-API-KEY-ID", "prefix": ""},
-        "base_url": "https://paper-api.alpaca.markets/v2",
+        "base_url": "https://paper-api.alpaca.markets",
         "allowed_hosts": ["paper-api.alpaca.markets", "api.alpaca.markets"],
         "extra_secret": True,
         "setup_help": (
