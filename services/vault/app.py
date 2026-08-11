@@ -2308,6 +2308,28 @@ async def proxy_request(conn_id: str, request: Request):
     elif body.get("data") is not None:
         kwargs["content"] = str(body["data"]).encode()
 
+    # Plaid authenticates via JSON body fields ("client_id"/"secret"), not
+    # headers — inject the stored credentials into the outgoing body for
+    # plaid hosts so agents never need (or see) the raw values.  Matched by
+    # upstream host so legacy/custom-service Plaid connections work too.
+    if host == "plaid.com" or (host or "").endswith(".plaid.com"):
+        if method in {"POST", "PUT", "PATCH"} and "content" not in kwargs:
+            jbody = kwargs.get("json")
+            if jbody is None:
+                jbody = {}
+            if isinstance(jbody, dict):
+                plaid_secret = None
+                extra_h = secrets_d.get("extra_headers")
+                if isinstance(extra_h, dict):
+                    for hn, hv in extra_h.items():
+                        if isinstance(hn, str) and hn.lower() == "plaid-secret":
+                            plaid_secret = str(hv)
+                if secrets_d.get("api_key"):
+                    jbody["client_id"] = secrets_d["api_key"]
+                if plaid_secret:
+                    jbody["secret"] = plaid_secret
+                kwargs["json"] = jbody
+
     try:
         async with httpx.AsyncClient(follow_redirects=False) as client:
             upstream = await client.request(method, url, **kwargs)

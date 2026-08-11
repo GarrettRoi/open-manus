@@ -579,9 +579,10 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "https://dashboard.plaid.com/developers/keys. "
             "Use the Production secret for real bank/card data or the Sandbox "
             "secret (with base URL https://sandbox.plaid.com) for testing. "
-            "Both values are stored encrypted and injected as headers "
-            "(PLAID-CLIENT-ID / PLAID-SECRET) by the vault proxy — you can omit "
-            "them from request bodies."
+            "Both values are stored encrypted; the vault proxy injects them "
+            "into the JSON request body as client_id/secret (and as the "
+            "PLAID-CLIENT-ID / PLAID-SECRET headers) — omit them from your "
+            "request bodies."
         ),
         "example_call": (
             'POST /accounts/balance/get with {"access_token": "<item access token>"}'
