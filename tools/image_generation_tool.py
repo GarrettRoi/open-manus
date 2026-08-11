@@ -1003,9 +1003,16 @@ def image_generate_tool(
             modality,
         )
 
+        primary_url = formatted_images[0]["url"] if formatted_images else None
+        local_path = (
+            _save_image_locally(primary_url, output_format)
+            if isinstance(primary_url, str) and primary_url.startswith(("http://", "https://"))
+            else None
+        )
         response_data = {
             "success": True,
-            "image": formatted_images[0]["url"] if formatted_images else None,
+            "image": primary_url,
+            "local_path": local_path,
             "modality": modality,
         }
 
@@ -1035,6 +1042,45 @@ def image_generate_tool(
         _debug.save()
 
         return json.dumps(response_data, indent=2, ensure_ascii=False)
+
+
+def _save_image_locally(image_url: str, output_format: Optional[str] = None) -> Optional[str]:
+    """Download a generated image to the local output dir; return its path.
+
+    Best-effort (devreq #30): the skill docs promise a ``local_path`` in the
+    tool output so agents can manage files without re-downloading. Directory
+    comes from ``IMAGE_OUTPUT_DIR`` (same convention as the image-generation
+    skill), falling back to ``./images`` when the default ``/workspace/images``
+    root is not writable. Returns None on any failure — never breaks the
+    generation result.
+    """
+    try:
+        import hashlib
+        import requests
+
+        out_dir = os.environ.get("IMAGE_OUTPUT_DIR", "/workspace/images")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            out_dir = os.path.join(os.getcwd(), "images")
+            os.makedirs(out_dir, exist_ok=True)
+
+        ext = (output_format or "png").lower().strip(".")
+        if ext not in {"png", "jpg", "jpeg", "webp"}:
+            ext = "png"
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        digest = hashlib.md5(image_url.encode()).hexdigest()[:8]
+        local_path = os.path.join(out_dir, f"generated_{stamp}_{digest}.{ext}")
+
+        resp = requests.get(image_url, timeout=60)
+        resp.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+        logger.info("Saved generated image to %s", local_path)
+        return local_path
+    except Exception as exc:  # noqa: BLE001 — local save must never fail the tool
+        logger.warning("Could not save generated image locally: %s", exc)
+        return None
 
 
 def check_fal_api_key() -> bool:

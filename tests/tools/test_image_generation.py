@@ -632,3 +632,67 @@ class TestFalKreaCatalog:
     def test_fal_krea_models_in_fal_catalog(self, image_tool):
         assert "fal-ai/krea/v2/medium/text-to-image" in image_tool.FAL_MODELS
         assert "fal-ai/krea/v2/large/text-to-image" in image_tool.FAL_MODELS
+
+
+# ---------------------------------------------------------------------------
+# local_path in tool output (devreq #30)
+# ---------------------------------------------------------------------------
+
+class TestLocalPath:
+    def test_save_image_locally_writes_file(self, image_tool, tmp_path, monkeypatch):
+        monkeypatch.setenv("IMAGE_OUTPUT_DIR", str(tmp_path / "imgs"))
+
+        class _Resp:
+            content = b"\x89PNG fakebytes"
+            def raise_for_status(self): pass
+
+        import requests
+        monkeypatch.setattr(requests, "get", lambda url, timeout=60: _Resp())
+        p = image_tool._save_image_locally("https://fal.example/img.png", "png")
+        assert p is not None and p.endswith(".png")
+        import os
+        assert os.path.exists(p)
+        with open(p, "rb") as f:
+            assert f.read() == b"\x89PNG fakebytes"
+
+    def test_save_image_locally_never_raises(self, image_tool, monkeypatch):
+        import requests
+
+        def _boom(url, timeout=60):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(requests, "get", _boom)
+        assert image_tool._save_image_locally("https://fal.example/x.png") is None
+
+    def test_generate_response_includes_local_path(self, image_tool, tmp_path, monkeypatch):
+        """Full image_generate_tool run with a mocked FAL client must return local_path."""
+        import json as _json
+        monkeypatch.setenv("IMAGE_OUTPUT_DIR", str(tmp_path / "imgs"))
+        monkeypatch.setenv("FAL_KEY", "test-key")
+
+        class _Handler:
+            def get(self):
+                return {"images": [{"url": "https://fal.example/gen.png", "width": 1, "height": 1}]}
+
+        class _FakeFal:
+            @staticmethod
+            def submit(model, arguments=None, headers=None):
+                return _Handler()
+
+        monkeypatch.setattr(image_tool, "fal_client", _FakeFal)
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway", lambda: None)
+        monkeypatch.setattr(image_tool, "fal_key_is_configured", lambda: True)
+
+        class _Resp:
+            content = b"imgbytes"
+            def raise_for_status(self): pass
+
+        import requests
+        monkeypatch.setattr(requests, "get", lambda url, timeout=60: _Resp())
+
+        out = _json.loads(image_tool.image_generate_tool(prompt="a red square"))
+        assert out["success"] is True
+        assert out["image"] == "https://fal.example/gen.png"
+        assert out["local_path"] and out["local_path"].endswith(".png")
+        import os
+        assert os.path.exists(out["local_path"])
