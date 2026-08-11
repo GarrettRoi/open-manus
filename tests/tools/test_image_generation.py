@@ -643,11 +643,14 @@ class TestLocalPath:
         monkeypatch.setenv("IMAGE_OUTPUT_DIR", str(tmp_path / "imgs"))
 
         class _Resp:
-            content = b"\x89PNG fakebytes"
             def raise_for_status(self): pass
+            def iter_content(self, chunk_size=65536):
+                yield b"\x89PNG fakebytes"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
 
         import requests
-        monkeypatch.setattr(requests, "get", lambda url, timeout=60: _Resp())
+        monkeypatch.setattr(requests, "get", lambda url, timeout=60, stream=False: _Resp())
         p = image_tool._save_image_locally("https://fal.example/img.png", "png")
         assert p is not None and p.endswith(".png")
         import os
@@ -658,7 +661,7 @@ class TestLocalPath:
     def test_save_image_locally_never_raises(self, image_tool, monkeypatch):
         import requests
 
-        def _boom(url, timeout=60):
+        def _boom(url, timeout=60, stream=False):
             raise RuntimeError("network down")
 
         monkeypatch.setattr(requests, "get", _boom)
@@ -684,15 +687,41 @@ class TestLocalPath:
         monkeypatch.setattr(image_tool, "fal_key_is_configured", lambda: True)
 
         class _Resp:
-            content = b"imgbytes"
             def raise_for_status(self): pass
+            def iter_content(self, chunk_size=65536):
+                yield b"\xff\xd8\xff jpegbytes"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
 
         import requests
-        monkeypatch.setattr(requests, "get", lambda url, timeout=60: _Resp())
+        monkeypatch.setattr(requests, "get", lambda url, timeout=60, stream=False: _Resp())
 
         out = _json.loads(image_tool.image_generate_tool(prompt="a red square"))
         assert out["success"] is True
         assert out["image"] == "https://fal.example/gen.png"
-        assert out["local_path"] and out["local_path"].endswith(".png")
+        # Extension derives from actual bytes (JPEG magic), not requested format.
+        assert out["local_path"] and out["local_path"].endswith(".jpg")
         import os
         assert os.path.exists(out["local_path"])
+
+
+    def test_save_respects_size_cap(self, image_tool, tmp_path, monkeypatch):
+        monkeypatch.setenv("IMAGE_OUTPUT_DIR", str(tmp_path / "imgs"))
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def iter_content(self, chunk_size=65536):
+                for _ in range(600):  # 600 * 64KB > 32MB cap
+                    yield b"x" * 65536
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        import requests
+        monkeypatch.setattr(requests, "get", lambda url, timeout=60, stream=False: _Resp())
+        assert image_tool._save_image_locally("https://fal.example/huge.png") is None
+
+    def test_postprocess_mirrors_plugin_local_image_to_local_path(self, image_tool):
+        import json as _json
+        raw = _json.dumps({"success": True, "image": "/tmp/krea/out.png"})
+        out = _json.loads(image_tool._postprocess_image_generate_result(raw))
+        assert out["local_path"] == "/tmp/krea/out.png"

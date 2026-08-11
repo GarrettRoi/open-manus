@@ -818,20 +818,46 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
     if not isinstance(payload, dict) or not payload.get("success"):
         return raw
 
+    changed = False
+
+    # Normalize local_path across provider routes (devreq #30): plugin
+    # providers (e.g. Krea) return a local file as ``image`` without a
+    # ``local_path`` key — mirror it so the tool response shape is
+    # provider-independent.
     image = payload.get("image")
-    if not isinstance(image, str) or not _looks_like_absolute_file_path(image):
-        return raw
+    if (
+        "local_path" not in payload
+        and isinstance(image, str)
+        and _looks_like_absolute_file_path(image)
+    ):
+        payload["local_path"] = image
+        changed = True
 
     env = _active_terminal_env(task_id)
-    agent_path = _agent_visible_cache_path(image, env)
-    if not agent_path or agent_path == image:
-        return raw
 
-    if env is not None:
+    # Map any host-side local file paths to the agent-visible filesystem when
+    # the active terminal backend is remote (docker/ssh/modal/...).
+    mapped_any = False
+    for key, visible_key in (
+        ("image", "agent_visible_image"),
+        ("local_path", "agent_visible_local_path"),
+    ):
+        host_path = payload.get(key)
+        if not isinstance(host_path, str) or not _looks_like_absolute_file_path(host_path):
+            continue
+        agent_path = _agent_visible_cache_path(host_path, env)
+        if not agent_path or agent_path == host_path:
+            continue
+        if key == "image":
+            payload.setdefault("host_image", host_path)
+        payload.setdefault(visible_key, agent_path)
+        mapped_any = True
+        changed = True
+    if mapped_any and env is not None:
         _force_artifact_sync(env)
 
-    payload.setdefault("host_image", image)
-    payload.setdefault("agent_visible_image", agent_path)
+    if not changed:
+        return raw
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1065,17 +1091,41 @@ def _save_image_locally(image_url: str, output_format: Optional[str] = None) -> 
             out_dir = os.path.join(os.getcwd(), "images")
             os.makedirs(out_dir, exist_ok=True)
 
-        ext = (output_format or "png").lower().strip(".")
-        if ext not in {"png", "jpg", "jpeg", "webp"}:
+        # Streamed download with a hard size cap — a successful generation
+        # must never block on an unbounded body.
+        max_bytes = 32 * 1024 * 1024
+        chunks: list = []
+        total = 0
+        with requests.get(image_url, timeout=60, stream=True) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    logger.warning(
+                        "Generated image exceeds %d bytes; skipping local save",
+                        max_bytes)
+                    return None
+                chunks.append(chunk)
+        data = b"".join(chunks)
+
+        # Derive the extension from the actual bytes (endpoints may ignore
+        # the requested output_format, and upscaling can change it).
+        if data.startswith(b"\x89PNG"):
             ext = "png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            ext = "jpg"
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            ext = "webp"
+        else:
+            ext = (output_format or "png").lower().strip(".")
+            if ext not in {"png", "jpg", "jpeg", "webp"}:
+                ext = "png"
+
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         digest = hashlib.md5(image_url.encode()).hexdigest()[:8]
         local_path = os.path.join(out_dir, f"generated_{stamp}_{digest}.{ext}")
-
-        resp = requests.get(image_url, timeout=60)
-        resp.raise_for_status()
         with open(local_path, "wb") as f:
-            f.write(resp.content)
+            f.write(data)
         logger.info("Saved generated image to %s", local_path)
         return local_path
     except Exception as exc:  # noqa: BLE001 — local save must never fail the tool
