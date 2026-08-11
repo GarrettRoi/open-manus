@@ -45,6 +45,7 @@ from connections import (
     normalize_id,
 )
 import oauth as oauth_mod
+from plaid_items import PlaidItemStore
 from oauth import OAuthError
 import backup as vault_backup
 import replit_mcp as replit_mcp_mod
@@ -172,6 +173,7 @@ def hash_token(token: str) -> str:
 
 
 store = ConnectionStore(r, encrypt_value, decrypt_value)
+item_store = PlaidItemStore(r, encrypt_value, decrypt_value)
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1313,7 @@ async def delete_service(request: Request, conn_id: str = Form(...)):
     if (resp := _admin_or_redirect(request)):
         return resp
     store.delete(normalize_id(conn_id), AGENT_NAMES)
+    item_store.delete_all(normalize_id(conn_id))
     audit_log("admin", conn_id, "connection_deleted")
     return RedirectResponse(url="/services?notice=Connection+deleted", status_code=303)
 
@@ -1393,6 +1396,202 @@ async def oauth_callback(request: Request, background_tasks: BackgroundTasks,
 # ---------------------------------------------------------------------------
 # Admin GUI — grants / agents / audit
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Admin GUI — Plaid Link bank connections (Items)
+# ---------------------------------------------------------------------------
+def _is_plaid_conn(conn: Dict[str, Any]) -> bool:
+    if (conn.get("service") or "") == "plaid":
+        return True
+    try:
+        host = httpx.URL(conn.get("base_url") or "").host or ""
+    except Exception:
+        host = ""
+    return host == "plaid.com" or host.endswith(".plaid.com")
+
+
+def _plaid_creds(secrets_d: Dict[str, Any]):
+    """(client_id, secret) from stored connection secrets, or (None, None)."""
+    client_id = secrets_d.get("api_key")
+    secret = None
+    extra_h = secrets_d.get("extra_headers")
+    if isinstance(extra_h, dict):
+        for hn, hv in extra_h.items():
+            if isinstance(hn, str) and hn.lower() == "plaid-secret":
+                secret = str(hv)
+    return client_id, secret
+
+
+async def _plaid_api_post(conn: Dict[str, Any], secrets_d: Dict[str, Any],
+                          path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Server-side call to the Plaid API using the stored client_id/secret."""
+    client_id, secret = _plaid_creds(secrets_d)
+    if not client_id or not secret:
+        raise HTTPException(
+            status_code=409,
+            detail="Plaid connection is missing its client_id or secret — "
+                   "add them on the Services page first")
+    base = (conn.get("base_url") or "https://production.plaid.com").rstrip("/")
+    body = dict(payload)
+    body["client_id"] = client_id
+    body["secret"] = secret
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{base}{path}", json=body)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Plaid request failed: {exc}")
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code >= 400:
+        msg = data.get("error_message") or data.get("error_code") or resp.text[:200]
+        raise HTTPException(status_code=502, detail=f"Plaid error: {msg}")
+    return data
+
+
+def _plaid_conn_or_404(conn_id: str) -> Dict[str, Any]:
+    conn = store.get(normalize_id(conn_id))
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if not _is_plaid_conn(conn):
+        raise HTTPException(status_code=400, detail="Not a Plaid connection")
+    return conn
+
+
+@app.get("/plaid", response_class=HTMLResponse)
+async def plaid_banks_page(request: Request, error: str = "", notice: str = ""):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    plaid_conns = []
+    for cid in store.list_ids():
+        conn = store.get(cid)
+        if not conn or not _is_plaid_conn(conn):
+            continue
+        secrets_d = store.get_secrets(cid)
+        client_id, secret = _plaid_creds(secrets_d)
+        plaid_conns.append({
+            "id": cid,
+            "label": conn.get("label") or cid,
+            "base_url": conn.get("base_url") or "",
+            "creds_ok": bool(client_id and secret),
+            "items": item_store.list_items(cid),
+        })
+    return templates.TemplateResponse(request, "plaid.html", {
+        "plaid_conns": plaid_conns,
+        "error": error,
+        "notice": notice,
+    })
+
+
+@app.post("/api/admin/plaid/{conn_id}/link-token")
+async def plaid_create_link_token(conn_id: str, request: Request):
+    """Create a Plaid Link token; pass {"item_key": ...} for update mode."""
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    conn = _plaid_conn_or_404(cid)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    payload: Dict[str, Any] = {
+        "client_name": "Open Manus Key Vault",
+        "user": {"client_user_id": "vault-admin"},
+        "country_codes": ["US"],
+        "language": "en",
+    }
+    item_key = str(body.get("item_key") or "").strip()
+    secrets_d = store.get_secrets(cid)
+    if item_key:
+        # Update mode: re-authenticate an existing Item.
+        token = item_store.get_access_token(cid, item_key)
+        if not token:
+            raise HTTPException(status_code=404, detail="Stored bank connection not found")
+        payload["access_token"] = token
+    else:
+        payload["products"] = ["transactions"]
+    data = await _plaid_api_post(conn, secrets_d, "/link/token/create", payload)
+    link_token = data.get("link_token")
+    if not link_token:
+        raise HTTPException(status_code=502, detail="Plaid returned no link_token")
+    audit_log("admin", cid, "plaid_link_token",
+              f"update-mode:{item_key}" if item_key else "new item")
+    return {"link_token": link_token}
+
+
+@app.post("/api/admin/plaid/{conn_id}/exchange")
+async def plaid_exchange_public_token(conn_id: str, request: Request):
+    """Exchange a Link public_token for an access token and store the Item."""
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    conn = _plaid_conn_or_404(cid)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    public_token = str((body or {}).get("public_token") or "").strip()
+    if not public_token:
+        raise HTTPException(status_code=400, detail="public_token is required")
+    secrets_d = store.get_secrets(cid)
+    data = await _plaid_api_post(conn, secrets_d, "/item/public_token/exchange",
+                                 {"public_token": public_token})
+    access_token = data.get("access_token")
+    item_id = data.get("item_id")
+    if not access_token or not item_id:
+        raise HTTPException(status_code=502, detail="Plaid exchange returned no access token")
+    item_key = item_store.save(
+        cid,
+        institution_name=str(body.get("institution_name") or "")[:120],
+        institution_id=str(body.get("institution_id") or "")[:64],
+        item_id=str(item_id),
+        access_token=str(access_token),
+        status="active",
+    )
+    audit_log("admin", cid, "plaid_item_added", f"Item {item_key}")
+    item = item_store.get(cid, item_key)
+    return {"ok": True, "item": item}
+
+
+@app.post("/api/admin/plaid/{conn_id}/items/{item_key}/reauth-done")
+async def plaid_item_reauth_done(conn_id: str, item_key: str, request: Request):
+    """After update-mode Link succeeds, mark the Item healthy again."""
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    _plaid_conn_or_404(cid)
+    if not item_store.get(cid, item_key):
+        raise HTTPException(status_code=404, detail="Stored bank connection not found")
+    item_store.set_status(cid, item_key, "active")
+    audit_log("admin", cid, "plaid_item_reauthed", f"Item {item_key}")
+    return {"ok": True}
+
+
+@app.post("/api/admin/plaid/{conn_id}/items/{item_key}/remove")
+async def plaid_item_remove(conn_id: str, item_key: str, request: Request):
+    """Remove an Item at Plaid (item/remove) and delete it from the vault."""
+    require_admin_api(request)
+    cid = normalize_id(conn_id)
+    conn = _plaid_conn_or_404(cid)
+    item = item_store.get(cid, item_key)
+    if not item:
+        raise HTTPException(status_code=404, detail="Stored bank connection not found")
+    token = item_store.get_access_token(cid, item_key)
+    secrets_d = store.get_secrets(cid)
+    if token:
+        try:
+            await _plaid_api_post(conn, secrets_d, "/item/remove",
+                                  {"access_token": token})
+        except HTTPException as exc:
+            # Still delete locally, but tell the admin Plaid-side removal failed.
+            item_store.delete(cid, item_key)
+            audit_log("admin", cid, "plaid_item_removed",
+                      f"Item {item_key} (Plaid remove failed: {exc.detail})")
+            return {"ok": True, "warning": f"Removed from vault, but Plaid said: {exc.detail}"}
+    item_store.delete(cid, item_key)
+    audit_log("admin", cid, "plaid_item_removed", f"Item {item_key}")
+    return {"ok": True}
+
+
 @app.get("/grants", response_class=HTMLResponse)
 async def grants_page(request: Request):
     if (resp := _admin_or_redirect(request)):
@@ -2340,6 +2539,35 @@ async def proxy_request(conn_id: str, request: Request):
                            "or secret — fix it in the vault dashboard")
             jbody["client_id"] = plaid_client_id
             jbody["secret"] = plaid_secret
+            # Stored-Item access token injection: the caller names a connected
+            # institution ("vault_item": key / institution / item_id) and the
+            # vault swaps in that Item's access token server-side.  Any
+            # agent-supplied access_token loses; tokens never leave the vault.
+            item_ref = jbody.pop("vault_item", None)
+            if item_ref is not None:
+                item = item_store.find(cid, str(item_ref))
+                if not item:
+                    known = ", ".join(
+                        i["key"] for i in item_store.list_items(cid)) or "none"
+                    audit_log(agent_name, cid, "proxy_auth_error",
+                              f"Unknown Plaid item '{str(item_ref)[:64]}'")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"No connected bank matches '{item_ref}'. "
+                               f"Connected institutions: {known}")
+                item_token = item_store.get_access_token(cid, item["key"])
+                if not item_token:
+                    audit_log(agent_name, cid, "proxy_auth_error",
+                              f"Plaid item '{item['key']}' has no usable token")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Bank connection '{item['key']}' has no usable "
+                               "access token — reconnect it in the vault's "
+                               "Plaid Banks page")
+                jbody["access_token"] = item_token
+            # Scrub every stored Item token from responses (Plaid echoes
+            # access tokens in several endpoint responses).
+            scrub_values.extend(item_store.all_access_tokens(cid))
             kwargs["json"] = jbody
 
     try:

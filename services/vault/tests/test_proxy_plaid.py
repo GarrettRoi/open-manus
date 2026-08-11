@@ -171,6 +171,133 @@ def test_evil_host_not_matched(client):
     assert r.status_code == 403  # host allowlist blocks it outright
 
 
+# ── Stored-Item access-token injection ─────────────────────────────────────
+
+ITEM_TOKEN = "access-production-item-token-abc123"
+
+
+@pytest.fixture()
+def item(client):
+    key = vault_app.item_store.save(
+        CONN_ID,
+        institution_name="Discover Bank",
+        institution_id="ins_33",
+        item_id="item-xyz-1",
+        access_token=ITEM_TOKEN,
+    )
+    yield key
+    vault_app.item_store.delete_all(CONN_ID)
+
+
+def test_vault_item_token_injected(client, item):
+    r = _proxy(client, {
+        "method": "POST", "path": "/accounts/balance/get",
+        "json": {"vault_item": item},
+    })
+    assert r.status_code == 200, r.text
+    jbody = _FakeAsyncClient.captured["json"]
+    assert jbody["access_token"] == ITEM_TOKEN
+    assert "vault_item" not in jbody
+    assert jbody["client_id"] == CLIENT_ID
+
+
+def test_vault_item_by_institution_name(client, item):
+    r = _proxy(client, {
+        "method": "POST", "path": "/accounts/get",
+        "json": {"vault_item": "discover"},
+    })
+    assert r.status_code == 200, r.text
+    assert _FakeAsyncClient.captured["json"]["access_token"] == ITEM_TOKEN
+
+
+def test_vault_item_overrides_agent_token(client, item):
+    """Agent-supplied access_token must lose to the stored Item token."""
+    r = _proxy(client, {
+        "method": "POST", "path": "/accounts/get",
+        "json": {"vault_item": item, "access_token": "agent-evil-token"},
+    })
+    assert r.status_code == 200, r.text
+    assert _FakeAsyncClient.captured["json"]["access_token"] == ITEM_TOKEN
+
+
+def test_vault_item_unknown_fails_closed(client, item):
+    _FakeAsyncClient.captured = {}
+    r = _proxy(client, {
+        "method": "POST", "path": "/accounts/get",
+        "json": {"vault_item": "NOSUCHBANK"},
+    })
+    assert r.status_code == 409, r.text
+    assert _FakeAsyncClient.captured == {}, "request must not reach upstream"
+    assert ITEM_TOKEN not in r.text
+
+
+def test_item_token_scrubbed_from_response(client, item):
+    """Plaid echoes access tokens in some responses — they must be scrubbed."""
+    class _EchoUpstream:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        encoding = "utf-8"
+        content = json.dumps({"access_token": ITEM_TOKEN, "ok": True}).encode()
+
+    orig = _FakeAsyncClient.request
+
+    async def echo_request(self, method, url, **kwargs):
+        _FakeAsyncClient.captured = {"method": method, "url": url, **kwargs}
+        return _EchoUpstream()
+
+    _FakeAsyncClient.request = echo_request
+    try:
+        r = _proxy(client, {"method": "POST", "path": "/item/get",
+                            "json": {"vault_item": item}})
+    finally:
+        _FakeAsyncClient.request = orig
+    assert r.status_code == 200, r.text
+    assert ITEM_TOKEN not in r.text
+    assert "***vault***" in r.text
+
+
+def test_item_token_scrubbed_even_without_vault_item(client, item):
+    """All stored Item tokens are scrubbed, not just the one injected."""
+    class _EchoUpstream:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        encoding = "utf-8"
+        content = json.dumps({"leak": ITEM_TOKEN}).encode()
+
+    orig = _FakeAsyncClient.request
+
+    async def echo_request(self, method, url, **kwargs):
+        _FakeAsyncClient.captured = {"method": method, "url": url, **kwargs}
+        return _EchoUpstream()
+
+    _FakeAsyncClient.request = echo_request
+    try:
+        r = _proxy(client, {"method": "POST", "path": "/institutions/get",
+                            "json": {"count": 1}})
+    finally:
+        _FakeAsyncClient.request = orig
+    assert r.status_code == 200, r.text
+    assert ITEM_TOKEN not in r.text
+
+
+def test_vault_item_with_missing_base_creds_fails_closed(client, item):
+    """Even with a valid Item, missing client_id/secret must 409."""
+    vault_app.store.save(
+        CONN_ID,
+        service="plaid",
+        label="Plaid test",
+        base_url="https://production.plaid.com",
+        auth={"kind": "header", "header_name": "PLAID-CLIENT-ID", "prefix": ""},
+        secrets={"api_key": CLIENT_ID},  # no PLAID-SECRET
+    )
+    _FakeAsyncClient.captured = {}
+    r = _proxy(client, {"method": "POST", "path": "/accounts/get",
+                        "json": {"vault_item": item}})
+    assert r.status_code == 409, r.text
+    assert _FakeAsyncClient.captured == {}
+    assert ITEM_TOKEN not in r.text
+
+
 def test_binary_response_scrubbed(client):
     """Credentials reflected in binary bodies must be scrubbed pre-base64."""
     import base64

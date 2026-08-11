@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+{% set active_page = "plaid" %}
+
+{% block title %}Plaid Banks{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>&#127974; Plaid Banks</h2>
+    <p>Connect financial institutions (Discover, Capital One, your bank…) through Plaid's secure login. Bank access tokens stay encrypted in the vault — agents call Plaid through the proxy and name a bank with <code>"vault_item"</code>; they never see tokens.</p>
+</div>
+
+{% if error %}<div class="card" style="border-color: var(--danger);"><strong style="color: var(--danger);">&#9888; {{ error }}</strong></div>{% endif %}
+{% if notice %}<div class="card" style="border-color: var(--success);"><strong style="color: var(--success);">&#10003; {{ notice }}</strong></div>{% endif %}
+
+{% if not plaid_conns %}
+<div class="card" style="border-color: var(--warning);">
+    <h3>&#9888; No Plaid connection yet</h3>
+    <p style="color: var(--text-muted);">
+        Before connecting banks, add a <strong>Plaid (bank &amp; card monitoring)</strong> service on the
+        <a href="/services">Services page</a> with your Plaid <code>client_id</code> and <code>secret</code>
+        from <a href="https://dashboard.plaid.com/developers/keys" target="_blank">dashboard.plaid.com</a>.
+        Then come back here to log into your institutions.
+    </p>
+</div>
+{% endif %}
+
+{% for pc in plaid_conns %}
+<div class="card">
+    <h3>&#128268; {{ pc.id }} <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">{{ pc.base_url }}</span></h3>
+
+    {% if not pc.creds_ok %}
+    <div style="border: 1px solid var(--warning); border-radius: var(--radius); padding: 12px; margin: 12px 0;">
+        <strong style="color: var(--warning);">&#9888; Missing Plaid credentials.</strong>
+        <span style="color: var(--text-muted);">This connection needs both the Plaid <code>client_id</code> (API key field) and the <code>secret</code> (second secret field). Edit it on the <a href="/services">Services page</a> — until then, bank logins can't start.</span>
+    </div>
+    {% else %}
+    <p style="margin: 8px 0;">
+        <button class="btn btn-primary" onclick="startLink('{{ pc.id }}', null, this)">&#10133; Connect a bank</button>
+    </p>
+    {% endif %}
+
+    {% if pc.items %}
+    <div class="table-responsive">
+        <table>
+            <thead><tr><th>Institution</th><th>Key (for agents)</th><th>Status</th><th>Connected</th><th>Actions</th></tr></thead>
+            <tbody>
+                {% for it in pc.items %}
+                <tr>
+                    <td><strong>{{ it.institution_name }}</strong>
+                        {% if it.institution_id %}<br><span style="font-size: 11px; color: var(--text-muted);">{{ it.institution_id }}</span>{% endif %}
+                    </td>
+                    <td><code>{{ it.key }}</code></td>
+                    <td>
+                        {% if it.status == 'active' %}
+                        <span class="badge badge-success">active</span>
+                        {% else %}
+                        <span class="badge badge-warning">{{ it.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="font-size: 12px; color: var(--text-muted);">{{ (it.created_at or '')[:16] }}</td>
+                    <td style="white-space: nowrap;">
+                        {% if pc.creds_ok %}
+                        <button class="btn btn-sm btn-outline" onclick="startLink('{{ pc.id }}', '{{ it.key }}', this)" title="Update-mode Link: re-authenticate this login">&#128260; Re-auth</button>
+                        {% endif %}
+                        <button class="btn btn-sm btn-danger" onclick="removeItem('{{ pc.id }}', '{{ it.key }}', this)">Remove</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p style="color: var(--text-muted); padding: 8px 0;">No banks connected yet{% if pc.creds_ok %} — click "Connect a bank" to log into your first institution{% endif %}.</p>
+    {% endif %}
+
+    <p style="font-size: 12px; color: var(--text-muted); margin-top: 10px;">
+        Agents use a connected bank by adding <code>"vault_item": "&lt;key&gt;"</code> to the JSON body of a proxied Plaid call —
+        e.g. <code>POST /accounts/balance/get</code> with <code>{"vault_item": "{{ pc.items[0].key if pc.items else 'DISCOVER' }}"}</code>.
+        The vault injects that bank's access token server-side.
+    </p>
+</div>
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script>
+async function startLink(connId, itemKey, btn) {
+    const orig = btn.textContent;
+    btn.textContent = '⏳…';
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/admin/plaid/' + connId + '/link-token', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(itemKey ? {item_key: itemKey} : {}),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            alert('Could not start bank login: ' + (data.detail || JSON.stringify(data)));
+            return;
+        }
+        const handler = Plaid.create({
+            token: data.link_token,
+            onSuccess: async function(public_token, metadata) {
+                try {
+                    if (itemKey) {
+                        // Update mode: the existing Item keeps its token.
+                        await fetch('/api/admin/plaid/' + connId + '/items/' + itemKey + '/reauth-done', {method: 'POST'});
+                    } else {
+                        const inst = (metadata && metadata.institution) || {};
+                        const ex = await fetch('/api/admin/plaid/' + connId + '/exchange', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                public_token: public_token,
+                                institution_name: inst.name || '',
+                                institution_id: inst.institution_id || '',
+                            }),
+                        });
+                        const exd = await ex.json();
+                        if (!ex.ok) {
+                            alert('Bank login succeeded but saving failed: ' + (exd.detail || JSON.stringify(exd)));
+                            return;
+                        }
+                    }
+                    window.location = '/plaid?notice=Bank+connected';
+                } catch (e) {
+                    alert('Saving the bank connection failed: ' + e);
+                }
+            },
+            onExit: function(err) {
+                if (err) alert('Bank login exited: ' + (err.display_message || err.error_message || err.error_code || 'unknown error'));
+            },
+        });
+        handler.open();
+    } catch (e) {
+        alert('Error: ' + e);
+    } finally {
+        btn.textContent = orig;
+        btn.disabled = false;
+    }
+}
+
+async function removeItem(connId, itemKey, btn) {
+    if (!confirm('Remove ' + itemKey + '? This revokes the bank login at Plaid and deletes its token from the vault.')) return;
+    btn.textContent = '⏳…';
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/admin/plaid/' + connId + '/items/' + itemKey + '/remove', {method: 'POST'});
+        const data = await resp.json();
+        if (!resp.ok) {
+            alert('Remove failed: ' + (data.detail || JSON.stringify(data)));
+            btn.textContent = 'Remove';
+            btn.disabled = false;
+            return;
+        }
+        if (data.warning) alert(data.warning);
+        window.location = '/plaid?notice=Bank+removed';
+    } catch (e) {
+        alert('Remove failed: ' + e);
+        btn.textContent = 'Remove';
+        btn.disabled = false;
+    }
+}
+</script>
+{% endblock %}
