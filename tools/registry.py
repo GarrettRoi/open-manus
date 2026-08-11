@@ -598,7 +598,15 @@ class ToolRegistry:
                         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                                       inspect.Parameter.KEYWORD_ONLY)
                     }
-                    kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+                    # Only the documented dispatch-context keys may be
+                    # silently dropped — anything else still raises so
+                    # dispatcher/handler integration bugs stay visible.
+                    _CONTEXT_KEYS = {
+                        "task_id", "session_id", "user_task", "enabled_tools"}
+                    kwargs = {
+                        k: v for k, v in kwargs.items()
+                        if k in accepted or k not in _CONTEXT_KEYS
+                    }
             except (ValueError, TypeError):
                 pass  # unintrospectable handler — pass kwargs through as before
         try:
