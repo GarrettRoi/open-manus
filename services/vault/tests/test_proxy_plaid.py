@@ -129,3 +129,71 @@ def test_non_plaid_host_untouched(client, monkeypatch):
         assert _FakeAsyncClient.captured["json"] == {"a": 1}
     finally:
         vault_app.store.delete("e2e_notplaid_proxy", [])
+
+
+def test_plaid_get_not_injected(client):
+    """GET requests carry no body; nothing to inject."""
+    r = _proxy(client, {"method": "GET", "path": "/health"})
+    assert r.status_code == 200, r.text
+    assert "json" not in _FakeAsyncClient.captured or \
+        _FakeAsyncClient.captured.get("json") is None
+
+
+def test_plaid_non_dict_json_rejected(client):
+    r = _proxy(client, {"method": "POST", "path": "/accounts/get", "json": [1, 2]})
+    assert r.status_code == 400
+    assert "JSON object" in r.text
+
+
+def test_plaid_missing_secret_fails_closed(client):
+    """Missing stored secret must 409, never forward agent-supplied creds."""
+    vault_app.store.save(
+        CONN_ID,
+        service="plaid",
+        label="Plaid test",
+        base_url="https://production.plaid.com",
+        auth={"kind": "header", "header_name": "PLAID-CLIENT-ID", "prefix": ""},
+        secrets={"api_key": CLIENT_ID},  # no PLAID-SECRET
+    )
+    _FakeAsyncClient.captured = {}
+    r = _proxy(client, {
+        "method": "POST", "path": "/accounts/get",
+        "json": {"client_id": "agent-supplied", "secret": "agent-supplied"},
+    })
+    assert r.status_code == 409, r.text
+    assert _FakeAsyncClient.captured == {}, "request must not reach upstream"
+
+
+def test_evil_host_not_matched(client):
+    """evilplaid.com is neither injected into nor allowed at all."""
+    r = _proxy(client, {"method": "POST", "path": "https://evilplaid.com/x",
+                        "json": {}})
+    assert r.status_code == 403  # host allowlist blocks it outright
+
+
+def test_binary_response_scrubbed(client):
+    """Credentials reflected in binary bodies must be scrubbed pre-base64."""
+    import base64
+
+    class _BinUpstream:
+        status_code = 200
+        headers = {"content-type": "application/octet-stream"}
+        encoding = "utf-8"
+        content = b"prefix" + SECRET.encode() + b"mid" + CLIENT_ID.encode() + b"suffix"
+
+    orig = _FakeAsyncClient.request
+
+    async def bin_request(self, method, url, **kwargs):
+        _FakeAsyncClient.captured = {"method": method, "url": url, **kwargs}
+        return _BinUpstream()
+
+    _FakeAsyncClient.request = bin_request
+    try:
+        r = _proxy(client, {"method": "POST", "path": "/accounts/get", "json": {}})
+    finally:
+        _FakeAsyncClient.request = orig
+    assert r.status_code == 200, r.text
+    decoded = base64.b64decode(r.json()["body_base64"])
+    assert SECRET.encode() not in decoded
+    assert CLIENT_ID.encode() not in decoded
+    assert b"***vault***" in decoded

@@ -2317,18 +2317,30 @@ async def proxy_request(conn_id: str, request: Request):
             jbody = kwargs.get("json")
             if jbody is None:
                 jbody = {}
-            if isinstance(jbody, dict):
-                plaid_secret = None
-                extra_h = secrets_d.get("extra_headers")
-                if isinstance(extra_h, dict):
-                    for hn, hv in extra_h.items():
-                        if isinstance(hn, str) and hn.lower() == "plaid-secret":
-                            plaid_secret = str(hv)
-                if secrets_d.get("api_key"):
-                    jbody["client_id"] = secrets_d["api_key"]
-                if plaid_secret:
-                    jbody["secret"] = plaid_secret
-                kwargs["json"] = jbody
+            if not isinstance(jbody, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Plaid requests need a JSON object body — the vault "
+                           "injects client_id/secret into it")
+            plaid_secret = None
+            extra_h = secrets_d.get("extra_headers")
+            if isinstance(extra_h, dict):
+                for hn, hv in extra_h.items():
+                    if isinstance(hn, str) and hn.lower() == "plaid-secret":
+                        plaid_secret = str(hv)
+            plaid_client_id = secrets_d.get("api_key")
+            # Fail closed: never forward a Plaid write with partial/agent
+            # credentials — stored values are the only accepted source.
+            if not plaid_client_id or not plaid_secret:
+                audit_log(agent_name, cid, "proxy_auth_error",
+                          "Plaid connection missing client_id/secret")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Plaid connection is missing its stored client_id "
+                           "or secret — fix it in the vault dashboard")
+            jbody["client_id"] = plaid_client_id
+            jbody["secret"] = plaid_secret
+            kwargs["json"] = jbody
 
     try:
         async with httpx.AsyncClient(follow_redirects=False) as client:
@@ -2362,6 +2374,11 @@ async def proxy_request(conn_id: str, request: Request):
         result["text"] = _scrub(raw.decode(upstream.encoding or "utf-8", "replace"))
     else:
         import base64
+        # Scrub injected credentials from binary bodies too — an upstream
+        # could reflect them in an octet-stream that agents can decode.
+        for sv in scrub_values:
+            if len(sv) >= 8:
+                raw = raw.replace(sv.encode(), b"***vault***")
         result["body_base64"] = base64.b64encode(raw).decode()
 
     audit_log(agent_name, cid, "proxy_call",
