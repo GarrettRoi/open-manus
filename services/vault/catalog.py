@@ -245,9 +245,10 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "endpoint. Same Google OAuth app as the combined connection."
         ),
         "example_call": "vault_<id>_sheets with operation='get'",
-        # No lightweight list endpoint — use the Drive about probe via www.googleapis.com.
-        # Sheets v4 has no ping; a 400/404 still proves auth works.
-        "test_probe": {"method": "GET", "path": "/v4/spreadsheets"},
+        # Sheets v4 has no read-only ping endpoint (/v4/spreadsheets 4xxes by
+        # design) — validate the granted token via Google tokeninfo instead.
+        "test_probe": {"method": "GET", "path": "/tokeninfo",
+                       "google_tokeninfo": True},
     },
     "google_docs": {
         "label": "Google Docs (dedicated)",
@@ -262,7 +263,9 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Docs connection.",
         "example_call": "vault_<id>_docs with operation='get'",
-        "test_probe": {"method": "GET", "path": "/v1/documents"},
+        # Docs v1 has no list endpoint — validate the token via tokeninfo.
+        "test_probe": {"method": "GET", "path": "/tokeninfo",
+                       "google_tokeninfo": True},
     },
     "google_slides": {
         "label": "Google Slides (dedicated)",
@@ -277,7 +280,9 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Slides connection.",
         "example_call": "vault_<id>_slides with operation='get'",
-        "test_probe": {"method": "GET", "path": "/v1/presentations"},
+        # Slides v1 has no list endpoint — validate the token via tokeninfo.
+        "test_probe": {"method": "GET", "path": "/tokeninfo",
+                       "google_tokeninfo": True},
     },
     "google_forms": {
         "label": "Google Forms (dedicated)",
@@ -295,7 +300,9 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
         "setup_help": "Dedicated Google Forms connection.",
         "example_call": "vault_<id>_forms with operation='get'",
-        "test_probe": {"method": "GET", "path": "/v1/forms"},
+        # Forms v1 has no list endpoint — validate the token via tokeninfo.
+        "test_probe": {"method": "GET", "path": "/tokeninfo",
+                       "google_tokeninfo": True},
     },
     "google_calendar": {
         "label": "Google Calendar (dedicated)",

@@ -121,64 +121,100 @@ class TestDedicatedGoogleProbeHosts:
 
 
 # ---------------------------------------------------------------------------
-# 3. Simulate probe responses through the test-engine classification logic
+# 3. Google-aware 401/403 classification (_google_auth_verdict)
 # ---------------------------------------------------------------------------
 
-def _classify(status: int):
-    """Mirror the classification logic from app._run_connection_test."""
-    if status in (401, 403):
-        return False, f"Auth rejected (HTTP {status})"
-    elif status >= 500:
-        return False, f"Server error (HTTP {status})"
-    else:
-        return True, f"HTTP {status}"
+def _google_resp(status: int, body: dict | None = None) -> httpx.Response:
+    return httpx.Response(
+        status_code=status,
+        json=body if body is not None else {},
+    )
 
 
-class TestProbeClassification:
-    """Simulate HTTP responses for each Google probe and verify ok/reason."""
+class TestGoogleAuthVerdict:
+    """403s from Google are only auth failures when the body says so."""
 
-    @pytest.mark.parametrize("service,good_status,bad_status", [
-        ("google",          200, 401),   # Drive about → 200 when authed
-        ("google_gmail",    200, 401),   # Gmail profile → 200 when authed
-        ("google_drive",    200, 401),   # Drive about → 200 when authed
-        ("google_sheets",   404, 401),   # No list endpoint → 404 when authed
-        ("google_docs",     404, 401),   # No list endpoint → 404 when authed
-        ("google_slides",   404, 401),   # No list endpoint → 404 when authed
-        ("google_forms",    404, 401),   # No list endpoint → 404 when authed
-        ("google_calendar", 200, 401),   # calendarList → 200 when authed
-        ("google_tasks",    200, 401),   # tasklist → 200 when authed
-        ("google_people",   200, 401),   # people/me → 200 when authed
-        ("google_meet",     400, 401),   # spaces needs filter → 400 when authed
-        ("google_app_script", 200, 401), # projects list → 200 when authed
+    def test_api_not_enabled_is_credentials_ok(self):
+        import app as vault_app
+        resp = _google_resp(403, {"error": {
+            "code": 403,
+            "message": ("Google Drive API has not been used in project 12345 "
+                        "before or it is disabled."),
+            "status": "PERMISSION_DENIED",
+            "errors": [{"reason": "accessNotConfigured",
+                        "message": "Access Not Configured"}],
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                         "reason": "SERVICE_DISABLED",
+                         "metadata": {"service": "drive.googleapis.com"}}],
+        }})
+        ok, reason = asyncio.run(
+            vault_app._google_auth_verdict(403, resp, "tok"))
+        assert ok is True
+        assert "credentials OK" in reason
+        assert "Drive API" in reason
+        assert "not enabled" in reason
+
+    def test_rate_limit_is_credentials_ok(self):
+        import app as vault_app
+        resp = _google_resp(403, {"error": {
+            "code": 403, "message": "Rate Limit Exceeded",
+            "errors": [{"reason": "rateLimitExceeded"}],
+        }})
+        ok, reason = asyncio.run(
+            vault_app._google_auth_verdict(403, resp, "tok"))
+        assert ok is True
+        assert "credentials OK" in reason
+
+    def test_401_is_auth_rejected(self):
+        import app as vault_app
+        resp = _google_resp(401, {"error": {
+            "code": 401, "message": "Invalid Credentials",
+            "status": "UNAUTHENTICATED",
+        }})
+        ok, reason = asyncio.run(
+            vault_app._google_auth_verdict(401, resp, "tok"))
+        assert ok is False
+        assert "re-login" in reason
+
+    def test_ambiguous_403_with_valid_token_is_ok(self):
+        import app as vault_app
+        resp = _google_resp(403, {"error": {
+            "code": 403, "message": "The caller does not have permission",
+            "status": "PERMISSION_DENIED",
+        }})
+        with patch.object(vault_app, "_google_tokeninfo_ok",
+                          AsyncMock(return_value=True)):
+            ok, reason = asyncio.run(
+                vault_app._google_auth_verdict(403, resp, "tok"))
+        assert ok is True
+        assert "credentials OK" in reason
+
+    def test_ambiguous_403_with_invalid_token_is_fail(self):
+        import app as vault_app
+        resp = _google_resp(403, {"error": {
+            "code": 403, "message": "The caller does not have permission",
+            "status": "PERMISSION_DENIED",
+        }})
+        with patch.object(vault_app, "_google_tokeninfo_ok",
+                          AsyncMock(return_value=False)):
+            ok, reason = asyncio.run(
+                vault_app._google_auth_verdict(403, resp, "tok"))
+        assert ok is False
+        assert "re-login" in reason
+
+
+class TestTokeninfoProbes:
+    """Services without a clean read-only endpoint use the tokeninfo probe."""
+
+    @pytest.mark.parametrize("service", [
+        "google_sheets", "google_docs", "google_slides", "google_forms",
     ])
-    def test_authenticated_response_is_ok(self, service, good_status, bad_status):
-        ok, reason = _classify(good_status)
-        assert ok is True, (
-            f"[{service}] authenticated status {good_status} should be ok=True, "
-            f"got ok={ok} reason={reason}"
+    def test_probe_uses_tokeninfo(self, service):
+        tpl = get_template(service)
+        assert tpl["test_probe"].get("google_tokeninfo") is True, (
+            f"[{service}] should use the scope-independent tokeninfo probe"
         )
-
-    @pytest.mark.parametrize("service,good_status,bad_status", [
-        ("google",          200, 401),
-        ("google_gmail",    200, 401),
-        ("google_drive",    200, 401),
-        ("google_sheets",   404, 401),
-        ("google_docs",     404, 401),
-        ("google_slides",   404, 401),
-        ("google_forms",    404, 401),
-        ("google_calendar", 200, 401),
-        ("google_tasks",    200, 401),
-        ("google_people",   200, 401),
-        ("google_meet",     400, 401),
-        ("google_app_script", 200, 401),
-    ])
-    def test_unauthenticated_response_is_fail(self, service, good_status, bad_status):
-        ok, reason = _classify(bad_status)
-        assert ok is False, (
-            f"[{service}] unauthenticated status {bad_status} should be ok=False, "
-            f"got ok={ok} reason={reason}"
-        )
-        assert "Auth rejected" in reason
+        assert "oauth2.googleapis.com" in tpl["allowed_hosts"]
 
 
 # ---------------------------------------------------------------------------

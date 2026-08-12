@@ -418,6 +418,108 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
 _UNTESTABLE_KINDS = {"apple", "macincloud", "email"}
 
 
+# ── Google-aware probe classification ────────────────────────────────────────
+# Google APIs return 403 for non-auth reasons: the probed API not being enabled
+# in the OAuth app's Cloud project ("accessNotConfigured"/"SERVICE_DISABLED"),
+# or rate/quota limits. Only treat 401/UNAUTHENTICATED (or a token that fails
+# an independent tokeninfo check) as a real auth failure.
+
+_GOOGLE_DISABLED_REASONS = {"accessnotconfigured", "service_disabled"}
+_GOOGLE_RATE_REASONS = {
+    "ratelimitexceeded", "userratelimitexceeded", "quotaexceeded",
+    "dailylimitexceeded", "resource_exhausted",
+}
+
+
+def _google_error_info(resp) -> Dict[str, Any]:
+    """Parse a Google JSON error body into {reasons: set, message: str}."""
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return {"reasons": set(), "message": "", "service": ""}
+    reasons = set()
+    service = ""
+    for e in err.get("errors") or []:
+        if isinstance(e, dict) and e.get("reason"):
+            reasons.add(str(e["reason"]).lower())
+    for d in err.get("details") or []:
+        if isinstance(d, dict):
+            if d.get("reason"):
+                reasons.add(str(d["reason"]).lower())
+            meta = d.get("metadata")
+            if isinstance(meta, dict) and meta.get("service"):
+                service = str(meta["service"])
+    if err.get("status"):
+        reasons.add(str(err["status"]).lower())
+    return {
+        "reasons": reasons,
+        "message": str(err.get("message") or "")[:200],
+        "service": service,
+    }
+
+
+def _google_api_label(info: Dict[str, Any]) -> str:
+    """Human name of the disabled API, e.g. 'Drive API'."""
+    svc = info.get("service") or ""
+    if svc.endswith(".googleapis.com"):
+        return svc[: -len(".googleapis.com")].replace("-json", "").capitalize() + " API"
+    m = re.search(r"([A-Za-z][A-Za-z ]*? API)\b", info.get("message") or "")
+    if m:
+        return m.group(1)
+    return "probed API"
+
+
+async def _google_tokeninfo_ok(access_token: str) -> Optional[bool]:
+    """True if the token is valid, False if rejected, None if unreachable."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r2 = await client.get(
+                "https://oauth2.googleapis.com/tokeninfo",
+                params={"access_token": access_token},
+                timeout=10.0,
+            )
+        return r2.status_code == 200
+    except httpx.RequestError:
+        return None
+
+
+async def _google_auth_verdict(status: int, resp,
+                               access_token: Optional[str]) -> tuple:
+    """Classify a 401/403 from a Google API host. Returns (ok, reason)."""
+    info = _google_error_info(resp)
+    reasons = info["reasons"]
+    msg = info["message"]
+
+    if status == 403:
+        if (reasons & _GOOGLE_DISABLED_REASONS
+                or "has not been used in project" in msg
+                or "it is disabled" in msg):
+            label = _google_api_label(info)
+            return True, (
+                f"credentials OK — {label} not enabled in the Google Cloud "
+                "project (enable it in the Cloud console to use this service)"
+            )
+        if reasons & _GOOGLE_RATE_REASONS:
+            return True, "credentials OK — probe hit a rate/quota limit (HTTP 403)"
+
+    if status == 401 or "unauthenticated" in reasons or "invalid credentials" in msg.lower():
+        return False, "Auth rejected — token invalid or expired, needs re-login"
+
+    # Ambiguous 403 — verify the token independently via tokeninfo.
+    tok_ok = await _google_tokeninfo_ok(access_token) if access_token else False
+    if tok_ok:
+        return True, (
+            f"credentials OK — probe returned HTTP {status}"
+            + (f" ({msg})" if msg else " (permission denied)")
+        )
+    if tok_ok is None:
+        return False, f"HTTP {status} — could not verify token (tokeninfo unreachable)"
+    return False, "Auth rejected — token invalid or expired, needs re-login"
+
+
 async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
     """Fire a safe, read-only probe for *conn_id*. Never raises — always returns
     a sanitized dict with at least {ok, reason, tested_at}.
@@ -515,6 +617,15 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
         path = "/" + path
     url = base_url + path
 
+    # Scope-independent Google auth check: some Google APIs have no clean,
+    # read-only "ping" endpoint (Sheets/Docs/Slides/Forms return 4xx by
+    # design on their collection roots). For those, the catalog marks the
+    # probe with google_tokeninfo=True and we validate the granted OAuth
+    # token directly against Google's tokeninfo endpoint instead.
+    google_tokeninfo = bool(probe.get("google_tokeninfo")) and auth_kind == "oauth2"
+    if google_tokeninfo:
+        url = "https://oauth2.googleapis.com/tokeninfo"
+
     # SSRF guard — same logic as the proxy route
     allowed = store.allowed_hosts(conn)
     try:
@@ -544,6 +655,7 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
             if isinstance(v, str) and len(v) >= 8
         )
 
+    access_token: Optional[str] = None
     if auth_kind == "oauth2":
         try:
             access_token, _ = await oauth_mod.get_valid_access_token(
@@ -587,6 +699,11 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
     headers = dict(injected["headers"])
     params = dict(injected["params"])
 
+    if google_tokeninfo:
+        # Token goes in the query for tokeninfo; no auth headers needed.
+        headers = {}
+        params = {"access_token": access_token or ""}
+
     kwargs: Dict[str, Any] = {
         "headers": headers,
         "params": params or None,
@@ -610,11 +727,31 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
         return _make(False, reason, elapsed_ms=elapsed)
 
     status = resp.status_code
+
+    if google_tokeninfo:
+        # tokeninfo: 200 = token valid; anything else = token invalid/expired.
+        if status == 200:
+            ok = True
+            reason = "token valid (Google tokeninfo)"
+        else:
+            ok = False
+            reason = "Auth rejected — token invalid or expired, needs re-login"
+        _persist("1" if ok else "0", reason, str(status), str(elapsed))
+        return _make(ok, reason, status_code=status, elapsed_ms=elapsed)
+
     # auth_ok heuristic: 401/403 = auth failure; 5xx = server error;
     # anything else (including 404 on a known probe path) = auth worked.
     if status in (401, 403):
-        ok = False
-        reason = f"Auth rejected (HTTP {status})"
+        if target_host.endswith(".googleapis.com") and auth_kind == "oauth2":
+            # Google returns 403 for non-auth reasons (API not enabled in the
+            # Cloud project, rate limits). Inspect the error body and, when
+            # ambiguous, verify the token independently via tokeninfo.
+            ok, reason = await _google_auth_verdict(status, resp, access_token)
+            for sv in scrub_values:
+                reason = reason.replace(sv, "***vault***")
+        else:
+            ok = False
+            reason = f"Auth rejected (HTTP {status})"
     elif status >= 500:
         ok = False
         reason = f"Server error (HTTP {status})"
