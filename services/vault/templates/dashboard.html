@@ -75,6 +75,23 @@
     {% endif %}
 </div>
 
+<div class="card" id="discord-coverage-card">
+    <h3>&#128172; Discord Server Coverage</h3>
+    <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 12px;">
+        Servers on your Discord account vs. servers the fleet reader bot can read.
+        Needs a <em>Discord (your account)</em> OAuth connection and a
+        <em>Discord read-only (reader bot)</em> connection on the
+        <a href="/services">Services</a> page.
+    </p>
+    <div id="discord-coverage-body">
+        <span style="color: var(--text-muted); font-size: 13px;">Loading coverage&#8230;</span>
+    </div>
+    <div style="margin-top: 10px;">
+        <button class="btn btn-sm" style="background: var(--surface-hover); color: var(--text);"
+                onclick="loadDiscordCoverage(this)">&#8635; Refresh Coverage</button>
+    </div>
+</div>
+
 <div class="card" id="replit-mcp-card">
     <h3>&#128640; Dev Request Dispatch</h3>
     <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
@@ -163,6 +180,90 @@ function mkEl(tag, attrs, text) {
 function mkBadge(cssClass, text) {
     return mkEl('span', { class: 'badge ' + cssClass }, text);
 }
+
+async function loadDiscordCoverage(btn) {
+    var body = document.getElementById('discord-coverage-body');
+    if (btn) { btn.disabled = true; btn.textContent = 'Refreshing\u2026'; }
+    try {
+        var resp = await fetch('/api/admin/discord/coverage');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var d = await resp.json();
+        body.innerHTML = '';
+
+        if (!d.user && !d.reader) {
+            body.appendChild(mkEl('span', { style: 'color:var(--text-muted);font-size:13px;' },
+                'Not set up yet — add the two Discord connections on the Services page, then click Connect on the OAuth one.'));
+            return;
+        }
+
+        var row = mkEl('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;' });
+        if (d.user && !d.user.error) {
+            row.appendChild(mkBadge('badge-success', '\u2713 Connected as ' + (d.user.global_name || d.user.username || '?')));
+        } else if (d.user && d.user.error) {
+            row.appendChild(mkBadge('badge-danger', '\u26A0 Account: ' + d.user.error));
+        } else {
+            row.appendChild(mkBadge('badge-warning', '\u26A0 No Discord account connected'));
+        }
+        if (d.reader && !d.reader.error && d.reader.has_token) {
+            row.appendChild(mkBadge('badge-success', '\u2713 Reader bot (' + (d.reader.guild_count != null ? d.reader.guild_count : '?') + ' servers)'));
+        } else if (d.reader && d.reader.error) {
+            row.appendChild(mkBadge('badge-danger', '\u26A0 Reader bot: ' + d.reader.error));
+        } else {
+            row.appendChild(mkBadge('badge-warning', '\u26A0 No reader bot connection'));
+        }
+        body.appendChild(row);
+
+        var guilds = d.guilds || [];
+        if (!guilds.length) {
+            body.appendChild(mkEl('span', { style: 'color:var(--text-muted);font-size:13px;' },
+                d.user && !d.user.error ? 'No servers found on your account.' :
+                'Connect your Discord account to see your server list.'));
+            return;
+        }
+        var wrap = mkEl('div', { class: 'table-responsive' });
+        var table = mkEl('table');
+        var thead = mkEl('thead');
+        var htr = mkEl('tr');
+        ['Server', 'Coverage', 'Action'].forEach(function(h) { htr.appendChild(mkEl('th', null, h)); });
+        thead.appendChild(htr);
+        table.appendChild(thead);
+        var tbody = mkEl('tbody');
+        guilds.forEach(function(g) {
+            var tr = mkEl('tr');
+            var nameTd = mkEl('td');
+            nameTd.appendChild(mkEl('strong', null, g.name || g.id));
+            if (g.owner) nameTd.appendChild(mkEl('span', { style: 'font-size:11px;color:var(--text-muted);margin-left:6px;' }, '(owner)'));
+            tr.appendChild(nameTd);
+            var covTd = mkEl('td');
+            covTd.appendChild(mkBadge(g.covered ? 'badge-success' : 'badge-warning',
+                g.covered ? '\u2713 readable' : 'not covered'));
+            tr.appendChild(covTd);
+            var actTd = mkEl('td');
+            if (!g.covered && g.invite_url) {
+                var a = mkEl('a', { href: g.invite_url, target: '_blank', class: 'btn btn-sm btn-primary' },
+                    'Invite reader bot (read-only)');
+                actTd.appendChild(a);
+            } else if (!g.covered) {
+                actTd.appendChild(mkEl('span', { style: 'font-size:12px;color:var(--text-muted);' },
+                    'set the bot application ID to get an invite link'));
+            } else {
+                actTd.appendChild(mkEl('span', { style: 'font-size:12px;color:var(--text-muted);' }, '\u2014'));
+            }
+            tr.appendChild(actTd);
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        body.appendChild(wrap);
+    } catch (e) {
+        body.textContent = 'Could not load Discord coverage: ' + e.message;
+        body.style.color = 'var(--danger)';
+        body.style.fontSize = '13px';
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '\u21BA Refresh Coverage'; }
+    }
+}
+loadDiscordCoverage(null);
 
 (async function loadReplitStatus() {
     var statusEl = document.getElementById('replit-mcp-status');

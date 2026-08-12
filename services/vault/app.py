@@ -33,6 +33,8 @@ from pydantic import BaseModel, Field
 from apple_ops import AppleOpsError, run_apple_operation
 
 import custom_mcp
+import discord_ops
+from discord_ops import DiscordOpsError
 import email_ops
 import google_ops
 import mac_ops
@@ -1067,6 +1069,11 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
             return RedirectResponse(url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         if extra_headers:
             secrets_d["extra_headers"] = extra_headers
+        # Discord reader bot: optional application ID used for invite links.
+        if service == "discord_read":
+            app_id = (form.get("application_id") or "").strip()
+            if app_id:
+                secrets_d["application_id"] = app_id
         # Services with extra_secret (e.g. Alpaca, Plaid) need a second
         # encrypted header; the header name comes from the catalog template.
         if tpl.get("extra_secret"):
@@ -1150,6 +1157,10 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
     # Services with extra_secret (e.g. Alpaca, Plaid): rotate the second
     # encrypted header; the header name comes from the catalog template.
     _conn_tpl = get_template(conn.get("service", "")) or {}
+    if (conn.get("service") or "") == "discord_read":
+        _app_id = (form.get("application_id") or "").strip()
+        if _app_id:
+            secrets_d["application_id"] = _app_id
     if _conn_tpl.get("extra_secret"):
         api_secret = (form.get("api_secret") or "").strip()
         if api_secret:
@@ -2470,6 +2481,20 @@ async def proxy_request(conn_id: str, request: Request):
     if httpx.URL(url).scheme != "https":
         raise HTTPException(status_code=403, detail="Only https upstream URLs are allowed")
 
+    # Read-only enforcement (e.g. discord_read): only GET/HEAD on an explicit
+    # allowlist of read paths. Any write-style call is rejected here, before
+    # any credential is attached or any network request is made.
+    tpl_ro = get_template(conn.get("service", "")) or {}
+    if tpl_ro.get("read_only"):
+        if not discord_ops.readonly_allowed(method, host or "", httpx.URL(url).path):
+            audit_log(agent_name, cid, "proxy_blocked_readonly",
+                      f"{method} {httpx.URL(url).path}")
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{cid}' is a read-only connection — only read "
+                       "operations (list channels, read message history, "
+                       "fetch attachments) are allowed. This call was blocked.")
+
     # Caller headers minus anything auth-ish; vault injects the real credential.
     headers = {
         k: v for k, v in (body.get("headers") or {}).items()
@@ -2612,6 +2637,159 @@ async def proxy_request(conn_id: str, request: Request):
     audit_log(agent_name, cid, "proxy_call",
               f"{method} {httpx.URL(url).path} -> {upstream.status_code}")
     return JSONResponse(result, status_code=200)
+
+
+@app.post("/api/vault/discord/{conn_id}")
+async def discord_read_call(conn_id: str, request: Request):
+    """Structured read-only Discord operations for agents.
+
+    Body: {"operation": "list_servers|list_channels|read_messages|"
+           "extract_links|download_attachment", "args": {...}}
+    The vault runs the call with the stored reader-bot token server-side;
+    the token never leaves the vault. Only read operations exist here.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "discord_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("service") or "") != "discord_read":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not a Discord read-only connection. "
+                   "Use POST /api/vault/proxy/{conn_id} for HTTP proxy connections.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    operation = str(body.get("operation") or "").strip()
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+
+    secrets_d = store.get_secrets(cid)
+    bot_token = secrets_d.get("api_key", "")
+    if not bot_token:
+        raise HTTPException(status_code=409,
+                            detail="No bot token stored — add it in the vault dashboard")
+
+    try:
+        result = await discord_ops.run_discord_operation(bot_token, operation, args)
+    except DiscordOpsError as exc:
+        audit_log(agent_name, cid, "discord_op_error", f"{operation}: {str(exc)[:150]}")
+        raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Discord request failed: {exc}")
+
+    audit_log(agent_name, cid, "discord_read", operation)
+    # Belt-and-braces: never echo the bot token even if Discord reflected it.
+    raw = json.dumps(result, ensure_ascii=False, default=str)
+    if len(bot_token) >= 8 and bot_token in raw:
+        result = json.loads(raw.replace(bot_token, "***vault***"))
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Admin — Discord server discovery & reader-bot coverage
+# ---------------------------------------------------------------------------
+def _find_conn_by_service(service: str) -> Optional[Dict[str, Any]]:
+    for cid in store.list_ids():
+        conn = store.get(cid)
+        if conn and (conn.get("service") or "") == service:
+            return conn
+    return None
+
+
+@app.get("/api/admin/discord/coverage")
+async def discord_coverage(request: Request):
+    """Owner's guilds (via the user-OAuth connection) cross-referenced with
+    the guilds the fleet reader bot is already in, plus read-only invite
+    links for uncovered guilds."""
+    require_admin_api(request)
+    result: Dict[str, Any] = {"user": None, "reader": None, "guilds": []}
+
+    user_conn = _find_conn_by_service("discord_user")
+    reader_conn = _find_conn_by_service("discord_read")
+
+    bot_guild_ids: set = set()
+    application_id = ""
+    if reader_conn:
+        secrets_d = store.get_secrets(reader_conn["id"])
+        bot_token = secrets_d.get("api_key", "")
+        application_id = str(secrets_d.get("application_id") or "").strip()
+        reader_info: Dict[str, Any] = {
+            "connection_id": reader_conn["id"],
+            "has_token": bool(bot_token),
+            "application_id": application_id,
+        }
+        if bot_token:
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    hdrs = {"Authorization": f"Bot {bot_token}"}
+                    resp = await client.get(
+                        f"{discord_ops.DISCORD_API}/users/@me/guilds", headers=hdrs)
+                    resp.raise_for_status()
+                    bot_guild_ids = {g.get("id") for g in resp.json()}
+                    reader_info["guild_count"] = len(bot_guild_ids)
+                    if not application_id:
+                        app_resp = await client.get(
+                            f"{discord_ops.DISCORD_API}/oauth2/applications/@me",
+                            headers=hdrs)
+                        if app_resp.status_code < 400:
+                            application_id = str(app_resp.json().get("id") or "")
+                            reader_info["application_id"] = application_id
+            except Exception as exc:
+                reader_info["error"] = f"Could not reach Discord with the bot token: {exc}"
+        result["reader"] = reader_info
+
+    if user_conn:
+        try:
+            access_token, _ = await oauth_mod.get_valid_access_token(
+                "discord_user", user_conn["id"], store, conn=user_conn)
+        except OAuthError as exc:
+            result["user"] = {"connection_id": user_conn["id"],
+                              "error": str(exc)}
+            return JSONResponse(result)
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                hdrs = {"Authorization": f"Bearer {access_token}"}
+                me = await client.get(f"{discord_ops.DISCORD_API}/users/@me",
+                                      headers=hdrs)
+                me.raise_for_status()
+                me_d = me.json()
+                guilds_resp = await client.get(
+                    f"{discord_ops.DISCORD_API}/users/@me/guilds", headers=hdrs)
+                guilds_resp.raise_for_status()
+                guilds = guilds_resp.json()
+        except Exception as exc:
+            result["user"] = {"connection_id": user_conn["id"],
+                              "error": f"Discord call failed: {exc}"}
+            return JSONResponse(result)
+        result["user"] = {
+            "connection_id": user_conn["id"],
+            "id": me_d.get("id"),
+            "username": me_d.get("username"),
+            "global_name": me_d.get("global_name"),
+        }
+        for g in guilds:
+            gid = str(g.get("id") or "")
+            covered = gid in bot_guild_ids
+            entry: Dict[str, Any] = {
+                "id": gid,
+                "name": g.get("name"),
+                "owner": bool(g.get("owner")),
+                "covered": covered,
+            }
+            if not covered and application_id:
+                entry["invite_url"] = discord_ops.invite_url(application_id, gid)
+            result["guilds"].append(entry)
+    return JSONResponse(result)
 
 
 @app.post("/api/vault/mcp/{conn_id}")

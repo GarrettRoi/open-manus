@@ -345,6 +345,44 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
                 "required": ["operation"],
             },
         }
+    if service == "discord_read":
+        return {
+            "name": tool_name,
+            "description": description + (
+                "\nREAD-ONLY Discord access via the fleet reader bot (works in "
+                "any server the reader bot has been invited to; the vault "
+                "rejects every write-style call).\nOperations:"
+                "\n• list_servers — servers the reader bot can see. no args"
+                "\n• list_channels — channels in a server. args: {guild_id}"
+                "\n• read_messages — recent messages, newest first. args: "
+                "{channel_id, limit (max 100), before/after/around (message id)}"
+                "\n• extract_links — links found in recent messages. args: "
+                "{channel_id, limit}"
+                "\n• download_attachment — save an attachment locally. args: "
+                "{url (from read_messages), save_dir (optional)}"
+                "\nNo sending, reacting, or DMs — this connection cannot write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["list_servers", "list_channels",
+                                 "read_messages", "extract_links",
+                                 "download_attachment"],
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation arguments. list_channels: {guild_id}. "
+                            "read_messages/extract_links: {channel_id, limit, "
+                            "before}. download_attachment: {url, save_dir}."
+                        ),
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
     # Google OAuth connections: return a hub schema so agents call this tool
     # with {product, operation, args} instead of confusing it with a generic
     # HTTP proxy.  The per-product tools (vault_<id>_sheets, etc.) are
@@ -544,6 +582,44 @@ def _save_email_attachment(resp: Dict[str, Any], args: dict) -> str:
         "size": len(data),
         "note": "File saved locally — you can now read, process, or re-send it.",
     }, ensure_ascii=False)
+
+
+def _discord_read_call(conn_id: str, args: dict) -> str:
+    """Execute a read-only Discord operation through the vault.
+
+    download_attachment responses carry base64 file content; decode and save
+    locally (same flow as email attachments) so the agent gets a file path.
+    """
+    operation = str(args.get("operation") or "").strip()
+    if not operation:
+        return json.dumps({"error": "operation is required"})
+    inner = args.get("args") if isinstance(args.get("args"), dict) else {}
+    payload = {"operation": operation, "args": inner}
+    try:
+        resp = _vault_http("POST", f"/api/vault/discord/{conn_id}", payload,
+                           timeout=90)
+        if operation == "download_attachment" and isinstance(resp, dict) \
+                and resp.get("attachment"):
+            return _save_email_attachment(resp, inner)
+        return json.dumps(resp, ensure_ascii=False, default=str)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
+    except URLError as e:
+        return json.dumps({
+            "error": f"Cannot reach vault at {VAULT_URL}: {e.reason}. "
+                     "The vault service may be restarting — try again shortly.",
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Discord read call failed: {e}"})
 
 
 def _build_email_schema(conn: dict, tool_name: str) -> dict:
@@ -970,6 +1046,10 @@ def _make_conn_handler(conn_id: str, auth_kind: str = "", service: str = ""):
         def _mac_handler(args: dict, **_kw) -> str:
             return _special_call(conn_id, "mac", args or {})
         return _mac_handler
+    if service == "discord_read":
+        def _discord_read_handler(args: dict, **_kw) -> str:
+            return _discord_read_call(conn_id, args or {})
+        return _discord_read_handler
     # Google OAuth hub: accept {product, operation, args} and route through
     # the structured Google endpoint rather than the generic proxy.
     if service == "google" and auth_kind == "oauth2":

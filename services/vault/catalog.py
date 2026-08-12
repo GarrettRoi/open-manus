@@ -49,6 +49,54 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "GET /users/@me",
         "test_probe": {"method": "GET", "path": "/users/@me"},
     },
+    "discord_user": {
+        "label": "Discord (your account — server discovery only)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://discord.com/api/v10",
+        "allowed_hosts": ["discord.com"],
+        "oauth": {
+            "authorize_url": "https://discord.com/oauth2/authorize",
+            "token_url": "https://discord.com/api/v10/oauth2/token",
+            "scopes": ["identify", "guilds"],
+        },
+        "setup_help": (
+            "Connect Discord as you, purely to discover which servers you're "
+            "in (identify + guilds scopes — Discord never lets a user token "
+            "read channel messages). One-time setup: in the Discord Developer "
+            "Portal create (or reuse) an application, add the redirect URL "
+            "shown below under OAuth2 → Redirects, then paste the client ID "
+            "and secret here and click Connect. Pair this with a 'Discord "
+            "read-only (reader bot)' connection so the dashboard can show "
+            "which of your servers the fleet reader bot covers."
+        ),
+        "example_call": "GET /users/@me/guilds",
+        "test_probe": {"method": "GET", "path": "/users/@me"},
+    },
+    "discord_read": {
+        "label": "Discord read-only (fleet reader bot)",
+        "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bot "},
+        "base_url": "https://discord.com/api/v10",
+        "allowed_hosts": ["discord.com", "cdn.discordapp.com", "media.discordapp.net"],
+        # Proxy-level guard: only GET/HEAD on an explicit read allowlist.
+        "read_only": True,
+        "fields": [
+            {"name": "application_id",
+             "label": "Bot application ID (for invite links)",
+             "placeholder": "the application's ID from the Developer Portal",
+             "required": False},
+        ],
+        "setup_help": (
+            "Read-only reader bot: paste the bot token from the Discord "
+            "Developer Portal → Bot. The vault only allows read calls "
+            "(list channels, read message history, fetch attachments) — any "
+            "write-style call is rejected. The application ID is optional; "
+            "it is used to build read-only invite links (View Channels + "
+            "Read Message History) so you can add the bot to your servers. "
+            "If left blank the vault looks it up from the bot token."
+        ),
+        "example_call": "GET /channels/{channel_id}/messages",
+        "test_probe": {"method": "GET", "path": "/users/@me"},
+    },
     "n8n": {
         "label": "n8n",
         "auth": {"kind": "header", "header_name": "X-N8N-API-KEY", "prefix": ""},

@@ -148,6 +148,12 @@
             <small style="color:var(--text-muted);">This token is sent as <code>Authorization: Bearer &lt;token&gt;</code> in every MCP call. For Vowsok: find it in your dashboard → API / Integrations.</small>
         </div>
 
+        <div id="grp_discord_app" class="form-group" style="display:none;">
+            <label>Bot application ID (optional — for invite links)</label>
+            <input type="text" name="application_id" placeholder="the application's ID from the Developer Portal">
+            <small style="color:var(--text-muted);">Used to build read-only invite links (View Channels + Read Message History). Leave blank to let the vault look it up from the bot token.</small>
+        </div>
+
         <div id="grp_alpaca_env" class="form-group" style="display:none;">
             <label>Environment</label>
             <select name="alpaca_env" style="width: 100%; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius);">
@@ -532,6 +538,8 @@ function onServiceChange() {
     document.getElementById('grp_alpaca_secret').style.display = hasExtraSecret ? '' : 'none';
     // Environment selector is Alpaca-specific (Paper vs Live hosts).
     document.getElementById('grp_alpaca_env').style.display = isAlpaca ? '' : 'none';
+    // Discord reader bot: optional application ID for invite links.
+    document.getElementById('grp_discord_app').style.display = (sid === 'discord_read') ? '' : 'none';
     document.getElementById('lbl_api_key').textContent =
         tpl.api_key_label || (hasExtraSecret ? 'API Key ID (never shown to agents)' : 'API key');
     document.getElementById('lbl_api_secret').textContent =
