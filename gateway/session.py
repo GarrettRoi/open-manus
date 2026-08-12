@@ -703,6 +703,18 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Runtime-only (NEVER persisted): set when this entry was rehydrated from
+    # disk at gateway startup.  On ephemeral hosts (Railway) the on-disk state
+    # can be a restored Redis snapshot whose ``updated_at`` is arbitrarily
+    # stale (e.g. state.db exceeded the sync size cap and saves silently
+    # stopped, so every redeploy restored a days-old snapshot — the cause of
+    # false "inactive for 24h" resets mid-conversation).  The idle reset check
+    # clamps its reference time to this value so a stale snapshot degrades to
+    # "idle clock restarts at boot" instead of wiping an active conversation.
+    # Deliberately excluded from to_dict()/from_dict() so it can never
+    # round-trip through a snapshot and go stale itself.
+    rehydrated_at: Optional[datetime] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -1075,6 +1087,15 @@ class SessionStore:
 
         self._loaded = True
 
+        # Safety clamp for the idle reset policy (#104): every entry loaded
+        # from disk at startup may carry a stale ``updated_at`` if the on-disk
+        # state was restored from an old snapshot (Redis memory sync on
+        # ephemeral hosts).  Stamp the rehydration moment so _should_reset /
+        # _is_session_expired never treat pre-boot staleness as user idleness.
+        _rehydrated_now = _now()
+        for _entry in self._entries.values():
+            _entry.rehydrated_at = _rehydrated_now
+
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
         # shutdown path, so sessions.json is never cleared and is left pointing
@@ -1408,6 +1429,26 @@ class SessionStore:
                         entry.session_id, exc,
                     )
     
+    @staticmethod
+    def _idle_reference(entry: SessionEntry) -> datetime:
+        """Reference time for the *idle* reset check.
+
+        Normally ``entry.updated_at`` (bumped on every message).  For entries
+        rehydrated from disk this boot, clamp to the rehydration moment: a
+        restored snapshot can carry an arbitrarily stale ``updated_at`` (#104
+        — Redis memory sync silently stopped pushing state.db once it exceeded
+        the size cap, so every redeploy restored a days-old routing table and
+        the first message of an ACTIVE conversation tripped the 24h idle
+        reset).  Clamping means a stale snapshot merely restarts the idle
+        clock at boot; genuinely idle sessions still reset once idle_minutes
+        pass without activity after startup.  The daily reset deliberately
+        keeps using the raw ``updated_at`` — firing on the first message after
+        the daily boundary is its intended semantics regardless of restarts.
+        """
+        if entry.rehydrated_at and entry.rehydrated_at > entry.updated_at:
+            return entry.rehydrated_at
+        return entry.updated_at
+
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
         
@@ -1434,7 +1475,9 @@ class SessionStore:
         now = _now()
 
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = self._idle_reference(entry) + timedelta(
+                minutes=policy.idle_minutes
+            )
             if now > idle_deadline:
                 return True
 
@@ -1536,7 +1579,9 @@ class SessionStore:
         now = _now()
         
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = self._idle_reference(entry) + timedelta(
+                minutes=policy.idle_minutes
+            )
             if now > idle_deadline:
                 return "idle"
         
