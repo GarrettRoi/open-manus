@@ -16,6 +16,7 @@ Usage:
     python3 redis_memory_sync.py --action watch --agent samantha
 """
 import argparse
+import gzip
 import json
 import os
 import sys
@@ -131,7 +132,12 @@ def save_memory(agent_name: str):
                 saved.append(rel)
 
     # Binary files (state.db) — snapshot via SQLite backup API so we never
-    # capture a half-written database, then store base64.
+    # capture a half-written database, then gzip + base64. Compression matters
+    # beyond Redis footprint: when a blob exceeded MAX_BINARY_SIZE the save was
+    # skipped but the OLD blob stayed in Redis, so every redeploy restored a
+    # days-old state.db whose gateway_routing timestamps tripped false
+    # "inactive for 24h" session resets mid-conversation (#104). SQLite DBs
+    # typically compress 4-10x, keeping saves well under the cap.
     for rel_path in BINARY_FILES:
         full_path = Path(MEMORY_DIR) / rel_path
         if not full_path.exists():
@@ -141,8 +147,12 @@ def save_memory(agent_name: str):
         except Exception as e:
             skipped.append(f"{rel_path} (snapshot failed: {e})")
             continue
+        raw_size = len(data)
+        data = gzip.compress(data, compresslevel=6)
         if len(data) > MAX_BINARY_SIZE:
-            skipped.append(f"{rel_path} (too large: {len(data)} bytes)")
+            skipped.append(
+                f"{rel_path} (too large: {len(data)} bytes gzipped, {raw_size} raw)"
+            )
             # Loud, operator-visible alert: session history is NO LONGER being
             # persisted for this agent. Surfaced in Redis so the dashboard /
             # health checks can pick it up.
@@ -162,6 +172,10 @@ def save_memory(agent_name: str):
         r.delete(f"agent:{agent_name}:memory:alert:state_db_too_large")
         key = f"agent:{agent_name}:memory:binary:{rel_path.replace('/', ':')}"
         r.set(key, base64.b64encode(data).decode("ascii"))
+        # Per-blob freshness stamp: last_saved covers text files even when the
+        # binary save is skipped, so restore uses THIS key to detect a stale
+        # binary snapshot (#104).
+        r.set(f"{key}:saved_at", datetime.utcnow().isoformat())
         saved.append(rel_path)
 
     r.set(f"agent:{agent_name}:memory:last_saved", datetime.utcnow().isoformat())
@@ -213,7 +227,7 @@ def restore_memory(agent_name: str):
     keys = r.keys(pattern)
 
     for key in keys:
-        if key.endswith(":last_saved"):
+        if key.endswith(":last_saved") or key.endswith(":saved_at"):
             continue
 
         # Reconstruct file path from key
@@ -225,6 +239,27 @@ def restore_memory(agent_name: str):
 
         is_binary = suffix.startswith("binary:")
         if is_binary:
+            # Stale-snapshot guard (#104): if the per-blob saved_at stamp is
+            # much older than the agent-wide last_saved, saves for this blob
+            # have been failing/skipped (e.g. size cap) and we are about to
+            # restore an OLD snapshot. Restore anyway (history beats nothing)
+            # but warn loudly so the operator sees it.
+            try:
+                blob_saved_at = r.get(f"{key}:saved_at")
+                last_saved = r.get(f"agent:{agent_name}:memory:last_saved")
+                if blob_saved_at and last_saved:
+                    age = (datetime.fromisoformat(last_saved)
+                           - datetime.fromisoformat(blob_saved_at)).total_seconds()
+                    if age > 3600:
+                        print(
+                            f"[{agent_name}] WARNING: restoring STALE snapshot "
+                            f"{key} — last saved {age/3600:.1f}h before the most "
+                            "recent sync (its saves are being skipped, likely "
+                            "size cap).",
+                            file=sys.stderr,
+                        )
+            except Exception:
+                pass
             suffix = suffix[len("binary:"):]
 
         rel_path = suffix.replace(":", "/")
@@ -242,7 +277,12 @@ def restore_memory(agent_name: str):
             continue
         full_path.parent.mkdir(parents=True, exist_ok=True)
         if is_binary:
-            full_path.write_bytes(base64.b64decode(content))
+            blob = base64.b64decode(content)
+            # New blobs are gzip-compressed; pre-compression blobs restore
+            # unchanged (gzip magic sniff keeps this backward compatible).
+            if blob[:2] == b"\x1f\x8b":
+                blob = gzip.decompress(blob)
+            full_path.write_bytes(blob)
         else:
             full_path.write_text(content, encoding="utf-8")
         restored.append(str(full_path))
