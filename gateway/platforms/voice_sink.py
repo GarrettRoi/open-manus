@@ -14,11 +14,19 @@ Requirements:
 import asyncio
 import logging
 import os
+import threading
 import time
 import traceback
 import wave
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+try:
+    import audioop  # stdlib (<=3.12) or audioop-lts shim (3.13+)
+    _AUDIOOP_OK = True
+except ImportError:
+    audioop = None
+    _AUDIOOP_OK = False
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +98,31 @@ class VoiceSink(_AudioSinkBase):
         self.last_activity: Dict[int, float] = {}
         self.is_processing: Dict[int, bool] = {}
 
+        # Transcripts of already-processed chunks belonging to the current
+        # (still ongoing) utterance, per user.  Dispatched as one message when
+        # the utterance ends (silence-triggered "final" flush).
+        self.pending_transcripts: Dict[int, List[str]] = {}
+
+        # Guards the buffer swap between the PacketRouter thread (write) and
+        # the event loop (processing).  Without it bytes appended between
+        # "snapshot" and "clear" would be silently lost.
+        self._buffer_lock = threading.Lock()
+
+        # Per-user asyncio locks so chunks are processed strictly in order.
+        self._process_locks: Dict[int, asyncio.Lock] = {}
+
         # Silence detection: seconds of quiet before we process the buffer
         self.silence_threshold = float(os.getenv("VOICE_SILENCE_THRESHOLD", "1.5"))
+
+        # Proactive chunking: flush the buffer once it holds this many seconds
+        # of audio, well before the STT 25MB file cap.  60s of 48kHz stereo
+        # 16-bit PCM is ~11.5MB raw, ~1.9MB after 16kHz-mono downsampling.
+        self.max_chunk_seconds = float(os.getenv("VOICE_MAX_CHUNK_SECONDS", "60"))
+        self.max_chunk_bytes = int(self.max_chunk_seconds * 48000 * 2 * 2)
+
+        # Bounded retries for a failed chunk transcription
+        self.transcribe_retries = int(os.getenv("VOICE_TRANSCRIBE_RETRIES", "2"))
+        self.retry_delay = float(os.getenv("VOICE_TRANSCRIBE_RETRY_DELAY", "2"))
 
         # Background monitor handle
         self._task: Optional[asyncio.Task] = None
@@ -200,22 +231,25 @@ class VoiceSink(_AudioSinkBase):
 
         user_id = user.id
         if user_id not in self.audio_data:
-            self.audio_data[user_id] = bytearray()
-            self.is_processing[user_id] = False
+            with self._buffer_lock:
+                if user_id not in self.audio_data:
+                    self.audio_data[user_id] = bytearray()
+            self.is_processing.setdefault(user_id, False)
             logger.info("[VoiceSink] New speaker detected: %s (id=%s)", getattr(user, 'display_name', user_id), user_id)
             self._schedule_async(self._send_debug_message(
                 f"👤 **Speaker Detected**: Receiving audio from <@{user_id}>"
             ))
 
-        # Don't append while we are transcribing the previous chunk
-        if not self.is_processing.get(user_id, False):
-            # Extract PCM bytes from VoiceData object
-            pcm_data = getattr(data, 'pcm', None)
-            if pcm_data is None:
-                pcm_data = data if isinstance(data, (bytes, bytearray)) else b""
-            if isinstance(pcm_data, (bytes, bytearray)) and len(pcm_data) > 0:
+        # ALWAYS append — even while a previous chunk is being transcribed.
+        # Audio arriving mid-transcription is buffered and processed as the
+        # next chunk instead of being dropped.
+        pcm_data = getattr(data, 'pcm', None)
+        if pcm_data is None:
+            pcm_data = data if isinstance(data, (bytes, bytearray)) else b""
+        if isinstance(pcm_data, (bytes, bytearray)) and len(pcm_data) > 0:
+            with self._buffer_lock:
                 self.audio_data[user_id].extend(pcm_data)
-                self.last_activity[user_id] = time.time()
+            self.last_activity[user_id] = time.time()
 
     def cleanup(self):
         """Called by the library when listening stops.
@@ -281,9 +315,12 @@ class VoiceSink(_AudioSinkBase):
         if self._task:
             self._task.cancel()
             self._task = None
-        self.audio_data.clear()
+        with self._buffer_lock:
+            self.audio_data.clear()
         self.last_activity.clear()
         self.is_processing.clear()
+        self.pending_transcripts.clear()
+        self._process_locks.clear()
         logger.info("[VoiceSink] STOPPED for channel %s", self.channel_id)
 
     async def _monitor_silence(self):
@@ -312,11 +349,21 @@ class VoiceSink(_AudioSinkBase):
                     for user_id, last_time in list(self.last_activity.items()):
                         buf = self.audio_data.get(user_id, b"")
                         silence_duration = now - last_time
-                        if silence_duration > self.silence_threshold and len(buf) > 0:
-                            if not self.is_processing.get(user_id, False):
-                                logger.info("[VoiceSink] Silence detected for user %s (%.1fs silence, %d bytes buffered) — triggering transcription",
-                                            user_id, silence_duration, len(buf))
-                                asyncio.create_task(self._process_user_audio(user_id))
+                        if self.is_processing.get(user_id, False):
+                            continue
+                        if len(buf) >= self.max_chunk_bytes:
+                            # Proactive flush: buffer is approaching a size the
+                            # STT layer can't safely handle in one upload.
+                            logger.info("[VoiceSink] Buffer for user %s reached %d bytes (max %d) — flushing partial chunk",
+                                        user_id, len(buf), self.max_chunk_bytes)
+                            self.is_processing[user_id] = True
+                            asyncio.create_task(self._process_user_audio(user_id, final=False))
+                        elif silence_duration > self.silence_threshold and (
+                                len(buf) > 0 or self.pending_transcripts.get(user_id)):
+                            logger.info("[VoiceSink] Silence detected for user %s (%.1fs silence, %d bytes buffered) — triggering transcription",
+                                        user_id, silence_duration, len(buf))
+                            self.is_processing[user_id] = True
+                            asyncio.create_task(self._process_user_audio(user_id, final=True))
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -348,71 +395,194 @@ class VoiceSink(_AudioSinkBase):
         except Exception as e:
             logger.error("[VoiceSink] Failed to send debug message: %s", e)
 
-    async def _process_user_audio(self, user_id: int):
-        """Save buffered PCM to WAV, transcribe with Whisper, and dispatch."""
-        self.is_processing[user_id] = True
-        tmp_path = None
-        try:
-            data = bytes(self.audio_data[user_id])
-            self.audio_data[user_id] = bytearray()  # clear buffer
+    def _snapshot_buffer(self, user_id: int, limit: Optional[int] = None) -> bytes:
+        """Atomically take up to ``limit`` bytes from the buffer.
 
+        Uses the buffer lock so packets appended concurrently from the
+        PacketRouter thread are never lost between snapshot and clear.
+        The limit is frame-aligned (4 bytes per 48kHz stereo 16-bit frame).
+        """
+        with self._buffer_lock:
+            buf = self.audio_data.get(user_id)
+            if not buf:
+                return b""
+            if limit is None or len(buf) <= limit:
+                data = bytes(buf)
+                self.audio_data[user_id] = bytearray()
+            else:
+                cut = limit - (limit % 4)  # keep frame alignment
+                data = bytes(buf[:cut])
+                self.audio_data[user_id] = bytearray(buf[cut:])
+            return data
+
+    @staticmethod
+    def _prepare_wav(data: bytes, tmp_path: str) -> float:
+        """Write PCM to a WAV file, downsampled to 16kHz mono when possible.
+
+        Downsampling shrinks the upload ~6x (192KB/s -> 32KB/s), keeping
+        long chunks far under the STT 25MB cap and avoiding upload timeouts.
+        Returns the audio duration in seconds.
+        """
+        duration_secs = len(data) / (48000 * 2 * 2)
+        if _AUDIOOP_OK:
+            try:
+                mono = audioop.tomono(data, 2, 0.5, 0.5)
+                downsampled, _ = audioop.ratecv(mono, 2, 1, 48000, 16000, None)
+                with wave.open(tmp_path, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(downsampled)
+                return duration_secs
+            except Exception as e:
+                logger.warning("[VoiceSink] Downsampling failed (%s) — falling back to raw 48kHz stereo", e)
+        with wave.open(tmp_path, "wb") as wav:
+            wav.setnchannels(2)       # discord-ext-voice-recv: stereo
+            wav.setsampwidth(2)       # 16-bit
+            wav.setframerate(48000)   # Discord standard
+            wav.writeframes(data)
+        return duration_secs
+
+    async def _transcribe_with_retry(self, tmp_path: str) -> dict:
+        """Transcribe a WAV file with bounded retries. The source audio file
+        is kept on disk until this returns, so a transient failure never
+        destroys the chunk."""
+        transcribe_fn = _get_transcribe_fn()
+        attempts = 1 + max(0, self.transcribe_retries)
+        result: dict = {"success": False, "transcript": "", "error": "not attempted"}
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await asyncio.to_thread(transcribe_fn, tmp_path)
+            except Exception as e:
+                # Treat a raising transcriber (network/client error) as a
+                # failed attempt so bounded retry still applies.
+                result = {"success": False, "transcript": "",
+                          "error": f"{type(e).__name__}: {e}"}
+            if result.get("success"):
+                return result
+            logger.warning("[VoiceSink] Transcription attempt %d/%d failed: %s",
+                           attempt, attempts, result.get("error", "unknown"))
+            if attempt < attempts:
+                await asyncio.sleep(min(self.retry_delay * attempt, 8))
+        return result
+
+    async def _process_user_audio(self, user_id: int, final: bool = True):
+        """Transcribe the current chunk for a user.
+
+        ``final=False`` means this is a proactive size-based flush mid-utterance:
+        the transcript is stored in ``pending_transcripts`` and dispatch waits
+        for the utterance to end.  ``final=True`` (silence detected) stitches
+        all pending chunk transcripts plus this one into a single message.
+        """
+        self.is_processing[user_id] = True
+        lock = self._process_locks.setdefault(user_id, asyncio.Lock())
+        try:
+          async with lock:
             # Minimum audio threshold: ~0.25s at 48kHz stereo 16-bit = 48000 bytes
             # (48000 samples/sec * 2 channels * 2 bytes * 0.25s = 48000)
             MIN_AUDIO_BYTES = 48_000
-            if len(data) < MIN_AUDIO_BYTES:
+
+            # Collect the chunk(s) to transcribe.  A partial (size-based)
+            # flush takes exactly one capped chunk; a final flush drains the
+            # whole buffer in capped chunks so even a huge backlog stays
+            # under the STT file-size limit.
+            chunks = []
+            if final:
+                while True:
+                    piece = self._snapshot_buffer(user_id, self.max_chunk_bytes)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+                    if len(piece) < self.max_chunk_bytes:
+                        break
+                # A short tail after a cap-sized chunk is real speech — merge
+                # it into the previous chunk instead of discarding it (the
+                # cap has ample headroom under the STT size limit).
+                if len(chunks) >= 2 and len(chunks[-1]) < MIN_AUDIO_BYTES:
+                    tail = chunks.pop()
+                    chunks[-1] = chunks[-1] + tail
+            else:
+                piece = self._snapshot_buffer(user_id, self.max_chunk_bytes)
+                if piece:
+                    chunks.append(piece)
+
+            pending = self.pending_transcripts.get(user_id) or []
+            total_bytes = sum(len(c) for c in chunks)
+            if final and chunks and pending and total_bytes < MIN_AUDIO_BYTES:
+                # Sub-minimum tail of a longer utterance (earlier chunks were
+                # already flushed) — pad with silence so it is transcribed
+                # instead of discarded.
+                chunks[-1] = chunks[-1] + b"\x00" * (MIN_AUDIO_BYTES - total_bytes)
+                total_bytes = MIN_AUDIO_BYTES
+            if total_bytes < MIN_AUDIO_BYTES and not (final and pending):
                 logger.info("[VoiceSink] Audio too short from user %s (%d bytes, need %d) — skipping",
-                            user_id, len(data), MIN_AUDIO_BYTES)
-                self.is_processing[user_id] = False
+                            user_id, total_bytes, MIN_AUDIO_BYTES)
                 return
 
-            logger.info("[VoiceSink] Processing %d bytes of audio from user %s", len(data), user_id)
+            if chunks and total_bytes >= MIN_AUDIO_BYTES:
+                # Check that VOICE_TOOLS_OPENAI_KEY is set
+                if not os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+                    await self._send_debug_message(
+                        "⚠️ **VOICE_TOOLS_OPENAI_KEY not set** — cannot transcribe audio."
+                    )
+                    return
 
-            # Send a visible confirmation that audio was captured
-            # PCM format: 48kHz, stereo (2ch), 16-bit (2 bytes) = 192000 bytes/sec
-            duration_secs = len(data) / (48000 * 2 * 2)
-            await self._send_debug_message(
-                f"🎤 **Voice detected** from <@{user_id}> — captured {duration_secs:.1f}s of audio. Transcribing..."
-            )
+                # PCM format: 48kHz, stereo (2ch), 16-bit (2 bytes) = 192000 bytes/sec
+                duration_secs = total_bytes / (48000 * 2 * 2)
+                logger.info("[VoiceSink] Processing %d bytes (%.1fs) of audio from user %s in %d chunk(s) (final=%s)",
+                            total_bytes, duration_secs, user_id, len(chunks), final)
+                await self._send_debug_message(
+                    f"🎤 **Voice detected** from <@{user_id}> — captured {duration_secs:.1f}s of audio. Transcribing..."
+                )
 
-            # Write a proper WAV file for Whisper
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-                with wave.open(tmp_path, "wb") as wav:
-                    wav.setnchannels(2)       # discord-ext-voice-recv: stereo
-                    wav.setsampwidth(2)       # 16-bit
-                    wav.setframerate(48000)   # Discord standard
-                    wav.writeframes(data)
+                for data in chunks:
+                    chunk_secs = len(data) / (48000 * 2 * 2)
+                    tmp_path = None
+                    try:
+                        # Write a WAV (16kHz mono when possible) for the STT provider
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            tmp_path = tmp.name
+                        self._prepare_wav(data, tmp_path)
 
-            # Check that VOICE_TOOLS_OPENAI_KEY is set
-            if not os.getenv("VOICE_TOOLS_OPENAI_KEY"):
-                error_msg = "⚠️ **VOICE_TOOLS_OPENAI_KEY not set** — cannot transcribe audio."
-                await self._send_debug_message(error_msg)
-                self.is_processing[user_id] = False
+                        result = await self._transcribe_with_retry(tmp_path)
+                    finally:
+                        if tmp_path:
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+
+                    if result.get("success"):
+                        chunk_text = (result.get("transcript") or "").strip()
+                        if chunk_text:
+                            self.pending_transcripts.setdefault(user_id, []).append(chunk_text)
+                    else:
+                        error_detail = result.get("error", "unknown")
+                        await self._send_debug_message(
+                            f"⚠️ **Transcription failed** for {chunk_secs:.1f}s of audio from <@{user_id}> "
+                            f"after {1 + max(0, self.transcribe_retries)} attempts: {error_detail}"
+                        )
+                        # Keep going: deliver whatever chunks succeeded.
+
+            if not final:
+                # Mid-utterance chunk: transcript stashed, dispatch waits for
+                # the utterance to end (silence-triggered final flush).
                 return
 
-            # Get the transcription function (lazy-loaded)
-            transcribe_fn = _get_transcribe_fn()
+            # Final flush: stitch chunk transcripts in order.
+            parts = self.pending_transcripts.pop(user_id, [])
+            text = " ".join(p for p in parts if p).strip()
 
-            # Transcribe (run in thread to avoid blocking the event loop)
-            result = await asyncio.to_thread(transcribe_fn, tmp_path)
-
-            if not result.get("success"):
-                error_detail = result.get("error", "unknown")
-                await self._send_debug_message(f"⚠️ **Transcription failed**: {error_detail}")
-                self.is_processing[user_id] = False
-                return
-
-            text = (result.get("transcript") or "").strip()
             if len(text) <= 1:
                 await self._send_debug_message(
                     f"🔇 Audio from <@{user_id}> was processed but no clear speech was found."
                 )
-                self.is_processing[user_id] = False
                 return
 
             # Send visible confirmation
+            display_text = text if len(text) <= 1500 else text[:1500] + "…"
             await self._send_debug_message(
-                f"🗣️ **Heard from** <@{user_id}>: \"{text}\"\n_Processing response..._"
+                f"🗣️ **Heard from** <@{user_id}>: \"{display_text}\"\n_Processing response..._"
             )
 
             # Resolve the Discord user and channel objects
@@ -461,9 +631,4 @@ class VoiceSink(_AudioSinkBase):
             logger.error("[VoiceSink] Failed to process user audio: %s", e, exc_info=True)
             await self._send_debug_message(f"⚠️ **Voice processing error**: {e}")
         finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
             self.is_processing[user_id] = False
