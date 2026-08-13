@@ -154,6 +154,28 @@ def verify_provider(url: str, key: str):
 
     out = json.loads(provider.handle_tool_call("memory_forget", {"memory_id": mem_id}))
     check("memory_forget deletes own memory", out.get("result") == "Memory deleted.")
+
+    # Shared-delete authorization: plant a shared point directly, then verify
+    # an UNauthorized provider cannot delete it while an authorized one can.
+    shared_id = str(uuid.uuid4())
+    vec = provider._embedder.embed([f"shared probe {marker}"])[0]
+    provider._client.upsert(COLLECTION, [{
+        "id": shared_id, "vector": vec,
+        "payload": {"text": f"shared probe {marker}", "agent_id": "someone-else",
+                    "scope": "shared", "importance": 3, "ts": time.time(),
+                    "session_id": "verify", "platform": "verify",
+                    "source": "verify", "superseded": False}}])
+    out = json.loads(provider.handle_tool_call("memory_forget", {"memory_id": shared_id}))
+    check("UNauthorized shared delete rejected",
+          "not authorized" in out.get("error", ""), str(out))
+
+    os.environ["QDRANT_ALLOW_SHARED_WRITE"] = "true"
+    authorized = load_memory_provider("qdrant")
+    authorized.initialize("verify-session-2", platform="verify",
+                          agent_context="primary")
+    out = json.loads(authorized.handle_tool_call("memory_forget", {"memory_id": shared_id}))
+    check("authorized shared delete succeeds", out.get("result") == "Memory deleted.")
+    authorized._stop.set()
     provider._stop.set()
 
 

@@ -613,6 +613,12 @@ class QdrantMemoryProvider(MemoryProvider):
                         "That memory belongs to another agent and cannot be "
                         "deleted from here."
                     )
+                if (payload.get("scope") == "shared"
+                        and not self._shared_write_allowed):
+                    return tool_error(
+                        "Deleting fleet-shared memories is not authorized "
+                        "for this service."
+                    )
                 self._client.delete(self._collection, [memory_id])
                 self._record_success()
                 return json.dumps({"result": "Memory deleted."})

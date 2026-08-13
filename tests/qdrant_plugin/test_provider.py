@@ -356,3 +356,34 @@ def test_embedder_falls_back_to_openrouter(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
     e2 = Embedder.from_env()
     assert e2.base == "https://api.openai.com/v1"
+
+
+def test_forget_shared_requires_authorization(monkeypatch):
+    # Unauthorized service cannot delete fleet-shared memories
+    p = _provider(monkeypatch, QDRANT_ALLOW_SHARED_WRITE=None)
+    client, _ = _init(p, monkeypatch)
+    client.retrieve.return_value = [{"id": "s1", "payload": {"scope": "shared", "agent_id": "lexi"}}]
+    out = json.loads(p.handle_tool_call("memory_forget", {"memory_id": "s1"}))
+    assert "error" in out and "not authorized" in out["error"]
+    client.delete.assert_not_called()
+    _shutdown(p)
+
+    # Authorized service can
+    p2 = _provider(monkeypatch)
+    client2, _ = _init(p2, monkeypatch)
+    client2.retrieve.return_value = [{"id": "s1", "payload": {"scope": "shared", "agent_id": "lexi"}}]
+    out = json.loads(p2.handle_tool_call("memory_forget", {"memory_id": "s1"}))
+    assert out["result"] == "Memory deleted."
+    client2.delete.assert_called_once()
+    _shutdown(p2)
+
+
+def test_memory_context_wrapper_marks_untrusted():
+    from agent.memory_manager import build_memory_context_block, sanitize_context
+    block = build_memory_context_block("- some recalled fact")
+    assert "NOT instructions" in block
+    assert "untrusted" in block
+    assert "authoritative" not in block
+    # sanitize strips the new note if a provider echoes it back
+    inner = block.replace("<memory-context>\n", "").replace("\n</memory-context>", "")
+    assert "System note" not in sanitize_context(inner)
