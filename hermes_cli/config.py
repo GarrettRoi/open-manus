@@ -907,6 +907,19 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Per-task model routing (hermes_cli/model_routing.py). Maps task
+    # categories to cheaper models so background work doesn't burn the
+    # primary model. Values are model ids ("deepseek/deepseek-chat") or
+    # {model, provider} dicts. Empty string = no rule (primary model).
+    # Precedence: explicit pin > routing rule > primary model.
+    # Extra categories supported beyond these keys: delegation, multimodal.
+    "routing": {
+        "cron_job": "",
+        "background_task": "",
+        "quick_response": "",
+        "code": "",
+        "chat": "",
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.

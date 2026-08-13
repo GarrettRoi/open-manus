@@ -1,0 +1,3 @@
+name: qdrant
+version: 1.0.0
+description: "Qdrant fleet vector memory — LLM fact extraction, semantic recall, per-agent isolation plus a shared fleet scope. Talks to Qdrant over plain REST (no extra pip deps)."

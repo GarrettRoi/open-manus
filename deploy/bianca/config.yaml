@@ -34,6 +34,7 @@ memory:
   enabled: true
   backend: core
   auto_capture: true
+  provider: qdrant
 compression:
   enabled: true
   threshold: 0.85
@@ -72,3 +73,7 @@ skills:
   - /root/.hermes/skills
   - /app/skills
   - /app/optional-skills
+
+routing:
+  cron_job: deepseek/deepseek-chat
+  background_task: google/gemini-2.5-flash-preview

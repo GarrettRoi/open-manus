@@ -2905,6 +2905,37 @@ def run_job(
                 f"(or pin the original values to keep them). See #44585."
             )
 
+        # Per-task model routing (#118): an UNPINNED job resolves through the
+        # agent's ``routing`` rules (cron_job → background_task fallback) so
+        # background/polling jobs run on a cheap model instead of the primary.
+        # Precedence: per-job pin > routing rule > primary model. Applied
+        # AFTER the drift guard so the guard keeps comparing the same
+        # primary-model resolution it snapshotted at creation — routing is an
+        # explicit owner-configured rule, not silent global drift.
+        if not (job.get("model") or "").strip():
+            try:
+                from hermes_cli.model_routing import resolve_routed_model
+                _routed = resolve_routed_model(_cfg, "cron_job")
+            except Exception as _route_exc:
+                _routed = None
+                logger.warning("Job '%s': routing resolution failed: %s", job_id, _route_exc)
+            if _routed and _routed.get("model"):
+                logger.info(
+                    "Job '%s': routing rule applied — model %s -> %s",
+                    job_id, model, _routed["model"],
+                )
+                model = _routed["model"]
+                _routed_provider = (_routed.get("provider") or "").strip()
+                if _routed_provider and not (job.get("provider") or "").strip():
+                    try:
+                        runtime = resolve_runtime_provider(requested=_routed_provider)
+                    except Exception as _rp_exc:
+                        logger.warning(
+                            "Job '%s': routed provider '%s' failed to resolve (%s); "
+                            "keeping default provider",
+                            job_id, _routed_provider, _rp_exc,
+                        )
+
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
@@ -3370,12 +3401,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        _log_cron_run_to_discord(job, success, error, adapters=adapters, loop=loop)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
+        _log_cron_run_to_discord(job, False, str(e), adapters=adapters, loop=loop)
         return False
+
+
+def _log_cron_run_to_discord(job: dict, success: bool, error, *, adapters=None, loop=None) -> None:
+    """LOCAL feature: append this run to the pinned cron-history Discord
+    thread. Best-effort and fire-and-forget — a posting failure must never
+    affect job execution or marking."""
+    try:
+        from cron.discord_cron_threads import log_run
+        log_run(job, success, error, adapters=adapters, loop=loop)
+    except Exception as e:
+        logger.debug("cron-history Discord log skipped: %s", e)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -3394,6 +3438,14 @@ def _notify_provider_jobs_changed() -> None:
         resolve_cron_scheduler().on_jobs_changed()
     except Exception as e:
         logger.debug("on_jobs_changed notify failed: %s", e)
+    # LOCAL feature: reflect the mutation in the pinned cron-jobs Discord
+    # thread immediately (in-gateway callers only; standalone CLI processes
+    # have no cached adapter/loop and rely on the next ticker sync).
+    try:
+        from cron.discord_cron_threads import request_sync
+        request_sync()
+    except Exception as e:
+        logger.debug("Discord cron-threads request_sync failed: %s", e)
 
 
 def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
@@ -3429,6 +3481,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        # LOCAL feature: keep the pinned cron-jobs/cron-history Discord threads
+        # in sync. Fire-and-forget on the gateway loop — never blocks the tick.
+        try:
+            from cron.discord_cron_threads import schedule_sync as _discord_threads_sync
+            _discord_threads_sync(adapters, loop)
+        except Exception as _dte:
+            logger.debug("Discord cron-threads sync skipped: %s", _dte)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:

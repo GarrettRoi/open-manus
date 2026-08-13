@@ -479,7 +479,13 @@ function getModelDisplay(job: CronJob): string {
   const provider = asText(job.provider);
   const model = asText(job.model);
   if (provider && model) return `${provider}/${model}`;
-  return model || provider;
+  if (model || provider) return model || provider;
+  // Unpinned job — show the effective model the scheduler will use
+  // (routing rule or primary config model), annotated by source.
+  const effective = asText(job.effective_model);
+  if (!effective) return "";
+  const source = asText(job.effective_model_source);
+  return source === "routing" ? `${effective} (routed)` : effective;
 }
 
 function getJobProfile(job: CronJob): string {
@@ -1024,8 +1030,17 @@ export default function CronPage() {
                       <Badge tone="outline">{mode}</Badge>
                     )}
                     {modelDisplay && (
-                      <Badge tone="outline" title={modelDisplay}>
-                        model
+                      <Badge
+                        tone="outline"
+                        title={
+                          asText(job.model)
+                            ? `pinned model: ${modelDisplay}`
+                            : job.effective_model_source === "routing"
+                              ? `routed model (routing.cron_job): ${modelDisplay}`
+                              : `default model: ${modelDisplay}`
+                        }
+                      >
+                        {modelDisplay}
                       </Badge>
                     )}
                     {toolsets.length > 0 && (

@@ -1138,11 +1138,54 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
+def _default_cron_model_info() -> Tuple[str, str]:
+    """Resolve the (model, source) an unpinned cron job would use right now.
+
+    Returns ``(model, source)`` where source is ``"routing"`` when a
+    ``routing.cron_job``/``background_task`` rule applies, else
+    ``"default"`` with the primary config model (may be empty). Read-only
+    annotation for UI/API consumers — never persisted to jobs.json.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return "", "default"
+    try:
+        from hermes_cli.model_routing import resolve_routed_model
+        routed = resolve_routed_model(cfg, "cron_job")
+        if routed and routed.get("model"):
+            return routed["model"], "routing"
+    except Exception:
+        pass
+    model_cfg = cfg.get("model")
+    if isinstance(model_cfg, str):
+        return model_cfg.strip(), "default"
+    if isinstance(model_cfg, dict):
+        return str(model_cfg.get("default") or model_cfg.get("model") or "").strip(), "default"
+    return "", "default"
+
+
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """List all jobs, optionally including disabled ones."""
+    """List all jobs, optionally including disabled ones.
+
+    Each returned record is annotated (read-only, not persisted) with
+    ``effective_model`` / ``effective_model_source`` — the model the job
+    would actually use at fire time: its pin, the routing rule, or the
+    primary config model (source: "pinned" | "routing" | "default").
+    """
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
+    default_model, default_source = _default_cron_model_info()
+    for j in jobs:
+        pinned = str(j.get("model") or "").strip()
+        if pinned:
+            j["effective_model"] = pinned
+            j["effective_model_source"] = "pinned"
+        else:
+            j["effective_model"] = default_model
+            j["effective_model_source"] = default_source
     return jobs
 
 

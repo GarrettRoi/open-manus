@@ -5577,6 +5577,24 @@ def _resolve_task_provider_model(
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
 
+    # Per-task model routing (#118): when neither an explicit arg nor an
+    # auxiliary.<task>.model pin exists, fall back to the agent's routing
+    # rules (vision-style tasks → multimodal, everything else →
+    # background_task) before the generic auto-detection default. Explicit
+    # pins always win; no routing rule = unchanged behaviour.
+    if task and not resolved_model:
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            from hermes_cli.model_routing import resolve_routed_model_for_aux_task
+
+            _routed = resolve_routed_model_for_aux_task(_load_full_config(), task)
+        except Exception:
+            _routed = None
+        if _routed and _routed.get("model"):
+            resolved_model = _routed["model"]
+            if not cfg_provider and (_routed.get("provider") or "").strip():
+                cfg_provider = _routed["provider"].strip()
+
     # Convenience aliases for direct API-key endpoints that aren't first-class
     # providers (e.g. ``provider: openai`` → custom + api.openai.com/v1).
     # Applied to both explicit args and config-derived values. When the user

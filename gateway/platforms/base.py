@@ -3361,9 +3361,12 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
-        Default strips markdown formatting and truncates to 4000 chars.
+        Default strips markdown formatting. Length limits are applied
+        downstream: the auto-TTS path splits long text into provider-safe
+        segments via ``tools.tts_tool.split_text_for_tts``, and
+        ``text_to_speech_tool`` enforces the per-provider input cap.
         """
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+        return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,
@@ -3378,6 +3381,37 @@ class BasePlatformAdapter(ABC):
         Default falls back to send_voice (shows audio player).
         """
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+
+    async def play_tts_queue(
+        self,
+        chat_id: str,
+        audio_paths: List[str],
+        caption: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Play an ordered queue of auto-TTS audio segments as one utterance.
+
+        Long spoken replies are synthesized as multiple provider-safe
+        segments; this plays them strictly in order. Default implementation
+        delegates each segment to :meth:`play_tts` sequentially (caption, if
+        any, rides on the first segment only). Adapters with true voice
+        playback (Discord) override this to keep the whole queue under one
+        playback lock and to mark the session busy until the queue drains.
+
+        Returns success when at least one segment was delivered.
+        """
+        if not audio_paths:
+            return SendResult(success=False, error="no audio segments")
+        any_ok = False
+        for index, audio_path in enumerate(audio_paths):
+            result = await self.play_tts(
+                chat_id=chat_id,
+                audio_path=audio_path,
+                caption=caption if index == 0 else None,
+                **kwargs,
+            )
+            any_ok = any_ok or bool(getattr(result, "success", False))
+        return SendResult(success=any_ok)
 
     async def send_video(
         self,
@@ -4976,40 +5010,80 @@ class BasePlatformAdapter(ABC):
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
                 # True globally and no ``/voice off`` has been issued.
-                _tts_path = None
+                # Long replies are split into provider-safe segments and
+                # synthesized as an ORDERED queue of audio items so the
+                # provider never truncates mid-response and each clip fits
+                # inside the adapter's per-clip playback timeout.
+                _tts_paths: list = []
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        from tools.tts_tool import (
+                            text_to_speech_tool,
+                            check_tts_requirements,
+                            split_text_for_tts,
+                        )
                         if check_tts_requirements():
                             import json as _json
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
-                            )
-                            tts_data = _json.loads(tts_result_str)
-                            _tts_path = tts_data.get("file_path")
+                            _segments = split_text_for_tts(speech_text)
+                            # Bound synthesis cost/latency for pathological
+                            # responses; ~18k chars of speech is plenty.
+                            _MAX_TTS_SEGMENTS = 12
+                            if len(_segments) > _MAX_TTS_SEGMENTS:
+                                logger.warning(
+                                    "[%s] Auto-TTS response needs %d segments; "
+                                    "speaking only the first %d",
+                                    self.name, len(_segments), _MAX_TTS_SEGMENTS,
+                                )
+                                _segments = _segments[:_MAX_TTS_SEGMENTS]
+                            for _seg in _segments:
+                                tts_result_str = await asyncio.to_thread(
+                                    text_to_speech_tool, text=_seg
+                                )
+                                tts_data = _json.loads(tts_result_str)
+                                _seg_path = tts_data.get("file_path")
+                                if not _seg_path:
+                                    # Keep the already-synthesized ordered
+                                    # prefix rather than dropping everything.
+                                    logger.warning(
+                                        "[%s] Auto-TTS segment synthesis failed "
+                                        "(%d of %d done): %s",
+                                        self.name, len(_tts_paths),
+                                        len(_segments), tts_data.get("error"),
+                                    )
+                                    break
+                                _tts_paths.append(_seg_path)
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
-                # Play TTS audio before text (voice-first experience)
+                # Play TTS audio before text (voice-first experience).
+                # Coordination policy: ALL audio segments play to completion
+                # first (one continuous utterance), THEN the text is posted
+                # and split into platform-sized chunks by the adapter. This
+                # keeps ordering stable and avoids interleaving partially
+                # posted text with in-flight speech.
                 _tts_caption_delivered = False
-                if _tts_path and Path(_tts_path).exists():
+                _existing_tts_paths = [
+                    p for p in _tts_paths if p and Path(p).exists()
+                ]
+                if _existing_tts_paths:
                     try:
                         telegram_tts_caption = None
                         if (
                             self.platform == Platform.TELEGRAM
                             and text_content
+                            and len(_existing_tts_paths) == 1
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
+                        tts_result = await self.play_tts_queue(
                             chat_id=event.source.chat_id,
-                            audio_path=_tts_path,
+                            audio_paths=_existing_tts_paths,
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
@@ -5017,10 +5091,11 @@ class BasePlatformAdapter(ABC):
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
                     finally:
-                        try:
-                            os.remove(_tts_path)
-                        except OSError:
-                            pass
+                        for _p in _existing_tts_paths:
+                            try:
+                                os.remove(_p)
+                            except OSError:
+                                pass
 
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:

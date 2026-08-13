@@ -2184,6 +2184,8 @@ export interface CronJob {
   deliver?: string | null;
   model?: string | null;
   provider?: string | null;
+  effective_model?: string | null;
+  effective_model_source?: "pinned" | "routing" | "default" | null;
   base_url?: string | null;
   no_agent?: boolean | null;
   context_from?: string[] | string | null;

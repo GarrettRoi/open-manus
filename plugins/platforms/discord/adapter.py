@@ -786,6 +786,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # an in-flight clip on timeout. asyncio.Lock wakes waiters FIFO, so
         # queued clips play in submission order, one at a time.
         self._voice_play_locks: Dict[int, asyncio.Lock] = {}
+        # guild_id -> number of queued/in-flight auto-TTS speech segments.
+        # Non-zero marks the voice session busy so the inactivity timeout,
+        # empty-channel linger, and deferred-leave logic never disconnect or
+        # stop playback while a multi-segment spoken reply is still draining.
+        # Explicit cancellation (/voice leave) still tears the session down.
+        self._voice_pending_speech: Dict[int, int] = {}
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -2778,6 +2784,61 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
+    async def play_tts_queue(
+        self,
+        chat_id: str,
+        audio_paths: List[str],
+        caption: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Play an ordered queue of auto-TTS segments as ONE utterance.
+
+        Voice-channel path: the whole queue is played back-to-back under the
+        per-guild playback lock, so concurrent callers can't interleave with
+        (or stop) a multi-segment reply. The playback timeout applies per
+        segment, not to the whole response. A per-guild pending-speech
+        counter marks the session busy for the full queue so inactivity
+        timeout / linger / deferred-leave never disconnect mid-response.
+
+        Not in a voice channel: fall back to the base implementation, which
+        delivers each segment as a voice attachment in order.
+        """
+        if not audio_paths:
+            return SendResult(success=False, error="no audio segments")
+        for gid, text_ch_id in self._voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                logger.info(
+                    "[%s] Playing %d TTS segment(s) in voice channel (guild=%d)",
+                    self.name, len(audio_paths), gid,
+                )
+                pending = getattr(self, "_voice_pending_speech", None)
+                if pending is None:
+                    pending = self._voice_pending_speech = {}
+                pending[gid] = pending.get(gid, 0) + len(audio_paths)
+                remaining = len(audio_paths)
+                any_ok = False
+                lock = self._voice_play_locks.setdefault(gid, asyncio.Lock())
+                try:
+                    async with lock:
+                        for audio_path in audio_paths:
+                            ok = await self._play_in_voice_channel_now(gid, audio_path)
+                            any_ok = any_ok or ok
+                            remaining -= 1
+                            pending[gid] = max(0, pending.get(gid, 0) - 1)
+                            if not ok:
+                                # Disconnected (e.g. explicit /voice leave)
+                                # — stop draining the rest of the queue.
+                                break
+                finally:
+                    if remaining > 0:
+                        pending[gid] = max(0, pending.get(gid, 0) - remaining)
+                    if pending.get(gid, 0) <= 0:
+                        pending.pop(gid, None)
+                return SendResult(success=any_ok)
+        return await super().play_tts_queue(
+            chat_id=chat_id, audio_paths=audio_paths, caption=caption, **kwargs
+        )
+
     async def send_voice(
         self,
         chat_id: str,
@@ -3119,6 +3180,11 @@ class DiscordAdapter(BasePlatformAdapter):
             mixer = self._voice_mixers.get(guild_id)
         if mixer is not None and getattr(mixer, "speech_active", False):
             return True
+        # Queued-but-not-yet-playing speech segments count as busy too, so a
+        # multi-segment reply can't be interrupted between segments.
+        pending = getattr(self, "_voice_pending_speech", None)
+        if pending and pending.get(guild_id, 0) > 0:
+            return True
         checker = getattr(self, "_voice_busy_checker", None)
         text_ch_id = self._voice_text_channels.get(guild_id)
         if checker:
@@ -3456,6 +3522,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            # Explicit leave cancels any queued speech accounting; the play
+            # loop itself bails out when the VC is gone.
+            getattr(self, "_voice_pending_speech", {}).pop(guild_id, None)
             # NOTE: _voice_play_locks is intentionally NOT popped here. An
             # in-flight play_in_voice_channel() may still hold the lock (with
             # waiters queued on it); popping would hand new callers a fresh
@@ -3579,6 +3648,18 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             await asyncio.sleep(self.VOICE_TIMEOUT)
         except asyncio.CancelledError:
+            return
+        # Never disconnect while queued/in-flight speech segments are still
+        # draining — a long multi-segment reply must play to completion.
+        # (Deliberately narrower than _voice_session_is_busy: only actual
+        # speech counts here, so the inactivity timer's other semantics —
+        # e.g. disconnecting during long agent turns — are unchanged.)
+        _pending = getattr(self, "_voice_pending_speech", None)
+        _mixer = (getattr(self, "_voice_mixers", None) or {}).get(guild_id)
+        if (_pending and _pending.get(guild_id, 0) > 0) or (
+            _mixer is not None and getattr(_mixer, "speech_active", False)
+        ):
+            self._reset_voice_timeout(guild_id)
             return
         # Home-channel sessions are presence-driven: while a human is still in
         # the designated channel, stay connected regardless of inactivity.
@@ -7019,6 +7100,22 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("[%s] taskboard gate failed; dropping message", self.name)
                 return
+
+        # Tracker-thread gate: agent-managed tracking threads (pinned
+        # trackers in home channels, maintained via the tracking_thread
+        # tool) are bot territory — a rolling log surface, not a chat. NO
+        # message inside a tracker thread may trigger a turn (same rule as
+        # the taskboard). Fail-open: if the check itself breaks, normal
+        # conversation in the home channel must keep working.
+        try:
+            from tools.tracker_threads import in_tracker_territory as _in_tracker
+            _tr_ids = {str(message.channel.id)}
+            if parent_channel_id:
+                _tr_ids.add(str(parent_channel_id))
+            if _in_tracker(_tr_ids):
+                return
+        except Exception:
+            logger.debug("[%s] tracker-territory gate failed; continuing", self.name)
 
         # Inter-agent dispatch gate: dispatch-channel threads are
         # reaction/tool-only for agents. Only the owner's steering messages

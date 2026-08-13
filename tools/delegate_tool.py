@@ -3000,6 +3000,29 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
+    # Per-task model routing (#118): when no explicit delegation.model is
+    # set, resolve the agent's routing rules (delegation → background_task
+    # fallback) so subagents run on the routed model instead of the parent's
+    # primary. Explicit delegation.model/base_url pins still win; no rule =
+    # inherit from parent as before.
+    if not configured_model and not configured_base_url:
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            from hermes_cli.model_routing import resolve_routed_model
+
+            _routed = resolve_routed_model(_load_full_config(), "delegation")
+        except Exception:
+            _routed = None
+        if _routed and _routed.get("model"):
+            configured_model = _routed["model"]
+            if not configured_provider and (_routed.get("provider") or "").strip():
+                configured_provider = _routed["provider"].strip()
+            logger.info(
+                "delegate_task: routing rule applied — subagent model %s%s",
+                configured_model,
+                f" (provider {configured_provider})" if configured_provider else "",
+            )
+
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
     # a base_url. For these, always fall through to resolve_runtime_provider()

@@ -490,6 +490,17 @@ def load_cli_config() -> Dict[str, Any]:
                 "api_key": "",
             },
         },
+        "routing": {
+            # Per-task model routing (hermes_cli/model_routing.py).
+            # Category -> model id (or {model, provider} dict). Empty = no
+            # rule; falls back to the primary model. Precedence everywhere:
+            # explicit pin > routing rule > primary model.
+            "cron_job": "",
+            "background_task": "",
+            "quick_response": "",
+            "code": "",
+            "chat": "",
+        },
         "delegation": {
             "max_iterations": 45,  # Max tool-calling turns per child agent
             "model": "",       # Subagent model override (empty = inherit parent model)

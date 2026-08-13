@@ -616,6 +616,31 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Context window override (0 = auto-detect from model metadata)",
         "category": "general",
     },
+    "routing.cron_job": {
+        "type": "string",
+        "description": "Model for unpinned cron jobs (empty = background_task rule, then primary model)",
+        "category": "routing",
+    },
+    "routing.background_task": {
+        "type": "string",
+        "description": "Model for background/side tasks (empty = primary model)",
+        "category": "routing",
+    },
+    "routing.quick_response": {
+        "type": "string",
+        "description": "Model for quick/cheap responses (empty = background_task rule, then primary model)",
+        "category": "routing",
+    },
+    "routing.code": {
+        "type": "string",
+        "description": "Model for code-focused work (empty = primary model)",
+        "category": "routing",
+    },
+    "routing.chat": {
+        "type": "string",
+        "description": "Model for main chat (empty = primary model; usually leave unset)",
+        "category": "routing",
+    },
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",

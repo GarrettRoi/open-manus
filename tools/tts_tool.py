@@ -268,6 +268,76 @@ def _config_bool(value: Any, default: bool = False) -> bool:
 # Final fallback when provider isn't recognised at all.
 FALLBACK_MAX_TEXT_LENGTH = 4000
 
+# Target size for one spoken segment of a long auto-TTS reply. Chosen so a
+# segment both stays well under every provider's input cap AND finishes
+# comfortably inside the adapters' per-clip playback timeout (~120s of
+# playback ≈ 1800 chars at typical speech rate). Long responses are split
+# into ordered segments of at most min(provider cap, this value) chars.
+TTS_SEGMENT_TARGET_CHARS = 1500
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def split_text_for_tts(
+    text: str,
+    provider: Optional[str] = None,
+    tts_config: Optional[Dict[str, Any]] = None,
+    segment_chars: Optional[int] = None,
+) -> list:
+    """Split *text* into ordered, provider-safe speech segments.
+
+    Each returned segment is at most ``min(provider input cap,
+    TTS_SEGMENT_TARGET_CHARS)`` characters (override with *segment_chars*),
+    split on sentence boundaries where possible so each segment sounds
+    natural on its own. Segment order preserves the original text order;
+    concatenating the segments reproduces the text (modulo collapsed
+    whitespace at the split points).
+
+    Used by the gateway auto-TTS path so long replies are synthesized as a
+    queue of clips instead of one oversized item that the provider would
+    truncate mid-sentence.
+    """
+    if not text or not text.strip():
+        return []
+    cfg = tts_config if tts_config is not None else _load_tts_config()
+    prov = (provider or _get_provider(cfg))
+    cap = _resolve_max_text_length(prov, cfg)
+    limit = max(1, min(cap, segment_chars or TTS_SEGMENT_TARGET_CHARS))
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+
+    segments: list = []
+    current = ""
+
+    def _flush():
+        nonlocal current
+        if current:
+            segments.append(current)
+            current = ""
+
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        sentence = (sentence or "").strip()
+        if not sentence:
+            continue
+        # Hard-split a single overlong sentence at word boundaries.
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", 0, limit + 1)
+            if cut <= 0:
+                cut = limit
+            piece = sentence[:cut].strip()
+            sentence = sentence[cut:].strip()
+            _flush()
+            if piece:
+                segments.append(piece)
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > limit:
+            _flush()
+        current = f"{current} {sentence}".strip()
+    _flush()
+    return segments
+
 # Back-compat alias. Prefer ``_resolve_max_text_length()`` for new code.
 MAX_TEXT_LENGTH = FALLBACK_MAX_TEXT_LENGTH
 

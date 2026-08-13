@@ -47,3 +47,7 @@ agent:
 
 discord:
   require_mention: false
+
+routing:
+  cron_job: deepseek/deepseek-chat
+  background_task: google/gemini-2.5-flash-preview
