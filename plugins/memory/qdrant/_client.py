@@ -98,12 +98,28 @@ class Embedder:
 
     @classmethod
     def from_env(cls) -> "Embedder":
+        """Resolve the embedding backend.
+
+        Precedence: explicit QDRANT_EMBED_* config, then OPENAI_API_KEY
+        against the OpenAI API, then OPENROUTER_API_KEY against OpenRouter's
+        OpenAI-compatible /embeddings endpoint (every fleet agent already
+        carries a working OpenRouter key).
+        """
+        explicit_key = os.environ.get("QDRANT_EMBED_API_KEY", "")
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if explicit_key or openai_key or not openrouter_key:
+            base = os.environ.get("QDRANT_EMBED_BASE_URL", "https://api.openai.com/v1")
+            key = explicit_key or openai_key
+            model = os.environ.get("QDRANT_EMBED_MODEL", "text-embedding-3-small")
+        else:
+            base = os.environ.get("QDRANT_EMBED_BASE_URL", "https://openrouter.ai/api/v1")
+            key = openrouter_key
+            model = os.environ.get("QDRANT_EMBED_MODEL", "openai/text-embedding-3-small")
         return cls(
-            base_url=os.environ.get("QDRANT_EMBED_BASE_URL",
-                                    "https://api.openai.com/v1"),
-            api_key=(os.environ.get("QDRANT_EMBED_API_KEY")
-                     or os.environ.get("OPENAI_API_KEY", "")),
-            model=os.environ.get("QDRANT_EMBED_MODEL", "text-embedding-3-small"),
+            base_url=base,
+            api_key=key,
+            model=model,
             dim=int(os.environ.get("QDRANT_EMBED_DIM", "1536")),
         )
 

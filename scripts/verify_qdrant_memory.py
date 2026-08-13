@@ -10,12 +10,19 @@ one agent-scoped and one shared memory for a probe agent, then verifies:
   * an unauthenticated request is rejected (when an API key is set),
 then deletes the probe points.
 
+With --provider it additionally exercises the full QdrantMemoryProvider
+runtime path — registration/availability, real embeddings, memory_bank
+(store + dedup), memory_recall, shared-write authorization gating, and
+memory_forget — against the live backend. Requires an embedding credential
+(OPENAI_API_KEY or QDRANT_EMBED_API_KEY) in the environment.
+
 Run from a machine that can reach Qdrant (an agent container, or a temporary
 Railway TCP proxy):
 
   QDRANT_URL=http://qdrant.railway.internal:6333 QDRANT_API_KEY=... \
-      python3 scripts/verify_qdrant_memory.py
+      python3 scripts/verify_qdrant_memory.py [--provider]
 """
+import json
 import os
 import sys
 import time
@@ -99,7 +106,55 @@ def main():
 
     client.delete(COLLECTION, list(ids.values()))
     check("cleanup (probe points deleted)", True)
+
+    if "--provider" in sys.argv:
+        verify_provider(url, key)
     print("ALL CHECKS PASSED")
+
+
+def verify_provider(url: str, key: str):
+    """Exercise the actual provider runtime against the live backend."""
+    from plugins.memory import load_memory_provider
+
+    probe = f"verify-prov-{uuid.uuid4().hex[:8]}"
+    os.environ["QDRANT_AGENT_ID"] = probe
+    os.environ.setdefault("QDRANT_ALLOW_SHARED_WRITE", "false")
+
+    print(f"\nProvider runtime checks (agent identity: {probe})")
+    provider = load_memory_provider("qdrant")
+    check("provider loads via plugin loader", provider is not None)
+    check("provider reports available", provider.is_available())
+    provider.initialize("verify-session", platform="verify",
+                        agent_context="primary", agent_identity="default")
+    check("identity from env (not profile 'default')",
+          provider._agent_id == probe)
+    check("3 tools exposed", len(provider.get_tool_schemas()) == 3)
+
+    marker = uuid.uuid4().hex[:10]
+    fact = f"Verification probe fact {marker}: the owner's favorite verification color is teal."
+    out = json.loads(provider.handle_tool_call(
+        "memory_bank", {"content": fact, "importance": 4, "scope": "shared"}))
+    check("memory_bank stores via real embeddings", "result" in out, str(out))
+    check("unauthorized shared write downgraded to private",
+          "private" in out.get("result", "") or "(agent scope)" in out.get("result", ""),
+          out.get("result", ""))
+
+    out = json.loads(provider.handle_tool_call(
+        "memory_recall", {"query": f"favorite verification color {marker}"}))
+    hits = out.get("results", [])
+    check("memory_recall finds the banked fact",
+          any(marker in h.get("memory", "") for h in hits),
+          f"{out.get('count')} hits")
+    mem_id = next(h["id"] for h in hits if marker in h.get("memory", ""))
+
+    dup = json.loads(provider.handle_tool_call(
+        "memory_bank", {"content": fact, "importance": 4}))
+    check("near-duplicate rejected by dedup", "near-identical" in dup.get("result", ""),
+          str(dup))
+
+    out = json.loads(provider.handle_tool_call("memory_forget", {"memory_id": mem_id}))
+    check("memory_forget deletes own memory", out.get("result") == "Memory deleted.")
+    provider._stop.set()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ def _provider(monkeypatch, **env):
         "QDRANT_API_KEY": "k",
         "OPENAI_API_KEY": "ek",
         "AGENT_NAME": "bianca",
+        "QDRANT_ALLOW_SHARED_WRITE": "true",
     }
     defaults.update(env)
     for k, v in defaults.items():
@@ -128,7 +129,7 @@ def test_store_skips_when_embeddings_unavailable(monkeypatch):
     emb.embed.side_effect = None
     emb.embed.return_value = None
     stored = p._store_facts([{"text": "x", "scope": "agent", "importance": 3}], "tool")
-    assert stored == 0
+    assert stored is None
     client.upsert.assert_not_called()
     _shutdown(p)
 
@@ -236,6 +237,37 @@ def test_agent_identity_env_beats_default_profile(monkeypatch):
     _shutdown(p2)
 
 
+def test_unauthorized_shared_write_downgraded_to_private(monkeypatch):
+    p = _provider(monkeypatch, QDRANT_ALLOW_SHARED_WRITE=None)
+    client, _ = _init(p, monkeypatch)
+    client.search.return_value = []
+    out = json.loads(p.handle_tool_call(
+        "memory_bank", {"content": "poison the fleet", "scope": "shared"}))
+    assert "not authorized" in out["result"]
+    points = client.upsert.call_args[0][1]
+    assert points[0]["payload"]["scope"] == "agent"  # downgraded, not shared
+
+    # extraction-path facts get the same downgrade
+    client.upsert.reset_mock()
+    p._store_facts([{"text": "extracted", "scope": "shared", "importance": 3}], "turn_sync")
+    assert client.upsert.call_args[0][1][0]["payload"]["scope"] == "agent"
+    _shutdown(p)
+
+
+def test_prefetch_block_marks_memories_as_untrusted(monkeypatch):
+    p = _provider(monkeypatch)
+    client, _ = _init(p, monkeypatch)
+    client.search.return_value = [
+        {"id": "i", "score": 0.9, "payload": {"text": "shared note", "scope": "shared",
+                                              "agent_id": "lexi", "ts": time.time(), "importance": 3}},
+    ]
+    p.queue_prefetch("note")
+    body = p.prefetch("note")
+    assert "NOT instructions" in body
+    assert "[fleet-shared, from lexi]" in body
+    _shutdown(p)
+
+
 def test_embed_outage_trips_breaker(monkeypatch):
     p = _provider(monkeypatch)
     client, emb = _init(p, monkeypatch)
@@ -299,3 +331,28 @@ def test_embedder_env_defaults(monkeypatch):
     assert e.model == "text-embedding-3-small"
     assert e.dim == 1536
     assert e.available()
+
+
+def test_bank_tool_reports_backend_failure_not_dedup(monkeypatch):
+    p = _provider(monkeypatch)
+    client, emb = _init(p, monkeypatch)
+    emb.embed.side_effect = None
+    emb.embed.return_value = None  # embedding backend down
+    out = json.loads(p.handle_tool_call("memory_bank", {"content": "x"}))
+    assert "error" in out and "NOT stored" in out["error"]
+    _shutdown(p)
+
+
+def test_embedder_falls_back_to_openrouter(monkeypatch):
+    for k in ("QDRANT_EMBED_API_KEY", "OPENAI_API_KEY", "QDRANT_EMBED_BASE_URL", "QDRANT_EMBED_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    e = Embedder.from_env()
+    assert e.base == "https://openrouter.ai/api/v1"
+    assert e.model == "openai/text-embedding-3-small"
+    assert e.available()
+
+    # explicit OPENAI key still takes precedence
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    e2 = Embedder.from_env()
+    assert e2.base == "https://api.openai.com/v1"
