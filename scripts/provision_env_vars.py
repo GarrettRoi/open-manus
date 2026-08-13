@@ -54,10 +54,6 @@ SHARED_VARS = {
     # Memory & Storage
     "MEMORY_BACKEND": "redis",
 
-    # Qdrant fleet vector memory (long-term semantic recall).
-    # Activated per agent via memory.provider: qdrant in deploy/<agent>/config.yaml.
-    "QDRANT_URL": "http://qdrant.railway.internal:6333",
-    "QDRANT_API_KEY": os.environ.get("QDRANT_API_KEY", ""),
     "WORKSPACE_DIR": "/root/.hermes/workspace",
     "HERMES_WORKSPACE_DIR": "/root/.hermes/workspace",
     
