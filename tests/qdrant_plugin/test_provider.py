@@ -200,12 +200,50 @@ def test_bank_tool_reports_dedup(monkeypatch):
     _shutdown(p)
 
 
-def test_forget_tool_deletes(monkeypatch):
+def test_forget_tool_deletes_own_memory(monkeypatch):
     p = _provider(monkeypatch)
     client, _ = _init(p, monkeypatch)
+    client.retrieve.return_value = [{"id": "abc", "payload": {"scope": "agent", "agent_id": "bianca"}}]
     out = json.loads(p.handle_tool_call("memory_forget", {"memory_id": "abc"}))
     assert out["result"] == "Memory deleted."
     client.delete.assert_called_once()
+    _shutdown(p)
+
+
+def test_forget_tool_blocks_foreign_private_memory(monkeypatch):
+    p = _provider(monkeypatch)
+    client, _ = _init(p, monkeypatch)
+    client.retrieve.return_value = [{"id": "abc", "payload": {"scope": "agent", "agent_id": "samantha"}}]
+    out = json.loads(p.handle_tool_call("memory_forget", {"memory_id": "abc"}))
+    assert "error" in out
+    client.delete.assert_not_called()
+
+    client.retrieve.return_value = []
+    out = json.loads(p.handle_tool_call("memory_forget", {"memory_id": "missing"}))
+    assert "error" in out
+    _shutdown(p)
+
+
+def test_agent_identity_env_beats_default_profile(monkeypatch):
+    p = _provider(monkeypatch)
+    _init(p, monkeypatch, agent_identity="default")
+    assert p._agent_id == "bianca"  # AGENT_NAME wins over profile "default"
+    _shutdown(p)
+
+    p2 = _provider(monkeypatch, AGENT_NAME=None)
+    _init(p2, monkeypatch, agent_identity="lexi")
+    assert p2._agent_id == "lexi"  # real profile identity is honored
+    _shutdown(p2)
+
+
+def test_embed_outage_trips_breaker(monkeypatch):
+    p = _provider(monkeypatch)
+    client, emb = _init(p, monkeypatch)
+    emb.embed.side_effect = None
+    emb.embed.return_value = None
+    for _ in range(5):
+        assert p._recall("q", 3) == []
+    assert p._breaker_open()
     _shutdown(p)
 
 

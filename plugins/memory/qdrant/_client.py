@@ -73,6 +73,10 @@ class QdrantClient:
         return self._req("POST", f"/collections/{collection}/points/search",
                          body).get("result", [])
 
+    def retrieve(self, collection: str, point_ids: List[str]) -> List[Dict[str, Any]]:
+        return self._req("POST", f"/collections/{collection}/points",
+                         {"ids": point_ids, "with_payload": True}).get("result", [])
+
     def set_payload(self, collection: str, point_ids: List[str],
                     payload: Dict[str, Any]) -> None:
         self._req("POST", f"/collections/{collection}/points/payload?wait=true",

@@ -180,7 +180,16 @@ class QdrantMemoryProvider(MemoryProvider):
         self._config = _load_config()
         self._session_id = session_id or ""
         self._platform = kwargs.get("platform") or ""
-        self._agent_id = (kwargs.get("agent_identity") or "").lower() or self._config["agent_id"]
+        # Identity precedence: explicit env (QDRANT_AGENT_ID / AGENT_NAME —
+        # unique per fleet service) wins over the runtime profile name, which
+        # is "default" on every agent using the shared HERMES_HOME and would
+        # collapse all private scopes into one bucket (cross-agent leak).
+        env_identity = (os.environ.get("QDRANT_AGENT_ID")
+                        or os.environ.get("AGENT_NAME", "")).lower().strip()
+        profile_identity = (kwargs.get("agent_identity") or "").lower().strip()
+        if profile_identity == "default":
+            profile_identity = ""
+        self._agent_id = env_identity or profile_identity or self._config["agent_id"]
         self._collection = self._config["collection"]
         # Cron system prompts / subagent chatter must not pollute memory.
         self._read_only = kwargs.get("agent_context", "primary") != "primary"
@@ -294,10 +303,14 @@ class QdrantMemoryProvider(MemoryProvider):
         """Embed + dedup + upsert facts. Returns number stored. Worker-thread only."""
         if not facts or not self._client or not self._embedder:
             return 0
-        if not self._ensure_ready() or self._breaker_open():
+        if self._breaker_open():
+            return 0
+        if not self._ensure_ready():
+            self._record_failure()
             return 0
         vectors = self._embedder.embed([f["text"] for f in facts])
         if vectors is None:
+            self._record_failure()
             return 0
         points = []
         try:
@@ -334,15 +347,26 @@ class QdrantMemoryProvider(MemoryProvider):
 
     def _recall(self, query: str, top_k: int) -> List[Dict[str, Any]]:
         """Synchronous recall (raises on failure). Returns ranked hits."""
-        if not self._client or not self._embedder or not self._ensure_ready():
+        if not self._client or not self._embedder:
+            return []
+        if not self._ensure_ready():
+            self._record_failure()
             return []
         vectors = self._embedder.embed([query])
         if vectors is None:
+            # Count toward the breaker so a dead embedding backend stops
+            # adding prefetch waits to every turn after a few failures.
+            self._record_failure()
             return []
-        hits = self._client.search(
-            self._collection, vectors[0],
-            limit=max(top_k * 3, 15), flt=self._read_filter(),
-        )
+        try:
+            hits = self._client.search(
+                self._collection, vectors[0],
+                limit=max(top_k * 3, 15), flt=self._read_filter(),
+            )
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
         return self._rank(hits, top_k)
 
     # -- background worker -------------------------------------------------------
@@ -445,9 +469,8 @@ class QdrantMemoryProvider(MemoryProvider):
                         lines.append(f"- {p['text']}{tag}")
                 if lines:
                     body = "## Long-Term Memory Recall\n" + "\n".join(lines)
-                self._record_success()
             except Exception as e:
-                self._record_failure()
+                # _recall already updated the circuit breaker.
                 logger.debug("qdrant memory: prefetch failed: %s", e)
             with self._prefetch_lock:
                 if self._prefetch_query == query:
@@ -498,9 +521,7 @@ class QdrantMemoryProvider(MemoryProvider):
             top_k = max(1, min(int(args.get("top_k", 8) or 8), 25))
             try:
                 hits = self._recall(query, top_k)
-                self._record_success()
             except Exception as e:
-                self._record_failure()
                 return tool_error(f"Recall failed: {e}")
             if not hits:
                 return json.dumps({"result": "No relevant memories found."})
@@ -546,6 +567,19 @@ class QdrantMemoryProvider(MemoryProvider):
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
             try:
+                # Ownership check: an agent may delete its own private
+                # memories or shared fleet memories, never another agent's
+                # private ones.
+                points = self._client.retrieve(self._collection, [memory_id])
+                if not points:
+                    return tool_error(f"Memory not found: {memory_id}")
+                payload = points[0].get("payload") or {}
+                if (payload.get("scope") == "agent"
+                        and payload.get("agent_id") != self._agent_id):
+                    return tool_error(
+                        "That memory belongs to another agent and cannot be "
+                        "deleted from here."
+                    )
                 self._client.delete(self._collection, [memory_id])
                 self._record_success()
                 return json.dumps({"result": "Memory deleted."})
