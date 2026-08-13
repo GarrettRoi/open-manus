@@ -407,7 +407,7 @@
             border-bottom: none;
         }
 
-        .grant-toggle label {
+        .grant-toggle label:not(.toggle-switch) {
             font-size: 14px;
             color: var(--text);
             cursor: pointer;
@@ -418,6 +418,7 @@
 
         /* Toggle switch for mobile */
         .toggle-switch {
+            display: inline-block;
             position: relative;
             width: 48px;
             height: 28px;

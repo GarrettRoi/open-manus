@@ -57,14 +57,14 @@
                 {% for kn in key_names %}
                 <div class="grant-toggle">
                     <label for="mobile_grant_{{ agent }}_{{ kn }}">{{ kn }}</label>
-                    <div class="toggle-switch">
+                    <label class="toggle-switch">
                         <input type="checkbox" 
                                id="mobile_grant_{{ agent }}_{{ kn }}"
                                name="grant_{{ agent }}_{{ kn }}" 
                                {% if matrix[agent][kn] %}checked{% endif %}
                                onchange="syncGrant('{{ agent }}', '{{ kn }}', this.checked); updateCount('{{ agent }}')">
                         <span class="toggle-slider"></span>
-                    </div>
+                    </label>
                 </div>
                 {% endfor %}
             </div>

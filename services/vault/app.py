@@ -1622,7 +1622,9 @@ async def plaid_banks_page(request: Request, error: str = "", notice: str = ""):
             "label": conn.get("label") or cid,
             "base_url": conn.get("base_url") or "",
             "creds_ok": bool(client_id and secret),
-            "items": item_store.list_items(cid),
+            # NOTE: named bank_items (not "items") — on a plain dict, Jinja's
+            # pc.items would resolve to the dict method and 500 the template.
+            "bank_items": item_store.list_items(cid),
         })
     return templates.TemplateResponse(request, "plaid.html", {
         "plaid_conns": plaid_conns,

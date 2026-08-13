@@ -39,12 +39,12 @@
     </p>
     {% endif %}
 
-    {% if pc.items %}
+    {% if pc.bank_items %}
     <div class="table-responsive">
         <table>
             <thead><tr><th>Institution</th><th>Key (for agents)</th><th>Status</th><th>Connected</th><th>Actions</th></tr></thead>
             <tbody>
-                {% for it in pc.items %}
+                {% for it in pc.bank_items %}
                 <tr>
                     <td><strong>{{ it.institution_name }}</strong>
                         {% if it.institution_id %}<br><span style="font-size: 11px; color: var(--text-muted);">{{ it.institution_id }}</span>{% endif %}
@@ -75,7 +75,7 @@
 
     <p style="font-size: 12px; color: var(--text-muted); margin-top: 10px;">
         Agents use a connected bank by adding <code>"vault_item": "&lt;key&gt;"</code> to the JSON body of a proxied Plaid call —
-        e.g. <code>POST /accounts/balance/get</code> with <code>{"vault_item": "{{ pc.items[0].key if pc.items else 'DISCOVER' }}"}</code>.
+        e.g. <code>POST /accounts/balance/get</code> with <code>{"vault_item": "{{ pc.bank_items[0].key if pc.bank_items else 'DISCOVER' }}"}</code>.
         The vault injects that bank's access token server-side.
     </p>
 </div>
