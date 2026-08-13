@@ -688,3 +688,194 @@ async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
         "direct_messages_topic_id": "20197",
         "telegram_reply_to_message_id": "462",
     }
+
+
+# ── status-channel routing for the shutdown broadcast ─────────────────────
+
+
+class _FakeStatusRedis:
+    """Minimal fake of the redis client surface used by gateway.status_notify."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.lists: dict[str, list[str]] = {}
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+        return len(self.lists[key])
+
+    def expire(self, key, ttl):
+        return True
+
+    def lrange(self, key, start, stop):
+        return list(self.lists.get(key, []))
+
+    def delete(self, key):
+        self.lists.pop(key, None)
+        self.store.pop(key, None)
+
+
+@pytest.fixture
+def status_redis(monkeypatch):
+    import gateway.status_notify as status_notify
+
+    fake = _FakeStatusRedis()
+    monkeypatch.setattr(status_notify, "_get_redis", lambda: fake)
+    monkeypatch.setenv("AGENT_NAME", "harmony")
+    monkeypatch.setenv("HERMES_SHUTDOWN_STATUS_COALESCE_WAIT", "0")
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_shutdown_broadcast_routed_to_status_channel(status_redis):
+    """With status_channel configured, the broadcast goes there, not home."""
+    runner, adapter = make_restart_runner()
+    cfg = runner.config.platforms[Platform.TELEGRAM]
+    cfg.status_channel = "status-1"
+    cfg.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-42", name="Home"
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    chat_id, content, _meta = adapter.sent_calls[0]
+    assert chat_id == "status-1"
+    assert "Harmony" in content
+    assert "shutting down" in content
+
+
+@pytest.mark.asyncio
+async def test_shutdown_broadcast_falls_back_to_home_channel(status_redis):
+    """Without status_channel, the home-channel behavior is unchanged."""
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-42", name="Home"
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    chat_id, content, _meta = adapter.sent_calls[0]
+    assert chat_id == "home-42"
+    assert "Gateway shutting down" in content
+
+
+@pytest.mark.asyncio
+async def test_status_channel_honors_restart_notification_toggle(status_redis):
+    """gateway_restart_notification=false still silences the status broadcast."""
+    runner, adapter = make_restart_runner()
+    cfg = runner.config.platforms[Platform.TELEGRAM]
+    cfg.status_channel = "status-1"
+    cfg.gateway_restart_notification = False
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_status_channel_cooldown_suppresses_repeat_notice(status_redis):
+    """A second shutdown within the cooldown window posts nothing."""
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].status_channel = "status-1"
+
+    await runner._notify_active_sessions_of_shutdown()
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_channel_groups_concurrent_agents(status_redis):
+    """Agents already in the pending wave are folded into one grouped message."""
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].status_channel = "status-1"
+    status_redis.lists["hermes:gateway:shutdown_notice:pending"] = ["lexi", "nova"]
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    _chat, content, _meta = adapter.sent_calls[0]
+    assert "3 agents" in content
+    assert "Lexi" in content and "Nova" in content and "Harmony" in content
+
+
+@pytest.mark.asyncio
+async def test_status_channel_coalesced_when_lock_held(status_redis):
+    """If another agent holds the group lock, this agent stays silent."""
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].status_channel = "status-1"
+    status_redis.store["hermes:gateway:shutdown_notice:lock"] = "lexi"
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent_calls == []
+    # Our name joined the pending wave for the lock holder's grouped message.
+    assert "harmony" in status_redis.lists["hermes:gateway:shutdown_notice:pending"]
+
+
+@pytest.mark.asyncio
+async def test_status_channel_fails_open_without_redis(monkeypatch):
+    """No Redis → notice still posts (unlimited) rather than being silenced."""
+    import gateway.status_notify as status_notify
+
+    monkeypatch.setattr(status_notify, "_get_redis", lambda: None)
+    monkeypatch.setenv("AGENT_NAME", "harmony")
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].status_channel = "status-1"
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    chat_id, content, _meta = adapter.sent_calls[0]
+    assert chat_id == "status-1"
+    assert "Harmony" in content
+
+
+@pytest.mark.asyncio
+async def test_status_channel_restarting_action(status_redis):
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].status_channel = "status-1"
+    runner._restart_requested = True
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    assert "restarting" in adapter.sent_calls[0][1]
+
+
+def test_platform_config_status_channel_roundtrip():
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig.from_dict({"enabled": True, "status_channel": "123"})
+    assert cfg.status_channel == "123"
+    assert PlatformConfig.from_dict(cfg.to_dict()).status_channel == "123"
+
+    # Bridged via extra (shared-key loop in load_gateway_config)
+    cfg2 = PlatformConfig.from_dict({"extra": {"status_channel": 456}})
+    assert cfg2.status_channel == "456"
+
+    # Absent → None, and omitted from to_dict
+    cfg3 = PlatformConfig.from_dict({})
+    assert cfg3.status_channel is None
+    assert "status_channel" not in cfg3.to_dict()
+
+
+def test_env_override_sets_status_channel(monkeypatch):
+    from gateway.config import GatewayConfig, PlatformConfig, _apply_env_overrides
+
+    monkeypatch.setenv("TELEGRAM_STATUS_CHANNEL_ID", "999")
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    _apply_env_overrides(config)
+
+    assert config.platforms[Platform.TELEGRAM].status_channel == "999"

@@ -413,6 +413,14 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Optional dedicated status channel for gateway shutdown/restart BROADCAST
+    # notices. When set, the home-channel-style "gateway shutting down"
+    # broadcast is routed here (rate-limited fleet-wide via shared Redis)
+    # instead of the platform's home channel; when unset, the home channel
+    # keeps its prior behavior. Per-active-session interrupt pings are never
+    # rerouted. Env-overridable via <PLATFORM>_STATUS_CHANNEL_ID.
+    status_channel: Optional[str] = None
+
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
     # preserves prior behavior. Set False on platforms where the indicator is
@@ -442,6 +450,8 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.status_channel:
+            result["status_channel"] = self.status_channel
         if self.channel_overrides:
             result["channel_overrides"] = {
                 cid: ov.to_dict() for cid, ov in self.channel_overrides.items()
@@ -469,6 +479,12 @@ class PlatformConfig:
         if _typing is None:
             _typing = data.get("extra", {}).get("typing_indicator")
 
+        # status_channel follows the same top-level-or-extra pattern so YAML
+        # ``discord: status_channel: "123"`` works via the shared-key bridge.
+        _status_channel = data.get("status_channel")
+        if _status_channel is None:
+            _status_channel = data.get("extra", {}).get("status_channel")
+
         channel_overrides: Dict[str, ChannelOverride] = {}
         raw_overrides = data.get("channel_overrides") or {}
         if isinstance(raw_overrides, dict):
@@ -483,6 +499,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            status_channel=str(_status_channel) if _status_channel else None,
             typing_indicator=_coerce_bool(_typing, True),
             channel_overrides=channel_overrides,
             extra=data.get("extra", {}),
@@ -1169,6 +1186,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
+                if "status_channel" in platform_cfg:
+                    bridged["status_channel"] = platform_cfg["status_channel"]
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")
@@ -2218,6 +2237,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if relay_url_val:
         relay_config = _enable_from_env(Platform.RELAY)
         relay_config.extra["relay_url"] = relay_url_val.rstrip("/")
+
+    # Dedicated shutdown/status channel, per platform. Env wins over YAML so a
+    # fleet-wide value (e.g. DISCORD_STATUS_CHANNEL_ID on every Railway
+    # service) routes all agents' shutdown broadcasts to one private channel.
+    for _plat, _pcfg in config.platforms.items():
+        _status_val = getenv(f"{_plat.value.upper()}_STATUS_CHANNEL_ID")
+        if _status_val:
+            _pcfg.status_channel = _status_val
 
     for platform_config in config.platforms.values():
         platform_config.extra.pop("_enabled_explicit", None)

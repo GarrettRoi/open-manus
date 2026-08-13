@@ -5732,16 +5732,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            platform_cfg = self.config.platforms.get(platform)
+            status_channel = (
+                getattr(platform_cfg, "status_channel", None) if platform_cfg else None
+            )
             home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            if not status_channel and (not home or not home.chat_id):
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
-                    "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
+                    "Shutdown notification suppressed for %s channel: %s has gateway_restart_notification=false",
+                    "status" if status_channel else "home",
                     platform.value,
                 )
+                continue
+
+            if status_channel:
+                # Route the broadcast to the dedicated status channel instead
+                # of the home channel, rate-limited/coalesced fleet-wide via
+                # shared Redis so a redeploy wave produces one compact report
+                # instead of per-agent spam.
+                try:
+                    from gateway.status_notify import prepare_shutdown_status_notice
+                    status_msg = await prepare_shutdown_status_notice(action)
+                except Exception as e:
+                    logger.debug(
+                        "Status-notice preparation failed, sending plain notice: %s", e
+                    )
+                    status_msg = msg
+                if status_msg is None:
+                    logger.info(
+                        "Shutdown status notice suppressed for %s (cooldown/coalesced)",
+                        platform.value,
+                    )
+                    continue
+                try:
+                    result = await adapter.send(str(status_channel), status_msg)
+                    if result is not None and getattr(result, "success", True) is False:
+                        logger.debug(
+                            "Failed to send shutdown notice to status channel %s:%s: %s",
+                            platform.value,
+                            status_channel,
+                            getattr(result, "error", "send returned success=False"),
+                        )
+                        continue
+                    logger.info(
+                        "Sent shutdown notice to status channel %s:%s",
+                        platform.value,
+                        status_channel,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Failed to send shutdown notice to status channel %s:%s: %s",
+                        platform.value,
+                        status_channel,
+                        e,
+                    )
                 continue
 
             dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)

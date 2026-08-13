@@ -62,6 +62,10 @@ SHARED_VARS = {
     
     # Discord (for notifications only, not agent-to-agent chat)
     "DISCORD_BOT_API": os.environ.get("DISCORD_BOT_API", ""),
+
+    # Dedicated private status channel: gateway shutdown/restart broadcasts
+    # route here (rate-limited fleet-wide) instead of each agent's home channel.
+    "DISCORD_STATUS_CHANNEL_ID": "1537420503663378492",
     
     # Voice: auto-join/leave when users enter/exit the agent's designated channel
     "DISCORD_VOICE_AUTO_JOIN": "true",
