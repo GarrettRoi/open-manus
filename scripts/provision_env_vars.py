@@ -48,7 +48,10 @@ AGENT_SERVICES = {
 # ============================================================
 SHARED_VARS = {
     # LLM
-    "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
+    # NOTE: OPENROUTER_API_KEY is intentionally NOT set here. Each agent has
+    # its own per-agent key (named "agent-<name>") managed by
+    # scripts/provision_openrouter_keys.py — pushing a single shared value
+    # from this script would clobber every per-agent key.
     "LLM_MODEL": "google/gemini-2.5-flash",
     
     # Memory & Storage

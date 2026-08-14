@@ -363,6 +363,16 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
+    # ── Mute-to-send ─────────────────────────────────────────────────
+    # While a user is UNMUTED we treat them as "still composing": their
+    # buffer is held through short pauses (ambient noise gaps, thinking)
+    # using the longer UNMUTED_SILENCE_THRESHOLD instead of the 1.5s cut.
+    # The moment they self-mute, their buffer is flushed immediately as
+    # one complete utterance. Toggle with DISCORD_VOICE_MUTE_TO_SEND
+    # (default on); tune the unmuted hold with DISCORD_VOICE_UNMUTED_SILENCE.
+    MUTE_TO_SEND = os.environ.get("DISCORD_VOICE_MUTE_TO_SEND", "true").lower() not in ("0", "false", "no")
+    UNMUTED_SILENCE_THRESHOLD = float(os.environ.get("DISCORD_VOICE_UNMUTED_SILENCE", "10"))
+
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
@@ -386,6 +396,13 @@ class VoiceReceiver:
 
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
+
+        # Mute-to-send state: user_id -> is currently muted (self or server).
+        # Unknown users (no voice-state seen yet) keep classic behavior.
+        self._user_muted: Dict[int, bool] = {}
+        # Users whose buffer must be flushed on the next check_silence pass
+        # (set on an unmute -> mute transition).
+        self._flush_users: set = set()
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -433,6 +450,19 @@ class VoiceReceiver:
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
             self._ssrc_to_user[ssrc] = user_id
+
+    def set_user_muted(self, user_id: int, muted: bool):
+        """Record a user's mute state (mute-to-send).
+
+        An unmuted -> muted transition marks the user's buffered speech for
+        immediate flush: muting is the explicit "I'm done talking" signal.
+        Thread-safe; called from the asyncio voice-state event.
+        """
+        with self._lock:
+            was_muted = self._user_muted.get(user_id)
+            self._user_muted[user_id] = muted
+            if muted and was_muted is False:
+                self._flush_users.add(user_id)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5).
@@ -657,20 +687,38 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC not mapped (SPEAKING event missing after bot rejoin).
-                        # Infer from allowed users in the voice channel.
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
+                user_id = ssrc_user_map.get(ssrc, 0)
+                if not user_id:
+                    # SSRC not mapped (SPEAKING event missing after bot rejoin).
+                    # Infer from allowed users in the voice channel.
+                    user_id = self._infer_user_for_ssrc(ssrc)
+
+                # Mute-to-send: the user just muted — flush their buffer now
+                # as one complete utterance, regardless of silence timing.
+                force_flush = (self.MUTE_TO_SEND and bool(user_id)
+                               and user_id in self._flush_users)
+
+                # While a known-unmuted user keeps talking, hold the buffer
+                # through longer pauses so ambient-noise gaps don't cut a
+                # thought mid-sentence.
+                threshold = self.SILENCE_THRESHOLD
+                if (self.MUTE_TO_SEND and user_id
+                        and self._user_muted.get(user_id) is False):
+                    threshold = self.UNMUTED_SILENCE_THRESHOLD
+
+                if force_flush or (silence_duration >= threshold
+                                   and buf_duration >= self.MIN_SPEECH_DURATION):
+                    if user_id and buf_duration >= self.MIN_SPEECH_DURATION:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                elif silence_duration >= self.SILENCE_THRESHOLD * 2 and not user_id:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+
+            # Clear flush requests (their SSRCs, if any, were handled above).
+            self._flush_users.clear()
 
         return completed
 
@@ -1291,6 +1339,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
+
+                # Mute-to-send: forward self/server mute transitions to the
+                # guild's voice receiver so muting flushes buffered speech.
+                receiver = adapter_self._voice_receivers.get(guild_id)
+                if receiver is not None:
+                    muted_before = bool(getattr(before, "self_mute", False) or getattr(before, "mute", False))
+                    muted_after = bool(getattr(after, "self_mute", False) or getattr(after, "mute", False))
+                    if muted_before != muted_after or member.id not in receiver._user_muted:
+                        receiver.set_user_muted(member.id, muted_after)
+                        if muted_after and not muted_before:
+                            logger.info(
+                                "Voice state: %s (%d) muted — flushing buffered speech (guild %d)",
+                                member.display_name, member.id, guild_id,
+                            )
 
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
@@ -3472,6 +3534,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
+                # Seed mute-to-send with the current mute state of everyone
+                # already in the channel (no transition event will fire for
+                # states that predate the bot joining).
+                try:
+                    for m in getattr(channel, "members", []) or []:
+                        vs = getattr(m, "voice", None)
+                        if vs is not None and not getattr(m, "bot", False):
+                            receiver.set_user_muted(
+                                m.id, bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False))
+                            )
+                except Exception:
+                    logger.debug("Mute-state seeding failed", exc_info=True)
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
                     self._voice_listen_loop(guild_id)
                 )
