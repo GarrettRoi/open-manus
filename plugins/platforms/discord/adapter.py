@@ -3625,10 +3625,21 @@ class DiscordAdapter(BasePlatformAdapter):
             receiver.pause()
 
         try:
-            # Wait for current playback to finish (with timeout)
+            # Wait for current playback to finish. If we started that clip
+            # ourselves we know its deadline (duration + margin) — only
+            # force-stop once it's past. Unknown/externally started playback
+            # keeps the bounded PLAYBACK_TIMEOUT fallback.
+            deadlines = getattr(self, "_voice_play_deadlines", None)
+            if deadlines is None:
+                deadlines = self._voice_play_deadlines = {}
             wait_start = time.monotonic()
             while vc.is_playing():
-                if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
+                deadline = deadlines.get(guild_id)
+                if deadline is not None:
+                    expired = time.monotonic() > deadline
+                else:
+                    expired = time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT
+                if expired:
                     logger.warning("Timed out waiting for previous playback to finish")
                     vc.stop()
                     break
@@ -3647,12 +3658,15 @@ class DiscordAdapter(BasePlatformAdapter):
             vc.play(source, after=_after)
             duration_s = await asyncio.to_thread(self._probe_audio_duration, audio_path)
             timeout_s = self._playback_timeout_for(duration_s)
+            deadlines[guild_id] = time.monotonic() + timeout_s
             try:
                 await asyncio.wait_for(done.wait(), timeout=timeout_s)
             except asyncio.TimeoutError:
                 logger.warning("Voice playback timed out after %.0fs (clip duration %s)",
                                timeout_s, f"{duration_s:.1f}s" if duration_s else "unknown")
                 vc.stop()
+            finally:
+                deadlines.pop(guild_id, None)
             self._reset_voice_timeout(guild_id)
             return True
         finally:
