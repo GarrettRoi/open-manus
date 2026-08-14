@@ -355,6 +355,10 @@ async def _ensure_thread(client, channel, thread_id: Optional[int], name: str):
             await anchor.edit(content=_anchor_text(name, th.id))
         except Exception:
             pass
+        # Stale exact-match anchors that failed to resolve to a valid thread
+        # (e.g. their thread was renamed/deleted) — remove them so the new
+        # starter is the only pinned anchor.
+        await _dedup_anchors(anchors, th.id, name)
         logger.info("cron discord-threads: created thread %s (%s)", name, th.id)
         return th
 

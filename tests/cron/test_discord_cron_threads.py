@@ -420,6 +420,11 @@ def test_recovery_rejects_wrong_thread_name(env):
         await dct._sync_async(adapter)
         jt = next(t for t in channel.threads if t.name == dct.JOBS_THREAD_NAME)
         assert dct._jobs_thread_id == jt.id != rogue.id
+        # The stale anchor is cleaned up: exactly one matching pin remains,
+        # and it is the new thread's starter message.
+        keepers = [m for m in channel.pinned
+                   if dct._anchor_re(dct.JOBS_THREAD_NAME).match(m.content or "")]
+        assert [m.id for m in keepers] == [jt.id]
 
     asyncio.run(run())
 
