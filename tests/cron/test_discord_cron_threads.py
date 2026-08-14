@@ -38,6 +38,7 @@ def dct(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(mod, "_disabled", False)
     monkeypatch.setattr(mod, "_pins_disabled", False)
+    monkeypatch.setattr(mod, "_state_loaded", False)
     monkeypatch.setattr(mod, "_message_map", None)
     monkeypatch.setattr(mod, "_jobs_thread_id", None)
     monkeypatch.setattr(mod, "_history_thread_id", None)
@@ -327,6 +328,41 @@ def test_thread_recovered_from_anchor_pin(env):
         await dct._sync_async(adapter)
         assert channel.threads == []  # nothing re-created in the channel
         assert dct._jobs_thread_id == jt.id
+
+    asyncio.run(run())
+
+
+def test_redeploy_restores_threads_from_persisted_ids(env):
+    """Fresh process: ONLY the persisted state-file ids (via fetch_channel)
+    can find the threads — no active/archived scan hits, no pins."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        await dct._sync_async(adapter)
+        jt_id, ht_id = dct._jobs_thread_id, dct._history_thread_id
+        assert json.loads(dct.STATE_FILE.read_text())["jobs_thread_id"] == jt_id
+
+        # Simulate redeploy: wipe module globals; threads invisible to the
+        # channel cache and pins; only client fetch-by-id can reach them.
+        hidden = list(channel.threads)
+        channel.threads = []
+        channel.pinned = []
+        dct._message_map = None
+        dct._jobs_thread_id = None
+        dct._history_thread_id = None
+        dct._state_loaded = False
+        real_get = adapter._client.get_channel
+
+        def get_channel(cid):
+            for t in hidden:
+                if t.id == cid:
+                    return t
+            return real_get(cid)
+
+        adapter._client.get_channel = get_channel
+        await dct._sync_async(adapter)
+        assert channel.threads == []  # nothing re-created
+        assert (dct._jobs_thread_id, dct._history_thread_id) == (jt_id, ht_id)
 
     asyncio.run(run())
 

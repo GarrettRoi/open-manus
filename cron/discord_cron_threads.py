@@ -60,6 +60,7 @@ _lock = threading.Lock()
 _bootstrap_lock: Optional[asyncio.Lock] = None
 _disabled = False          # set on Forbidden / fatal errors; process-lifetime
 _pins_disabled = False     # no perms for pin management; threads keep working
+_state_loaded = False      # persisted thread ids loaded once per process
 _sync_inflight = False
 _cached_adapter = None     # last live Discord adapter seen by schedule_sync
 _cached_loop = None        # gateway event loop
@@ -192,7 +193,7 @@ async def _resolve_thread(client, channel, thread_id: Optional[int], name: str):
     """Find an existing thread by stored id or name; return it or None."""
     import discord
 
-    # 1. Stored id.
+    # 1. Stored id (in-memory or restored from the persisted state file).
     if thread_id:
         th = client.get_channel(thread_id)
         if th is None:
@@ -200,7 +201,9 @@ async def _resolve_thread(client, channel, thread_id: Optional[int], name: str):
                 th = await client.fetch_channel(thread_id)
             except discord.HTTPException:
                 th = None
-        if th is not None and getattr(th, "parent_id", None) == channel.id:
+        if (th is not None
+                and getattr(th, "parent_id", None) == channel.id
+                and getattr(th, "name", None) == name):
             return th
     # 2. Active threads by name.
     for th in getattr(channel, "threads", []) or []:
@@ -393,9 +396,23 @@ async def _bootstrap(adapter):
     global _jobs_thread_id, _history_thread_id, _bootstrap_lock
     import discord
 
+    global _state_loaded
     if _bootstrap_lock is None:
         _bootstrap_lock = asyncio.Lock()
     async with _bootstrap_lock:
+        if not _state_loaded:
+            # Fresh process (redeploy): restore persisted thread ids so
+            # resolution goes straight to fetch-by-id instead of relying on
+            # active/archived scans or pin discovery.
+            _state_loaded = True
+            state = _load_state()
+            try:
+                if _jobs_thread_id is None and state.get("jobs_thread_id"):
+                    _jobs_thread_id = int(state["jobs_thread_id"])
+                if _history_thread_id is None and state.get("history_thread_id"):
+                    _history_thread_id = int(state["history_thread_id"])
+            except (TypeError, ValueError):
+                pass
         client, channel = await _get_home_channel(adapter)
         if channel is None:
             return None, None
