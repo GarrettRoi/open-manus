@@ -17,7 +17,7 @@ def _receiver():
     r._buffers = defaultdict(bytearray)
     r._last_packet_time = {}
     r._user_muted = {}
-    r._flush_users = set()
+    r._flush_users = {}
     r._allowed_user_ids = set()
     return r
 
@@ -68,3 +68,28 @@ def test_mute_flush_skips_noise_below_min_duration():
     r.set_user_muted(555, True)
     assert r.check_silence() == []
     assert len(r._buffers[5]) == 0  # cleared, not delivered
+
+
+def test_flush_marker_survives_unmapped_ssrc_pass():
+    """A mute-flush must not be lost when the SSRC is momentarily unmapped."""
+    r = _receiver()
+    r.set_user_muted(666, False)
+    _speech(r, 6, 666, seconds=4, last_packet_age=0.2)
+    del r._ssrc_to_user[6]  # mapping gap at the moment of the pass
+    r._vc = type("VC", (), {"channel": None, "user": None})()
+    r.set_user_muted(666, True)
+    assert r.check_silence() == []      # pass with no mapping: nothing flushed
+    assert 666 in r._flush_users        # ...but the marker survives
+    r._ssrc_to_user[6] = 666            # mapping restored next pass
+    out = r.check_silence()
+    assert [u for u, _ in out] == [666]
+    assert 666 not in r._flush_users
+
+
+def test_hot_mic_max_utterance_cap_flushes():
+    """Continuous packets (hot mic) still flush once the cap is reached."""
+    r = _receiver()
+    r.set_user_muted(777, False)
+    _speech(r, 7, 777, seconds=VR.MAX_UTTERANCE_SECONDS + 1, last_packet_age=0.05)
+    out = r.check_silence()
+    assert [u for u, _ in out] == [777]

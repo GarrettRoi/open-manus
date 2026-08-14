@@ -372,6 +372,12 @@ class VoiceReceiver:
     # (default on); tune the unmuted hold with DISCORD_VOICE_UNMUTED_SILENCE.
     MUTE_TO_SEND = os.environ.get("DISCORD_VOICE_MUTE_TO_SEND", "true").lower() not in ("0", "false", "no")
     UNMUTED_SILENCE_THRESHOLD = float(os.environ.get("DISCORD_VOICE_UNMUTED_SILENCE", "10"))
+    # Hard cap: a hot mic streams packets continuously, so an unmuted user may
+    # never hit the silence threshold. Flush anyway once the buffer holds this
+    # many seconds of audio so speech can never be stuck indefinitely.
+    MAX_UTTERANCE_SECONDS = float(os.environ.get("DISCORD_VOICE_MAX_UTTERANCE", "120"))
+    # A pending mute-flush marker survives at most this long before expiring.
+    FLUSH_MARKER_TTL = 30.0
 
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
@@ -400,9 +406,10 @@ class VoiceReceiver:
         # Mute-to-send state: user_id -> is currently muted (self or server).
         # Unknown users (no voice-state seen yet) keep classic behavior.
         self._user_muted: Dict[int, bool] = {}
-        # Users whose buffer must be flushed on the next check_silence pass
-        # (set on an unmute -> mute transition).
-        self._flush_users: set = set()
+        # Users whose buffer must be flushed ASAP (set on an unmute -> mute
+        # transition). Maps user_id -> request time; entries persist until
+        # consumed or expired so a momentary SSRC-mapping gap can't lose them.
+        self._flush_users: Dict[int, float] = {}
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -462,7 +469,7 @@ class VoiceReceiver:
             was_muted = self._user_muted.get(user_id)
             self._user_muted[user_id] = muted
             if muted and was_muted is False:
-                self._flush_users.add(user_id)
+                self._flush_users[user_id] = time.monotonic()
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5).
@@ -695,6 +702,8 @@ class VoiceReceiver:
 
                 # Mute-to-send: the user just muted — flush their buffer now
                 # as one complete utterance, regardless of silence timing.
+                # The marker persists until consumed here (or expires), so a
+                # momentary SSRC-mapping gap can't drop it.
                 force_flush = (self.MUTE_TO_SEND and bool(user_id)
                                and user_id in self._flush_users)
 
@@ -706,10 +715,23 @@ class VoiceReceiver:
                         and self._user_muted.get(user_id) is False):
                     threshold = self.UNMUTED_SILENCE_THRESHOLD
 
-                if force_flush or (silence_duration >= threshold
-                                   and buf_duration >= self.MIN_SPEECH_DURATION):
+                # Hot-mic safety valve: continuous packets mean the silence
+                # threshold may never fire — flush once the buffer is huge.
+                over_cap = buf_duration >= self.MAX_UTTERANCE_SECONDS
+
+                if force_flush or over_cap or (
+                        silence_duration >= threshold
+                        and buf_duration >= self.MIN_SPEECH_DURATION):
                     if user_id and buf_duration >= self.MIN_SPEECH_DURATION:
                         completed.append((user_id, bytes(buf)))
+                        logger.info(
+                            "Voice: flushing %.1fs utterance for user %d (%s)",
+                            buf_duration, user_id,
+                            "mute" if force_flush else
+                            "max-utterance cap" if over_cap else "silence",
+                        )
+                    if force_flush:
+                        self._flush_users.pop(user_id, None)
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2 and not user_id:
@@ -717,8 +739,17 @@ class VoiceReceiver:
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
 
-            # Clear flush requests (their SSRCs, if any, were handled above).
-            self._flush_users.clear()
+            # Drop pending flush markers with no buffered audio anywhere
+            # (nothing to send) or that have expired.
+            if self._flush_users:
+                have_audio = {ssrc_user_map.get(s) or 0
+                              for s, b in self._buffers.items() if len(b)}
+                for uid in list(self._flush_users):
+                    age = now - self._flush_users[uid]
+                    if uid not in have_audio and age > 1.0:
+                        self._flush_users.pop(uid, None)
+                    elif age > self.FLUSH_MARKER_TTL:
+                        self._flush_users.pop(uid, None)
 
         return completed
 
