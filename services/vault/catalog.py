@@ -648,6 +648,271 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "json": {"count": 1, "offset": 0, "country_codes": ["US"]},
         },
     },
+    # ── Social / content platforms ────────────────────────────────────────────
+    "meta": {
+        "label": "Facebook / Instagram (Meta Graph API)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://graph.facebook.com/v19.0",
+        "allowed_hosts": ["graph.facebook.com"],
+        "oauth": {
+            "authorize_url": "https://www.facebook.com/v19.0/dialog/oauth",
+            "token_url": "https://graph.facebook.com/v19.0/oauth/access_token",
+            "scopes": [
+                "public_profile", "pages_show_list", "pages_manage_posts",
+                "pages_read_engagement", "pages_manage_engagement",
+                "instagram_basic", "instagram_content_publish",
+                "business_management",
+            ],
+            "scope_separator": ",",
+            # Meta has no refresh_token flow — the vault swaps the short-lived
+            # code-exchange token for a ~60-day long-lived token immediately.
+            "long_lived_exchange": "facebook",
+            "no_refresh": True,
+        },
+        "setup_help": (
+            "One-time setup: create a Meta developer app at "
+            "developers.facebook.com (type: Business), add the 'Facebook Login "
+            "for Business' product, and register the redirect URL shown below "
+            "under Valid OAuth Redirect URIs. Paste the app ID and secret here "
+            "and click Connect. Instagram posting rides on this connection "
+            "(instagram_* scopes) via an Instagram professional account linked "
+            "to a Facebook Page. Note: page/instagram publish scopes require "
+            "Meta app review before they work for non-tester accounts — until "
+            "then use accounts added as app testers. Tokens are long-lived "
+            "(~60 days); reconnect when the Test button reports expiry."
+        ),
+        "example_call": "GET /me/accounts (your pages + page tokens stay in the vault)",
+        "test_probe": {"method": "GET", "path": "/me?fields=id,name"},
+    },
+    "x_twitter": {
+        "label": "X (Twitter)",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://api.x.com",
+        "allowed_hosts": ["api.x.com", "api.twitter.com", "upload.twitter.com"],
+        "oauth": {
+            "authorize_url": "https://x.com/i/oauth2/authorize",
+            "token_url": "https://api.x.com/2/oauth2/token",
+            "scopes": ["tweet.read", "tweet.write", "users.read",
+                       "media.write", "offline.access"],
+            # X OAuth 2.0 requires PKCE; confidential clients also send
+            # HTTP-Basic client credentials on the token endpoint.
+            "pkce": True,
+            "token_auth": "basic",
+        },
+        "setup_help": (
+            "One-time setup: in the X Developer Portal create a project + app, "
+            "enable OAuth 2.0 (type: Web App / confidential client), add the "
+            "redirect URL shown below, then paste the OAuth 2.0 client ID and "
+            "secret here and click Connect. Scopes cover reading and posting "
+            "tweets plus media upload; offline.access keeps the token "
+            "refreshed automatically."
+        ),
+        "example_call": 'POST /2/tweets with {"text": "hello"}',
+        "test_probe": {"method": "GET", "path": "/2/users/me"},
+    },
+    "linkedin": {
+        "label": "LinkedIn",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://api.linkedin.com",
+        "allowed_hosts": ["api.linkedin.com"],
+        "oauth": {
+            "authorize_url": "https://www.linkedin.com/oauth/v2/authorization",
+            "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
+            "scopes": ["openid", "profile", "email", "w_member_social"],
+        },
+        "setup_help": (
+            "One-time setup: create an app at linkedin.com/developers, add the "
+            "'Sign In with LinkedIn using OpenID Connect' and 'Share on "
+            "LinkedIn' products, register the redirect URL shown below under "
+            "Auth → Redirect URLs, then paste the client ID and secret here "
+            "and click Connect. w_member_social allows posting as the "
+            "connected member; organization posting needs LinkedIn's Community "
+            "Management API approval (add w_organization_social after approval)."
+        ),
+        "example_call": "GET /v2/userinfo, POST /rest/posts",
+        "test_probe": {"method": "GET", "path": "/v2/userinfo"},
+    },
+    "reddit": {
+        "label": "Reddit",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://oauth.reddit.com",
+        "allowed_hosts": ["oauth.reddit.com", "www.reddit.com"],
+        # Reddit rejects default library User-Agents — the vault injects a
+        # descriptive one on every proxied call.
+        "default_headers": {"User-Agent": "open-manus-vault/1.0 (by /u/open-manus)"},
+        "oauth": {
+            "authorize_url": "https://www.reddit.com/api/v1/authorize",
+            "token_url": "https://www.reddit.com/api/v1/access_token",
+            "scopes": ["identity", "read", "submit", "edit", "vote",
+                       "history", "flair", "privatemessages"],
+            # Reddit's token endpoint requires HTTP-Basic client credentials.
+            "token_auth": "basic",
+            # duration=permanent is required to receive a refresh_token.
+            "extra_authorize_params": {"duration": "permanent"},
+        },
+        "setup_help": (
+            "One-time setup: create an app at reddit.com/prefs/apps (type: "
+            "web app), set the redirect uri to the URL shown below, then paste "
+            "the client ID (under the app name) and secret here and click "
+            "Connect. The vault handles Reddit's quirks server-side: "
+            "HTTP-Basic auth on the token endpoint and the required custom "
+            "User-Agent header on every API call."
+        ),
+        "example_call": "GET /api/v1/me, POST /api/submit",
+        "test_probe": {"method": "GET", "path": "/api/v1/me"},
+    },
+    "tiktok": {
+        "label": "TikTok",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://open.tiktokapis.com",
+        "allowed_hosts": ["open.tiktokapis.com"],
+        "oauth": {
+            "authorize_url": "https://www.tiktok.com/v2/auth/authorize/",
+            "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
+            "scopes": ["user.info.basic", "video.list",
+                       "video.upload", "video.publish"],
+            "scope_separator": ",",
+            # TikTok names the client-id parameter client_key everywhere.
+            "client_id_param": "client_key",
+        },
+        "setup_help": (
+            "One-time setup: create an app at developers.tiktok.com, add the "
+            "Login Kit and Content Posting API products, register the redirect "
+            "URL shown below, then paste the Client Key (as client ID) and "
+            "Client Secret here and click Connect. Note: direct-post publishing "
+            "requires TikTok's app audit; unaudited apps can only post as "
+            "private/draft to accounts added as testers. The vault handles "
+            "TikTok's client_key parameter naming server-side."
+        ),
+        "example_call": "GET /v2/user/info/?fields=open_id,display_name",
+        "test_probe": {"method": "GET",
+                       "path": "/v2/user/info/?fields=open_id,display_name"},
+    },
+    "pinterest": {
+        "label": "Pinterest",
+        "auth": {"kind": "oauth2"},
+        "base_url": "https://api.pinterest.com",
+        "allowed_hosts": ["api.pinterest.com"],
+        "oauth": {
+            "authorize_url": "https://www.pinterest.com/oauth/",
+            "token_url": "https://api.pinterest.com/v5/oauth/token",
+            "scopes": ["user_accounts:read", "boards:read", "boards:write",
+                       "pins:read", "pins:write"],
+            "scope_separator": ",",
+            # Pinterest's token endpoint requires HTTP-Basic client credentials.
+            "token_auth": "basic",
+        },
+        "setup_help": (
+            "One-time setup: create an app at developers.pinterest.com, "
+            "request standard API access, add the redirect URL shown below, "
+            "then paste the app ID and secret here and click Connect. Scopes "
+            "cover reading and creating pins/boards."
+        ),
+        "example_call": "GET /v5/user_account, POST /v5/pins",
+        "test_probe": {"method": "GET", "path": "/v5/user_account"},
+    },
+    # ── Amazon Associates (affiliate links + optional PA-API) ────────────────
+    "amazon_associates": {
+        "label": "Amazon Associates (affiliate links + PA-API)",
+        "auth": {"kind": "amazon"},
+        "base_url": "https://webservices.amazon.com",
+        "allowed_hosts": ["webservices.amazon.com"],
+        "fields": [
+            {"name": "associate_tag", "label": "Associate tag (e.g. yoursite-20)",
+             "placeholder": "yoursite-20", "required": True},
+            {"name": "marketplace", "label": "Marketplace (default www.amazon.com)",
+             "placeholder": "www.amazon.com", "required": False},
+        ],
+        "setup_help": (
+            "Enter your Amazon Associates tracking ID (associate tag) — that "
+            "alone lets agents build tagged affiliate links. Optionally add "
+            "Product Advertising API credentials (access key + secret from "
+            "the Associates Central → Tools → Product Advertising API page; "
+            "requires 3 qualifying sales) to let agents search products and "
+            "fetch prices. The PA-API secret never leaves the vault — request "
+            "signing (AWS SigV4) happens server-side."
+        ),
+        "example_call": (
+            'operation="build_link" with {"asin": "B0..."} or '
+            'operation="search_items" with {"keywords": "..."}'
+        ),
+        # Test handled specially in app.py: signed PA-API probe when keys
+        # exist, otherwise confirms the stored tag.
+    },
+    # ── WordPress ─────────────────────────────────────────────────────────────
+    "wordpress": {
+        "label": "WordPress (REST API, application password)",
+        "auth": {"kind": "basic"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "Site URL",
+             "placeholder": "https://yoursite.com", "required": True},
+            {"name": "wp_username", "label": "WordPress username",
+             "placeholder": "admin", "required": True},
+        ],
+        "setup_help": (
+            "Manage a WordPress site via its built-in REST API. Enter the "
+            "site URL, your WordPress username, and an Application Password "
+            "(WP Admin → Users → Profile → Application Passwords — requires "
+            "WordPress 5.6+ and HTTPS). The vault sends HTTP Basic auth "
+            "server-side; agents never see the password. Posts, pages, media, "
+            "categories, comments, and users are all reachable under "
+            "/wp-json/wp/v2/."
+        ),
+        "example_call": 'POST /wp-json/wp/v2/posts with {"title": ..., "content": ..., "status": "draft"}',
+        "test_probe": {"method": "GET",
+                       "path": "/wp-json/wp/v2/users/me?context=edit"},
+    },
+    "wordpress_mcp": {
+        "label": "WordPress MCP server (bearer token)",
+        "auth": {"kind": "mcp_bearer"},
+        "is_mcp": True,
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "WordPress MCP endpoint URL",
+             "placeholder": "https://yoursite.com/wp-json/wp/v2/wpmcp/streamable",
+             "required": True},
+        ],
+        "setup_help": (
+            "Connect a WordPress site through an MCP server. Recommended "
+            "trusted server: Automattic's official 'wordpress-mcp' plugin "
+            "(github.com/Automattic/wordpress-mcp) — install it on the site, "
+            "enable it under Settings → WordPress MCP, generate a JWT/API "
+            "token there, and paste the streamable endpoint URL (usually "
+            "/wp-json/wp/v2/wpmcp/streamable) plus the token here. The vault "
+            "lists the server's tools and registers each as a native "
+            "vault_<name>_<tool>. Prefer the plain 'WordPress (REST API)' "
+            "connection when you can't install plugins."
+        ),
+        "example_call": "Use the native vault_<name>_<tool> tools registered from the server",
+        # MCP kind: test uses tools/list — no test_probe needed
+    },
+    # ── WebinarNinja ──────────────────────────────────────────────────────────
+    "webinarninja": {
+        "label": "WebinarNinja",
+        "auth": {"kind": "bearer"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "API base URL",
+             "placeholder": "https://api.webinarninja.com/v1", "required": True},
+        ],
+        "setup_help": (
+            "Heads-up: WebinarNinja does not publish a stable public REST API "
+            "— its integrations are Zapier-first. If your plan/account has API "
+            "access (check WebinarNinja → Integrations or ask their support "
+            "for an API key and base URL), enter that base URL and key here "
+            "and the vault will proxy calls with Bearer auth. If not, connect "
+            "WebinarNinja through an n8n/Zapier webhook workflow instead (add "
+            "it as an 'n8n' or 'Custom' connection pointing at your workflow "
+            "URL). This template is a best-effort bridge, not an official "
+            "integration."
+        ),
+        "example_call": "GET /webinars (depends on the API access WebinarNinja grants you)",
+        "test_probe": {"method": "GET", "path": "/"},
+    },
     "custom": {
         "label": "Custom (any API)",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bearer "},

@@ -148,6 +148,36 @@
             <small style="color:var(--text-muted);">This token is sent as <code>Authorization: Bearer &lt;token&gt;</code> in every MCP call. For Vowsok: find it in your dashboard → API / Integrations.</small>
         </div>
 
+        <div id="grp_wordpress" class="form-group" style="display:none;">
+            <label>WordPress username</label>
+            <input type="text" name="wp_username" placeholder="admin">
+            <small style="color:var(--text-muted);">Pair with an Application Password (WP Admin &rarr; Users &rarr; Profile &rarr; Application Passwords) entered in the key field above.</small>
+        </div>
+
+        <div id="grp_amazon" style="display:none;">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Associate tag (tracking ID)</label>
+                    <input type="text" name="associate_tag" placeholder="yoursite-20">
+                </div>
+                <div class="form-group">
+                    <label>Marketplace (default www.amazon.com)</label>
+                    <input type="text" name="marketplace" placeholder="www.amazon.com">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>PA-API access key (optional)</label>
+                    <input type="text" name="paapi_access_key" placeholder="AKIA... (optional — enables product search)">
+                </div>
+                <div class="form-group">
+                    <label>PA-API secret key (optional)</label>
+                    <input type="password" name="paapi_secret_key" placeholder="never shown to agents">
+                </div>
+            </div>
+            <small style="color:var(--text-muted);">The tag alone enables affiliate link building. PA-API keys additionally enable product search; SigV4 signing happens inside the vault.</small>
+        </div>
+
         <div id="grp_discord_app" class="form-group" style="display:none;">
             <label>Bot application ID (optional — for invite links)</label>
             <input type="text" name="application_id" placeholder="the application's ID from the Developer Portal">
@@ -472,6 +502,33 @@
                     </div>
                 </div>
             </div>
+            <div id="e_grp_wordpress" class="form-group" style="display:none;">
+                <label>WordPress username (leave blank to keep)</label>
+                <input type="text" name="wp_username" id="e_wp_username">
+                <small style="color:var(--text-muted);">Rotate the Application Password via the key field above.</small>
+            </div>
+            <div id="e_grp_amazon" style="display:none;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Associate tag (leave blank to keep)</label>
+                        <input type="text" name="associate_tag" id="e_associate_tag">
+                    </div>
+                    <div class="form-group">
+                        <label>Marketplace (leave blank to keep)</label>
+                        <input type="text" name="marketplace" id="e_marketplace" placeholder="www.amazon.com">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>New PA-API access key (leave blank to keep)</label>
+                        <input type="text" name="paapi_access_key">
+                    </div>
+                    <div class="form-group">
+                        <label>New PA-API secret key (leave blank to keep)</label>
+                        <input type="password" name="paapi_secret_key">
+                    </div>
+                </div>
+            </div>
             <div id="e_grp_custom_oauth" style="display:none;">
                 <div class="form-group">
                     <label>Authorization URL</label>
@@ -526,9 +583,16 @@ function onServiceChange() {
     const isOAuth = tpl.auth.kind === 'oauth2';
     const isEmail = tpl.auth.kind === 'email';
     const isMcp = tpl.auth.kind === 'mcp_bearer';
+    const isBasic = tpl.auth.kind === 'basic';
+    const isAmazon = tpl.auth.kind === 'amazon';
     document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
-    document.getElementById('grp_api_key').style.display = (isOAuth || isEmail || isMcp) ? 'none' : '';
+    document.getElementById('grp_api_key').style.display = (isOAuth || isEmail || isMcp || isAmazon) ? 'none' : '';
     document.getElementById('grp_mcp_bearer').style.display = isMcp ? '' : 'none';
+    document.getElementById('grp_wordpress').style.display = isBasic ? '' : 'none';
+    document.getElementById('grp_amazon').style.display = isAmazon ? '' : 'none';
+    if (isBasic) {
+        document.getElementById('lbl_api_key').textContent = 'Application password';
+    }
     const isMac = sid === 'macincloud';
     const hasExtraSecret = !!tpl.extra_secret;
     const isAlpaca = sid === 'alpaca';
@@ -554,7 +618,7 @@ function onServiceChange() {
 
     // base URL field: needed when template has no default
     const needsBase = isMcp ? !tpl.base_url
-                            : (!tpl.base_url && !isEmail && !isMac && (!isOAuth || isCustomOAuth));
+                            : (!tpl.base_url && !isEmail && !isMac && !isAmazon && (!isOAuth || isCustomOAuth));
     document.getElementById('grp_base_url').style.display = needsBase ? '' : 'none';
     const fields = tpl.fields || [];
     const baseField = fields.find(f => f.name === 'base_url');
@@ -612,10 +676,23 @@ function openEdit(c) {
     const isApple = c.auth_kind === 'apple';
     const isMac = c.auth_kind === 'macincloud';
     const isMcp = c.auth_kind === 'mcp_bearer';
+    const isBasicEdit = c.auth_kind === 'basic';
+    const isAmazonEdit = c.auth_kind === 'amazon';
     const _editTpl = CATALOG[c.service] || {};
     const hasExtraSecretEdit = !!_editTpl.extra_secret;
     const isAlpacaEdit = c.service === 'alpaca';
-    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac) ? 'none' : '';
+    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac || isAmazonEdit) ? 'none' : '';
+    document.getElementById('e_grp_wordpress').style.display = isBasicEdit ? '' : 'none';
+    document.getElementById('e_grp_amazon').style.display = isAmazonEdit ? '' : 'none';
+    if (isBasicEdit) {
+        document.getElementById('e_lbl_api_key').textContent =
+            'New application password (leave blank to keep current)';
+        document.getElementById('e_wp_username').placeholder = c.basic_username || '';
+    }
+    if (isAmazonEdit) {
+        document.getElementById('e_associate_tag').placeholder = c.associate_tag || '';
+        document.getElementById('e_marketplace').placeholder = c.amazon_marketplace || 'www.amazon.com';
+    }
     // MCP connections reuse the e_grp_key field with a different label.
     if (isMcp) {
         document.getElementById('e_grp_key').style.display = '';
@@ -626,7 +703,7 @@ function openEdit(c) {
         document.getElementById('e_lbl_api_key').textContent =
             _editTpl.api_key_label ? ('New ' + _editTpl.api_key_label + ' (leave blank to keep)')
                                    : 'New API Key ID (leave blank to keep)';
-    } else if (!isMcp) {
+    } else if (!isMcp && !isBasicEdit) {
         // Reset the label — a previous edit dialog (Plaid/Alpaca/MCP) may
         // have left service-specific text behind.
         document.getElementById('e_lbl_api_key').textContent =

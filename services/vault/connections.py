@@ -366,11 +366,30 @@ def build_auth(conn: Dict[str, Any], secrets: Dict[str, Any],
         # "Bearer " (trailing space) is preserved correctly for existing conns.
         prefix = auth.get("prefix") if auth.get("prefix") is not None else ""
         headers[hdr_name] = f"{prefix}{key}"
+    elif kind == "basic":
+        # HTTP Basic auth (e.g. WordPress application passwords):
+        # username stored alongside the password-like api_key.
+        import base64 as _b64
+        username = secrets.get("username")
+        password = secrets.get("api_key")
+        if not username or not password:
+            raise AuthInjectionError(
+                "No username/password stored for this connection")
+        raw = f"{username}:{password}".encode()
+        headers["Authorization"] = f"Basic {_b64.b64encode(raw).decode()}"
     elif kind == "query":
         key = secrets.get("api_key")
         if not key:
             raise AuthInjectionError("No API key stored for this connection")
         params[auth.get("param_name") or "api_key"] = key
+    elif kind == "amazon":
+        raise AuthInjectionError(
+            "This is an Amazon Associates connection — it cannot be used with "
+            "the HTTP proxy (PA-API requests need server-side SigV4 signing). "
+            "Call POST /api/vault/amazon/{connection} instead "
+            '(e.g. {"operation": "build_link", "args": {"asin": "B0..."}} or '
+            '{"operation": "search_items", "args": {"keywords": "..."}}).'
+        )
     elif kind == "apple":
         raise AuthInjectionError(
             "This is an Apple (iCloud) connection — it cannot be used with "

@@ -345,6 +345,41 @@ def _build_conn_schema(conn: dict, tool_name: str) -> dict:
                 "required": ["operation"],
             },
         }
+    if str(conn.get("auth_kind") or "") == "amazon":
+        return {
+            "name": tool_name,
+            "description": description + (
+                "\nAmazon Associates affiliate connection. Operations:"
+                "\n• build_link — build a tagged affiliate link. args: {asin} "
+                "or {url} (an Amazon product URL), optional {marketplace}"
+                "\n• search_items — PA-API product search. args: {keywords, "
+                "ItemCount, Resources}"
+                "\n• get_items — PA-API item lookup. args: {asin} or "
+                "{item_ids: [...]}, optional {Resources}"
+                "\n• get_variations / get_browse_nodes — PA-API passthrough "
+                "(PA-API operations need stored PA-API keys; build_link works "
+                "with just the tag). All request signing happens in the vault."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["build_link", "search_items", "get_items",
+                                 "get_variations", "get_browse_nodes"],
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Operation arguments. build_link: {asin | url, "
+                            "marketplace}. search_items: {keywords, ItemCount}. "
+                            "get_items: {asin | item_ids}."
+                        ),
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
     if service == "discord_read":
         return {
             "name": tool_name,
@@ -1050,6 +1085,10 @@ def _make_conn_handler(conn_id: str, auth_kind: str = "", service: str = ""):
         def _discord_read_handler(args: dict, **_kw) -> str:
             return _discord_read_call(conn_id, args or {})
         return _discord_read_handler
+    if auth_kind == "amazon":
+        def _amazon_handler(args: dict, **_kw) -> str:
+            return _special_call(conn_id, "amazon", args or {})
+        return _amazon_handler
     # Google OAuth hub: accept {product, operation, args} and route through
     # the structured Google endpoint rather than the generic proxy.
     if service == "google" and auth_kind == "oauth2":

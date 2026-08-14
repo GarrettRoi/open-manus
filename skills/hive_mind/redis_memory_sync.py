@@ -65,6 +65,11 @@ PERSIST_FILES = [
     # Output files (cron/output/…) are intentionally excluded — they are
     # ephemeral per-job artefacts and would exceed the 512 KB cap.
     "cron/jobs.json",
+    # Discord cron-thread state (thread ids + job→message map). Persisting it
+    # lets redeploys reuse the existing threads/pinned anchors instead of
+    # creating duplicates (the module also self-heals by scanning pins, but
+    # keeping state avoids the extra API churn).
+    "cron/discord_cron_threads.json",
 ]
 
 # Directories whose text files are swept wholesale (relative to MEMORY_DIR).

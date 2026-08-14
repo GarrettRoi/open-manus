@@ -59,6 +59,7 @@ _lock = threading.Lock()
 # log can never double-create the threads.
 _bootstrap_lock: Optional[asyncio.Lock] = None
 _disabled = False          # set on Forbidden / fatal errors; process-lifetime
+_pins_disabled = False     # no perms for pin management; threads keep working
 _sync_inflight = False
 _cached_adapter = None     # last live Discord adapter seen by schedule_sync
 _cached_loop = None        # gateway event loop
@@ -215,24 +216,168 @@ async def _resolve_thread(client, channel, thread_id: Optional[int], name: str):
     return None
 
 
+def _anchor_text(name: str, thread_id: Optional[int] = None) -> str:
+    text = f"📌 {name}"
+    if thread_id:
+        text += f" → <#{thread_id}>"
+    return text
+
+
+def _anchor_re(name: str) -> "re.Pattern[str]":
+    # EXACT anchor formats only: "📌 <name>" or "📌 <name> → <#123>".
+    # A prefix match would let e.g. "📌 cron-history-old" be deleted.
+    return re.compile(rf"^📌 {re.escape(name)}( → <#\d+>)?$")
+
+
+async def _channel_pins(channel):
+    """Return the channel's pinned messages, or None when the pin inventory
+    is unavailable (permission denied / transient API failure). Callers must
+    NOT treat None as 'no pins exist'."""
+    global _pins_disabled
+    import discord
+
+    if _pins_disabled:
+        return None
+    try:
+        pins = channel.pins()
+        if hasattr(pins, "__aiter__"):  # discord.py >= 2.4 returns an async iterator
+            return [m async for m in pins]
+        return list(await pins)
+    except discord.Forbidden:
+        if not _pins_disabled:
+            _pins_disabled = True
+            logger.warning(
+                "cron discord-threads: no permission to read pins — anchor "
+                "pin management disabled (threads still work)")
+        return None
+    except Exception as e:
+        logger.debug("cron discord-threads: pins fetch failed: %s", e)
+        return None
+
+
+def _matching_anchors(client, pins, name):
+    """Bot-authored pinned messages that EXACTLY match the anchor format."""
+    me = getattr(getattr(client, "user", None), "id", None)
+    pat = _anchor_re(name)
+    out = []
+    for m in pins or []:
+        if getattr(getattr(m, "author", None), "id", None) != me:
+            continue
+        if pat.match(m.content or ""):
+            out.append(m)
+    return out
+
+
+async def _dedup_anchors(pins_matching, keep_id: Optional[int], name: str) -> None:
+    """Unpin + delete every duplicate anchor except the one with keep_id.
+    Only messages that passed the exact `_matching_anchors` filter are ever
+    touched."""
+    global _pins_disabled
+    import discord
+
+    for m in pins_matching:
+        if keep_id is not None and m.id == keep_id:
+            continue
+        try:
+            await m.unpin()
+        except discord.Forbidden:
+            _pins_disabled = True
+            logger.warning("cron discord-threads: no permission to unpin — "
+                           "anchor pin management disabled")
+            return
+        except Exception:
+            pass
+        try:
+            await m.delete()
+        except discord.Forbidden:
+            _pins_disabled = True
+            logger.warning("cron discord-threads: no permission to delete "
+                           "anchors — anchor pin management disabled")
+            return
+        except Exception as e:
+            logger.debug("cron discord-threads: dup anchor delete failed for %s: %s", name, e)
+            continue
+        logger.info("cron discord-threads: removed duplicate anchor pin for %s (%s)", name, m.id)
+
+
 async def _ensure_thread(client, channel, thread_id: Optional[int], name: str):
-    """Locate or create the named thread, pin its anchor, keep it unarchived."""
+    """Locate or create the named thread, keep exactly one pinned anchor,
+    keep it unarchived."""
+    global _pins_disabled
     import discord
 
     th = await _resolve_thread(client, channel, thread_id, name)
+    pins = await _channel_pins(channel)  # None = inventory unavailable
+    anchors = _matching_anchors(client, pins, name)
+
+    if th is None and anchors:
+        # State + thread lookup missed, but an anchor pin survives (e.g. the
+        # thread aged out of archived_threads(limit=50)). A thread spawned
+        # from a message shares its id — recover it from the newest anchor,
+        # but only bind to a thread whose name AND parent both check out.
+        for anchor in sorted(anchors, key=lambda m: m.id, reverse=True):
+            recovered = getattr(anchor, "thread", None)
+            if recovered is None:
+                try:
+                    recovered = await client.fetch_channel(anchor.id)
+                except discord.HTTPException:
+                    recovered = None
+            if (recovered is not None
+                    and getattr(recovered, "parent_id", None) == channel.id
+                    and getattr(recovered, "name", None) == name):
+                th = recovered
+                break
+
     if th is None:
+        if pins is None and not _pins_disabled:
+            # Pin inventory temporarily unreadable — an anchor may still
+            # exist. Creating now risks a duplicate; retry next sync instead.
+            logger.debug("cron discord-threads: deferring create of %s — "
+                         "pin inventory unavailable", name)
+            return None
         # Create: anchor message in home channel, pin it, spawn the thread.
-        anchor = await channel.send(f"📌 {name}")
+        anchor = await channel.send(_anchor_text(name))
         try:
             await anchor.pin()
+        except discord.Forbidden:
+            _pins_disabled = True
+            logger.warning("cron discord-threads: no permission to pin anchor "
+                           "for %s — anchor pin management disabled", name)
         except discord.HTTPException as e:
             logger.warning("cron discord-threads: could not pin anchor for %s: %s", name, e)
         th = await channel.create_thread(
             name=name, message=anchor, auto_archive_duration=10080
         )
+        try:
+            await anchor.edit(content=_anchor_text(name, th.id))
+        except Exception:
+            pass
         logger.info("cron discord-threads: created thread %s (%s)", name, th.id)
         return th
-    # Reuse: unarchive / extend auto-archive when needed.
+
+    if pins is not None:
+        # Reuse: exactly one pinned anchor — the thread's own starter message.
+        keep = next((m for m in anchors if m.id == th.id), None)
+        await _dedup_anchors(anchors, th.id, name)
+        if keep is None and not _pins_disabled:
+            # The live thread's starter message is not pinned (or was deleted).
+            try:
+                starter = await channel.fetch_message(th.id)
+                await starter.edit(content=_anchor_text(name, th.id))
+                await starter.pin()
+            except discord.Forbidden:
+                _pins_disabled = True
+                logger.warning("cron discord-threads: no permission to pin — "
+                               "anchor pin management disabled")
+            except Exception as e:
+                logger.debug("cron discord-threads: could not (re)pin anchor for %s: %s", name, e)
+        elif keep is not None and "<#" not in (keep.content or ""):
+            try:
+                await keep.edit(content=_anchor_text(name, th.id))
+            except Exception:
+                pass
+
+    # Unarchive / extend auto-archive when needed.
     try:
         if getattr(th, "archived", False):
             await th.edit(archived=False, auto_archive_duration=10080)
@@ -259,6 +404,9 @@ async def _bootstrap(adapter):
             hist_th = await _ensure_thread(client, channel, _history_thread_id, HISTORY_THREAD_NAME)
         except discord.Forbidden:
             _disable("missing permissions to create/manage threads in home channel")
+            return None, None
+        if jobs_th is None or hist_th is None:
+            # Deferred (pin inventory unavailable) — retry on the next sync.
             return None, None
         if _jobs_thread_id != jobs_th.id or _history_thread_id != hist_th.id:
             _jobs_thread_id, _history_thread_id = jobs_th.id, hist_th.id

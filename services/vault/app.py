@@ -32,6 +32,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from apple_ops import AppleOpsError, run_apple_operation
 
+import amazon_ops
+from amazon_ops import AmazonOpsError
 import custom_mcp
 import discord_ops
 from discord_ops import DiscordOpsError
@@ -399,6 +401,15 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
         elif view["auth_kind"] == "email":
             view["connected"] = bool(secrets_d.get("password"))
             view["email_address"] = secrets_d.get("username", "")
+        elif view["auth_kind"] == "basic":
+            view["connected"] = bool(secrets_d.get("username") and secrets_d.get("api_key"))
+            view["basic_username"] = secrets_d.get("username", "")
+        elif view["auth_kind"] == "amazon":
+            view["connected"] = bool(secrets_d.get("associate_tag"))
+            view["associate_tag"] = secrets_d.get("associate_tag", "")
+            view["amazon_marketplace"] = secrets_d.get("marketplace", "www.amazon.com")
+            view["has_paapi"] = bool(secrets_d.get("paapi_access_key")
+                                     and secrets_d.get("paapi_secret_key"))
         else:
             view["connected"] = bool(secrets_d.get("api_key"))
 
@@ -599,7 +610,53 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
             _persist("0", reason, "", str(elapsed))
             return _make(False, reason, elapsed_ms=elapsed)
 
-    # ── HTTP-based kinds: bearer / header / query / oauth2 ───────────────────
+    # ── Amazon Associates: tag-only OK, signed PA-API probe when keys exist ──
+    if auth_kind == "amazon":
+        secrets_d = store.get_secrets(conn_id)
+        tag = secrets_d.get("associate_tag", "")
+        if not tag:
+            reason = "no associate tag stored"
+            _persist("0", reason)
+            return _make(False, reason)
+        if not (secrets_d.get("paapi_access_key") and secrets_d.get("paapi_secret_key")):
+            reason = "associate tag stored — link building ready (no PA-API keys)"
+            _persist("1", reason)
+            return _make(True, reason)
+        t0 = time.monotonic()
+        try:
+            result = await amazon_ops.paapi_call(
+                secrets_d, "search_items",
+                {"Keywords": "book", "ItemCount": 1},
+                marketplace=secrets_d.get("marketplace", "www.amazon.com"),
+                timeout=15.0)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            status = int(result.get("status") or 0)
+            if status in (401, 403):
+                reason = f"PA-API auth rejected (HTTP {status}) — check access key/secret"
+                _persist("0", reason, str(status), str(elapsed))
+                return _make(False, reason, status_code=status, elapsed_ms=elapsed)
+            if status == 429:
+                reason = "credentials OK — PA-API rate limited (HTTP 429)"
+            elif status >= 500:
+                reason = f"PA-API server error (HTTP {status})"
+                _persist("0", reason, str(status), str(elapsed))
+                return _make(False, reason, status_code=status, elapsed_ms=elapsed)
+            else:
+                reason = f"PA-API probe OK (HTTP {status})"
+            _persist("1", reason, str(status), str(elapsed))
+            return _make(True, reason, status_code=status, elapsed_ms=elapsed)
+        except AmazonOpsError as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            reason = str(exc)[:300]
+            _persist("0", reason, "", str(elapsed))
+            return _make(False, reason, elapsed_ms=elapsed)
+        except httpx.RequestError as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            reason = f"Connection error: {str(exc)[:200]}"
+            _persist("0", reason, "", str(elapsed))
+            return _make(False, reason, elapsed_ms=elapsed)
+
+    # ── HTTP-based kinds: bearer / header / query / basic / oauth2 ───────────
     base_url = (conn.get("base_url") or "").rstrip("/")
     if not base_url:
         reason = "no base URL configured — edit the connection to add one"
@@ -698,6 +755,12 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
 
     headers = dict(injected["headers"])
     params = dict(injected["params"])
+
+    # Template default headers (e.g. Reddit's required User-Agent) — never
+    # override the injected auth headers.
+    for hname, hval in (tpl.get("default_headers") or {}).items():
+        if hname.lower() not in {h.lower() for h in headers}:
+            headers[hname] = hval
 
     if google_tokeninfo:
         # Token goes in the query for tokeninfo; no auth headers needed.
@@ -1180,6 +1243,40 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
             return RedirectResponse(
                 url=f"/services?error={err.replace(' ', '+')}", status_code=303)
         base_url = ""
+    elif auth["kind"] == "basic":
+        # HTTP Basic (e.g. WordPress application password): username + key.
+        wp_username = (form.get("wp_username") or "").strip()
+        app_password = (form.get("api_key") or "").strip()
+        if not wp_username or not app_password:
+            return RedirectResponse(
+                url="/services?error=Username+and+application+password+are+required",
+                status_code=303)
+        if not base_url:
+            return RedirectResponse(url="/services?error=Site+URL+required", status_code=303)
+        secrets_d = {"username": wp_username, "api_key": app_password}
+    elif auth["kind"] == "amazon":
+        associate_tag = (form.get("associate_tag") or "").strip()
+        if not associate_tag:
+            return RedirectResponse(
+                url="/services?error=Associate+tag+is+required", status_code=303)
+        secrets_d = {"associate_tag": associate_tag}
+        marketplace = (form.get("marketplace") or "").strip()
+        if marketplace:
+            try:
+                secrets_d["marketplace"] = amazon_ops.normalize_marketplace(marketplace)
+            except AmazonOpsError as exc:
+                return RedirectResponse(
+                    url=f"/services?error={str(exc)[:120].replace(' ', '+')}",
+                    status_code=303)
+        paapi_key = (form.get("paapi_access_key") or "").strip()
+        paapi_secret = (form.get("paapi_secret_key") or "").strip()
+        if bool(paapi_key) != bool(paapi_secret):
+            return RedirectResponse(
+                url="/services?error=PA-API+needs+both+access+key+and+secret",
+                status_code=303)
+        if paapi_key:
+            secrets_d["paapi_access_key"] = paapi_key
+            secrets_d["paapi_secret_key"] = paapi_secret
     elif auth["kind"] == "mcp_bearer":
         api_key = (form.get("mcp_token") or "").strip()
         if not api_key:
@@ -1384,6 +1481,29 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
             secrets_d["email_address"] = email_address
         if app_password:
             secrets_d["app_password"] = app_password
+    if (conn.get("auth") or {}).get("kind") == "basic":
+        _wp_user = (form.get("wp_username") or "").strip()
+        if _wp_user:
+            secrets_d["username"] = _wp_user
+        # api_key rotation (application password) is handled generically above.
+    if (conn.get("auth") or {}).get("kind") == "amazon":
+        _tag = (form.get("associate_tag") or "").strip()
+        if _tag:
+            secrets_d["associate_tag"] = _tag
+        _mkt = (form.get("marketplace") or "").strip()
+        if _mkt:
+            try:
+                secrets_d["marketplace"] = amazon_ops.normalize_marketplace(_mkt)
+            except AmazonOpsError as exc:
+                return RedirectResponse(
+                    url=f"/services?error={str(exc)[:120].replace(' ', '+')}",
+                    status_code=303)
+        _pk = (form.get("paapi_access_key") or "").strip()
+        _ps = (form.get("paapi_secret_key") or "").strip()
+        if _pk:
+            secrets_d["paapi_access_key"] = _pk
+        if _ps:
+            secrets_d["paapi_secret_key"] = _ps
 
     auth = conn.get("auth")
     # Custom OAuth connections can update their endpoint config too.
@@ -1522,7 +1642,8 @@ async def oauth_callback(request: Request, background_tasks: BackgroundTasks,
     try:
         tokens = await oauth_mod.exchange_code(
             pending["service"], code, secrets_d.get("client_id", ""),
-            secrets_d.get("client_secret", ""), PUBLIC_URL, conn=conn)
+            secrets_d.get("client_secret", ""), PUBLIC_URL, conn=conn,
+            code_verifier=pending.get("code_verifier"))
     except OAuthError as exc:
         audit_log("admin", conn_id, "oauth_failed", str(exc)[:200])
         return RedirectResponse(url=f"/services?error={str(exc)[:120].replace(' ', '+')}", status_code=303)
@@ -2661,6 +2782,11 @@ async def proxy_request(conn_id: str, request: Request):
         raise HTTPException(status_code=409, detail=str(exc))
 
     headers.update(injected["headers"])
+    # Template default headers (e.g. Reddit's required User-Agent): applied
+    # when neither the caller nor the auth injection set them.
+    for hname, hval in (tpl_ro.get("default_headers") or {}).items():
+        if hname.lower() not in {h.lower() for h in headers}:
+            headers[hname] = hval
     params = dict(body.get("params") or {})
     params.update(injected["params"])
 
@@ -3134,6 +3260,73 @@ async def email_request(conn_id: str, request: Request):
     return JSONResponse(result, status_code=200)
 
 
+@app.post("/api/vault/amazon/{conn_id}")
+async def amazon_operation(conn_id: str, request: Request):
+    """Structured Amazon Associates operations for agents.
+
+    Body: {"operation": "build_link" | "search_items" | "get_items" |
+           "get_variations" | "get_browse_nodes", "args": {...}}
+    build_link works with just the stored associate tag; the PA-API
+    operations require stored PA-API keys — SigV4 signing happens here in
+    the vault, never agent-side.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "amazon_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "amazon":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not an Amazon Associates connection — use the HTTP proxy instead.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    operation = str(body.get("operation") or "").strip().lower()
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+
+    secrets_d = store.get_secrets(cid)
+    marketplace = secrets_d.get("marketplace", "www.amazon.com")
+
+    if operation == "build_link":
+        try:
+            result = amazon_ops.build_tagged_link(
+                secrets_d.get("associate_tag", ""), args, marketplace=marketplace)
+        except AmazonOpsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        audit_log(agent_name, cid, "amazon_build_link",
+                  result.get("asin") or (result.get("link") or "")[:80])
+        return JSONResponse(result, status_code=200)
+
+    try:
+        result = await amazon_ops.paapi_call(
+            secrets_d, operation, args, marketplace=marketplace)
+    except AmazonOpsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except httpx.RequestError as exc:
+        audit_log(agent_name, cid, "amazon_upstream_error", str(exc)[:200])
+        raise HTTPException(status_code=502, detail=f"PA-API request failed: {exc}")
+
+    # Scrub: never let the PA-API secret leak through an echoed error body.
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    for sv in (secrets_d.get("paapi_secret_key", ""), secrets_d.get("paapi_access_key", "")):
+        if sv and len(sv) >= 8 and sv in text:
+            text = text.replace(sv, "***vault***")
+    result = json.loads(text)
+    audit_log(agent_name, cid, f"amazon_{operation}",
+              f"HTTP {result.get('status')}")
+    return JSONResponse(result, status_code=200)
+
+
 # ---------------------------------------------------------------------------
 # Health & startup
 # ---------------------------------------------------------------------------
@@ -3237,6 +3430,37 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
             "vnc_port": (body.get("vnc_port") or "5900") or "5900",
         }
         base_url = ""
+    elif auth["kind"] == "basic":
+        wp_username = (form.get("wp_username") or form.get("username") or "").strip()
+        app_password = (form.get("api_key") or "").strip()
+        if not wp_username or not app_password:
+            raise HTTPException(
+                status_code=400,
+                detail="Username and application password are required "
+                       "(fields: wp_username, api_key)")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Site URL required (field: base_url)")
+        secrets_d = {"username": wp_username, "api_key": app_password}
+    elif auth["kind"] == "amazon":
+        associate_tag = (form.get("associate_tag") or "").strip()
+        if not associate_tag:
+            raise HTTPException(status_code=400,
+                                detail="Associate tag is required (field: associate_tag)")
+        secrets_d = {"associate_tag": associate_tag}
+        marketplace = (form.get("marketplace") or "").strip()
+        if marketplace:
+            try:
+                secrets_d["marketplace"] = amazon_ops.normalize_marketplace(marketplace)
+            except AmazonOpsError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        paapi_key = (form.get("paapi_access_key") or "").strip()
+        paapi_secret = (form.get("paapi_secret_key") or "").strip()
+        if bool(paapi_key) != bool(paapi_secret):
+            raise HTTPException(status_code=400,
+                                detail="PA-API needs both access key and secret")
+        if paapi_key:
+            secrets_d["paapi_access_key"] = paapi_key
+            secrets_d["paapi_secret_key"] = paapi_secret
     elif auth["kind"] == "mcp_bearer":
         api_key = (form.get("api_key") or str(body.get("bearer_token") or "")).strip()
         if not api_key:

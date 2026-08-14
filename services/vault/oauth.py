@@ -7,6 +7,8 @@ access tokens automatically; agents only ever see upstream API responses.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import secrets as pysecrets
 import time
@@ -18,6 +20,9 @@ import httpx
 from catalog import get_template
 
 logger = logging.getLogger("vault.oauth")
+
+# Some providers (Reddit) reject requests without a descriptive User-Agent.
+_DEFAULT_UA = "open-manus-vault/1.0 (+https://github.com/open-manus)"
 
 # Refresh a little early so in-flight requests don't race expiry.
 _EXPIRY_SLACK_SECONDS = 90
@@ -48,38 +53,94 @@ def build_authorize_url(service: str, conn_id: str, client_id: str,
     if not oauth.get("authorize_url"):
         raise OAuthError(f"{service} is not an OAuth service (no authorize URL configured)")
     state = pysecrets.token_urlsafe(24)
-    store.put_oauth_state(state, {"service": service, "conn_id": conn_id})
+    state_payload: Dict[str, Any] = {"service": service, "conn_id": conn_id}
+    # Provider quirk: some (TikTok) name the client-id param differently.
+    client_id_param = oauth.get("client_id_param") or "client_id"
     params = {
-        "client_id": client_id,
+        client_id_param: client_id,
         "redirect_uri": redirect_uri(public_url),
         "response_type": "code",
-        "scope": " ".join(oauth.get("scopes") or []),
+        "scope": (oauth.get("scope_separator") or " ").join(oauth.get("scopes") or []),
         "state": state,
     }
+    # PKCE (required by X/Twitter OAuth 2.0): S256 challenge, verifier kept
+    # in the state payload server-side until the callback.
+    if oauth.get("pkce"):
+        verifier = pysecrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
+        state_payload["code_verifier"] = verifier
     params.update(oauth.get("extra_authorize_params") or {})
+    store.put_oauth_state(state, state_payload)
     return f"{oauth['authorize_url']}?{urlencode(params)}"
+
+
+def _token_request_kwargs(oauth: Dict[str, Any], data: Dict[str, str],
+                          client_id: str, client_secret: str) -> Dict[str, Any]:
+    """Apply provider token-endpoint quirks to a token/refresh POST."""
+    headers = {"Accept": "application/json", "User-Agent": _DEFAULT_UA}
+    client_id_param = oauth.get("client_id_param") or "client_id"
+    auth = None
+    if oauth.get("token_auth") == "basic":
+        # Reddit / X / Pinterest style: client creds via HTTP Basic only.
+        auth = (client_id, client_secret)
+        data.pop("client_secret", None)
+        data.pop(client_id_param, None)
+    elif client_id_param != "client_id":
+        data[client_id_param] = data.pop("client_id", client_id)
+    data.update(oauth.get("extra_token_params") or {})
+    return {"data": data, "headers": headers, "auth": auth}
+
+
+async def _facebook_long_lived(oauth: Dict[str, Any], short_token: str,
+                               client_id: str, client_secret: str) -> Dict[str, Any]:
+    """Swap a short-lived Meta user token for a ~60-day long-lived one."""
+    token_url = oauth["token_url"]
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(token_url, params={
+            "grant_type": "fb_exchange_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "fb_exchange_token": short_token,
+        })
+    if resp.status_code >= 400:
+        raise OAuthError(
+            f"Meta long-lived token exchange failed ({resp.status_code}): {resp.text[:300]}")
+    payload = resp.json()
+    if not payload.get("access_token"):
+        raise OAuthError("Meta long-lived token exchange returned no access_token")
+    return payload
 
 
 async def exchange_code(service: str, code: str, client_id: str,
                         client_secret: str, public_url: str,
-                        conn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Exchange an authorization code for tokens. Returns the token payload."""
+                        conn: Optional[Dict[str, Any]] = None,
+                        code_verifier: Optional[str] = None) -> Dict[str, Any]:
+    """Exchange an authorization code for tokens. Returns the token payload.
+
+    Provider quirks are handled here (never agent-side): PKCE code_verifier
+    (X/Twitter), HTTP-Basic token auth (Reddit/X/Pinterest), renamed
+    client-id params (TikTok's client_key), and Meta's long-lived-token
+    exchange after the initial code exchange.
+    """
     oauth = oauth_config(service, conn)
     token_url = oauth.get("token_url")
     if not token_url:
         raise OAuthError(f"No token URL for service {service}")
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri(public_url),
+    }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+    kwargs = _token_request_kwargs(oauth, data, client_id, client_secret)
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            token_url,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": redirect_uri(public_url),
-            },
-            headers={"Accept": "application/json"},
-        )
+        resp = await client.post(token_url, **kwargs)
     if resp.status_code >= 400:
         raise OAuthError(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
     payload = resp.json()
@@ -87,6 +148,11 @@ async def exchange_code(service: str, code: str, client_id: str,
         raise OAuthError(f"Token exchange failed: {payload.get('error_description') or payload['error']}")
     if not payload.get("access_token"):
         raise OAuthError("Token exchange returned no access_token")
+    if oauth.get("long_lived_exchange") == "facebook":
+        # Meta short-lived (~1h) user tokens must be swapped immediately for
+        # a long-lived (~60 day) token; there is no refresh_token flow.
+        payload = await _facebook_long_lived(
+            oauth, payload["access_token"], client_id, client_secret)
     return _normalize_token_payload(payload)
 
 
@@ -100,17 +166,16 @@ async def refresh_tokens(service: str, secrets: Dict[str, Any],
     refresh_token = secrets.get("refresh_token")
     if not refresh_token:
         raise OAuthError("No refresh token stored — reconnect this service")
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": secrets.get("client_id", ""),
+        "client_secret": secrets.get("client_secret", ""),
+    }
+    kwargs = _token_request_kwargs(
+        oauth, data, secrets.get("client_id", ""), secrets.get("client_secret", ""))
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            oauth["token_url"],
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": secrets.get("client_id", ""),
-                "client_secret": secrets.get("client_secret", ""),
-            },
-            headers={"Accept": "application/json"},
-        )
+        resp = await client.post(oauth["token_url"], **kwargs)
     if resp.status_code >= 400:
         raise OAuthError(f"Token refresh failed ({resp.status_code}): {resp.text[:300]}")
     payload = resp.json()

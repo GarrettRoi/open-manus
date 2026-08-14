@@ -37,6 +37,7 @@ def dct(tmp_path, monkeypatch):
     monkeypatch.setenv("DISCORD_HOME_CHANNEL", "555")
     monkeypatch.setattr(mod, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(mod, "_disabled", False)
+    monkeypatch.setattr(mod, "_pins_disabled", False)
     monkeypatch.setattr(mod, "_message_map", None)
     monkeypatch.setattr(mod, "_jobs_thread_id", None)
     monkeypatch.setattr(mod, "_history_thread_id", None)
@@ -48,18 +49,28 @@ def dct(tmp_path, monkeypatch):
 class _Msg:
     _next = [100]
 
-    def __init__(self, author_id, content, thread):
+    def __init__(self, author_id, content, thread, channel=None):
         _Msg._next[0] += 1
         self.id = _Msg._next[0]
         self.author = types.SimpleNamespace(id=author_id)
         self.content = content
         self.thread = thread
+        self.channel = channel
 
     async def pin(self):
-        pass
+        if self.channel is not None and self not in self.channel.pinned:
+            self.channel.pinned.append(self)
+
+    async def unpin(self):
+        if self.channel is not None and self in self.channel.pinned:
+            self.channel.pinned.remove(self)
 
     async def delete(self):
-        self.thread.msgs = [m for m in self.thread.msgs if m.id != self.id]
+        if self.thread is not None:
+            self.thread.msgs = [m for m in self.thread.msgs if m.id != self.id]
+        if self.channel is not None:
+            self.channel.sent = [m for m in self.channel.sent if m.id != self.id]
+            self.channel.pinned = [m for m in self.channel.pinned if m.id != self.id]
 
     async def edit(self, content=None):
         self.content = content
@@ -119,16 +130,32 @@ class _Channel:
         self.id = 555
         self.threads = []
         self.sent = []
+        self.pinned = []
 
     async def send(self, content):
-        m = _Msg(1, content, None)
+        m = _Msg(1, content, None, channel=self)
         self.sent.append(m)
         return m
 
     async def create_thread(self, name, message=None, auto_archive_duration=None):
         t = _Thread(name, self)
+        if message is not None:
+            # Mirror Discord: a thread spawned from a message shares its id.
+            t.id = message.id
+            message.thread = t
         self.threads.append(t)
         return t
+
+    async def pins(self):
+        return list(self.pinned)
+
+    async def fetch_message(self, mid):
+        import discord
+
+        for m in self.sent:
+            if m.id == mid:
+                return m
+        raise discord.NotFound()
 
     def archived_threads(self, limit=50):
         async def gen():
@@ -150,6 +177,14 @@ class _Client:
             if t.id == cid:
                 return t
         return None
+
+    async def fetch_channel(self, cid):
+        import discord
+
+        ch = self.get_channel(cid)
+        if ch is None:
+            raise discord.NotFound()
+        return ch
 
 
 @pytest.fixture()
@@ -229,6 +264,169 @@ def test_restart_reconciliation_and_reuse(env):
         await dct._sync_async(adapter)
         assert jt.archived is False
         assert len(channel.threads) == 2
+
+    asyncio.run(run())
+
+
+def test_duplicate_anchor_pins_cleaned_up(env):
+    """Redeploy leftovers: surplus pinned anchors get unpinned + deleted."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        # First sync creates threads + one pinned anchor each.
+        await dct._sync_async(adapter)
+        jt = next(t for t in channel.threads if t.name == dct.JOBS_THREAD_NAME)
+        # Simulate older redeploys that left duplicate pinned anchors.
+        for _ in range(3):
+            dup = await channel.send(f"📌 {dct.JOBS_THREAD_NAME}")
+            await dup.pin()
+        assert len([m for m in channel.pinned
+                    if m.content.startswith(f"📌 {dct.JOBS_THREAD_NAME}")]) == 4
+        # Fresh process (state lost) — dedup keeps only the live thread's anchor.
+        dct._message_map = None
+        dct._jobs_thread_id = None
+        dct._history_thread_id = None
+        await dct._sync_async(adapter)
+        keepers = [m for m in channel.pinned
+                   if m.content.startswith(f"📌 {dct.JOBS_THREAD_NAME}")]
+        assert len(keepers) == 1
+        assert keepers[0].id == jt.id
+        assert f"<#{jt.id}>" in keepers[0].content
+        assert len(channel.threads) == 2  # no new threads created
+
+    asyncio.run(run())
+
+
+def test_thread_recovered_from_anchor_pin(env):
+    """State + thread caches lost, but the anchor pin survives → reuse it."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        await dct._sync_async(adapter)
+        jt = next(t for t in channel.threads if t.name == dct.JOBS_THREAD_NAME)
+        # Simulate the thread being invisible to id/name/archived lookups.
+        channel.threads = [t for t in channel.threads if t.id == jt.id or True]
+        hidden = list(channel.threads)
+        channel.threads = []
+        dct._message_map = None
+        dct._jobs_thread_id = None
+        dct._history_thread_id = None
+
+        # get_channel/fetch_channel must still resolve the hidden threads
+        # (Discord can fetch a thread by id even when it's not in caches).
+        adapter._client._channel.threads = []
+        real_get = adapter._client.get_channel
+
+        def get_channel(cid):
+            for t in hidden:
+                if t.id == cid:
+                    return t
+            return real_get(cid)
+
+        adapter._client.get_channel = get_channel
+        await dct._sync_async(adapter)
+        assert channel.threads == []  # nothing re-created in the channel
+        assert dct._jobs_thread_id == jt.id
+
+    asyncio.run(run())
+
+
+def test_missing_anchor_gets_repinned(env):
+    """Live thread whose starter pin was removed gets re-pinned with a link."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        await dct._sync_async(adapter)
+        jt = next(t for t in channel.threads if t.name == dct.JOBS_THREAD_NAME)
+        channel.pinned = [m for m in channel.pinned if m.id != jt.id]
+        await dct._sync_async(adapter)
+        keepers = [m for m in channel.pinned if m.id == jt.id]
+        assert len(keepers) == 1
+        assert f"<#{jt.id}>" in keepers[0].content
+
+    asyncio.run(run())
+
+
+def test_non_matching_pins_never_touched(env):
+    """Prefix-colliding, non-bot, and unrelated pins must survive dedup."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        await dct._sync_async(adapter)
+        # Prefix collision (bot-authored), foreign-author lookalike, unrelated.
+        collide = await channel.send(f"📌 {dct.JOBS_THREAD_NAME}-old")
+        await collide.pin()
+        foreign = _Msg(999, f"📌 {dct.JOBS_THREAD_NAME}", None, channel=channel)
+        channel.sent.append(foreign)
+        await foreign.pin()
+        other = await channel.send("important announcement")
+        await other.pin()
+        dct._message_map = None
+        dct._jobs_thread_id = None
+        dct._history_thread_id = None
+        await dct._sync_async(adapter)
+        surviving = {m.id for m in channel.pinned}
+        assert {collide.id, foreign.id, other.id} <= surviving
+
+    asyncio.run(run())
+
+
+def test_recovery_rejects_wrong_thread_name(env):
+    """An anchor whose message spawned a differently-named thread is not bound."""
+    dct, channel, adapter, jobs = env
+
+    async def run():
+        # A pinned exact-format anchor whose .thread has the wrong name.
+        rogue = await channel.send(f"📌 {dct.JOBS_THREAD_NAME}")
+        await rogue.pin()
+        rogue.thread = types.SimpleNamespace(
+            id=rogue.id, name="something-else", parent_id=channel.id)
+        await dct._sync_async(adapter)
+        jt = next(t for t in channel.threads if t.name == dct.JOBS_THREAD_NAME)
+        assert dct._jobs_thread_id == jt.id != rogue.id
+
+    asyncio.run(run())
+
+
+def test_pins_forbidden_degrades_gracefully(env):
+    """Forbidden on pins(): pin management disabled, threads still created."""
+    import discord
+
+    dct, channel, adapter, jobs = env
+
+    async def deny():
+        raise discord.Forbidden()
+
+    channel.pins = deny
+
+    async def run():
+        await dct._sync_async(adapter)
+
+    asyncio.run(run())
+    assert dct._pins_disabled is True
+    assert dct._disabled is False
+    names = sorted(t.name for t in channel.threads)
+    assert names == sorted([dct.JOBS_THREAD_NAME, dct.HISTORY_THREAD_NAME])
+
+
+def test_transient_pins_failure_defers_creation(env):
+    """Unreadable pin inventory (non-Forbidden) defers creation, no dupes."""
+    import discord
+
+    dct, channel, adapter, jobs = env
+    real_pins = channel.pins
+
+    async def flaky():
+        raise discord.HTTPException()
+
+    channel.pins = flaky
+
+    async def run():
+        await dct._sync_async(adapter)
+        assert channel.threads == []  # deferred, nothing created
+        channel.pins = real_pins
+        await dct._sync_async(adapter)
+        assert len(channel.threads) == 2  # created once pins are readable
 
     asyncio.run(run())
 
