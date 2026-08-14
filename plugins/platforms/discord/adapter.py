@@ -686,6 +686,7 @@ class VoiceReceiver:
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
+            flushed_by_mute = set()
 
             for ssrc in ssrc_list:
                 last_time = self._last_packet_time.get(ssrc, now)
@@ -731,24 +732,50 @@ class VoiceReceiver:
                             "max-utterance cap" if over_cap else "silence",
                         )
                     if force_flush:
-                        self._flush_users.pop(user_id, None)
-                    self._buffers[ssrc] = bytearray()
-                    self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2 and not user_id:
-                    # Stale buffer with no valid user — discard
+                        flushed_by_mute.add(user_id)
+                    if user_id or not self._flush_users:
+                        self._buffers[ssrc] = bytearray()
+                        self._last_packet_time.pop(ssrc, None)
+                    # else: unmapped audio while a mute flush is pending —
+                    # hold it for a late SSRC mapping (stale path enforces
+                    # the marker-TTL bound below).
+                elif not user_id and silence_duration >= (
+                        self.FLUSH_MARKER_TTL if self._flush_users
+                        else self.SILENCE_THRESHOLD * 2):
+                    # Stale buffer with no valid user — discard. While a mute
+                    # flush is pending, hold unmapped audio for the marker TTL
+                    # instead: it may be the muting user's speech awaiting a
+                    # late SSRC mapping.
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
 
-            # Drop pending flush markers with no buffered audio anywhere
-            # (nothing to send) or that have expired.
+            # Consume markers only after the full pass, so one mute flushes
+            # every buffer resolved to that user in the same pass.
+            for uid in flushed_by_mute:
+                self._flush_users.pop(uid, None)
+
+            # Expire leftover markers. Use the LIVE ssrc map (inference above
+            # may have just mapped an SSRC) and never early-drop a marker
+            # while any unmapped audio is still buffered — it may turn out to
+            # belong to that user on a later pass. Hard TTL still applies.
             if self._flush_users:
-                have_audio = {ssrc_user_map.get(s) or 0
-                              for s, b in self._buffers.items() if len(b)}
+                live_map = dict(self._ssrc_to_user)
+                have_audio = set()
+                unmapped_audio = False
+                for s, b in self._buffers.items():
+                    if not len(b):
+                        continue
+                    uid = live_map.get(s)
+                    if uid:
+                        have_audio.add(uid)
+                    else:
+                        unmapped_audio = True
                 for uid in list(self._flush_users):
                     age = now - self._flush_users[uid]
-                    if uid not in have_audio and age > 1.0:
+                    if age > self.FLUSH_MARKER_TTL:
                         self._flush_users.pop(uid, None)
-                    elif age > self.FLUSH_MARKER_TTL:
+                    elif (age > 1.0 and uid not in have_audio
+                          and not unmapped_audio):
                         self._flush_users.pop(uid, None)
 
         return completed

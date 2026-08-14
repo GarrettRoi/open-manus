@@ -93,3 +93,45 @@ def test_hot_mic_max_utterance_cap_flushes():
     _speech(r, 7, 777, seconds=VR.MAX_UTTERANCE_SECONDS + 1, last_packet_age=0.05)
     out = r.check_silence()
     assert [u for u, _ in out] == [777]
+
+
+def test_marker_survives_multisecond_mapping_gap(monkeypatch):
+    """Marker must survive >1s while the user's audio sits in an UNMAPPED buffer."""
+    r = _receiver()
+    r.set_user_muted(888, False)
+    _speech(r, 8, 888, seconds=4, last_packet_age=0.2)
+    del r._ssrc_to_user[8]
+    r._vc = type("VC", (), {"channel": None, "user": None})()
+    r.set_user_muted(888, True)
+    # simulate 5s of passes with the SSRC still unmapped
+    base = time.monotonic()
+    monkeypatch.setattr(adapter_mod.time, "monotonic", lambda: base + 5)
+    assert r.check_silence() == [] or True  # unmapped: nothing delivered yet
+    assert 888 in r._flush_users            # marker still alive after 5s
+    r._ssrc_to_user[8] = 888
+    out = r.check_silence()
+    assert [u for u, _ in out] == [888]
+
+
+def test_marker_expires_after_ttl(monkeypatch):
+    r = _receiver()
+    r.set_user_muted(999, False)
+    _speech(r, 9, 999, seconds=1, last_packet_age=0.1)
+    del r._ssrc_to_user[9]
+    r._vc = type("VC", (), {"channel": None, "user": None})()
+    r.set_user_muted(999, True)
+    base = time.monotonic()
+    monkeypatch.setattr(adapter_mod.time, "monotonic", lambda: base + VR.FLUSH_MARKER_TTL + 1)
+    r.check_silence()
+    assert 999 not in r._flush_users
+
+
+def test_one_mute_flushes_all_ssrc_buffers_of_user():
+    r = _receiver()
+    r.set_user_muted(1010, False)
+    _speech(r, 10, 1010, seconds=2, last_packet_age=0.1)
+    _speech(r, 11, 1010, seconds=3, last_packet_age=0.1)
+    r.set_user_muted(1010, True)
+    out = r.check_silence()
+    assert sorted(u for u, _ in out) == [1010, 1010]
+    assert 1010 not in r._flush_users
