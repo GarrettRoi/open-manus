@@ -3532,8 +3532,37 @@ class DiscordAdapter(BasePlatformAdapter):
             # leave/rejoin. Locks are tiny and per-guild, so keeping them for
             # the adapter's lifetime is safe.
 
-    # Maximum seconds to wait for voice playback before giving up
+    # Maximum seconds to wait for voice playback before giving up.
+    # This is a floor, not a hard cap: long TTS segments get a timeout
+    # derived from the clip's real duration (see _playback_timeout_for),
+    # because cutting a clip at a fixed 120s truncated long replies ~90%
+    # through their first segment and dropped the rest of the queue.
     PLAYBACK_TIMEOUT = 120
+    # Safety margin added on top of a clip's known duration.
+    PLAYBACK_TIMEOUT_MARGIN = 20
+
+    def _playback_timeout_for(self, duration_s: Optional[float]) -> float:
+        """Timeout for a clip: its real duration plus margin, floored at
+        PLAYBACK_TIMEOUT so unknown/short clips keep the old behavior."""
+        if duration_s and duration_s > 0:
+            return max(self.PLAYBACK_TIMEOUT, duration_s + self.PLAYBACK_TIMEOUT_MARGIN)
+        return float(self.PLAYBACK_TIMEOUT)
+
+    @staticmethod
+    def _probe_audio_duration(audio_path: str) -> Optional[float]:
+        """Best-effort clip duration in seconds via ffprobe (None on failure)."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+                capture_output=True, timeout=10, stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0:
+                return float((proc.stdout or b"").strip())
+        except Exception:
+            pass
+        return None
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -3572,11 +3601,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 mixer.play_speech(pcm, gain=speech_gain)
                 # Block until the speech child drains so callers serialise
                 # replies (mirrors legacy semantics) but the ambient keeps
-                # playing underneath the whole time.
+                # playing underneath the whole time. The timeout scales with
+                # the clip's actual duration (48kHz stereo s16 PCM) so long
+                # segments aren't truncated at a fixed cap.
+                pcm_duration = len(pcm) / 192000.0  # 48000 Hz * 2 ch * 2 bytes
+                timeout_s = self._playback_timeout_for(pcm_duration)
                 wait_start = time.monotonic()
                 while mixer.speech_active:
-                    if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
-                        logger.warning("Mixer speech playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                    if time.monotonic() - wait_start > timeout_s:
+                        logger.warning("Mixer speech playback timed out after %.0fs "
+                                       "(clip duration %.1fs)", timeout_s, pcm_duration)
                         mixer.stop_speech()
                         break
                     await asyncio.sleep(0.05)
@@ -3611,10 +3645,13 @@ class DiscordAdapter(BasePlatformAdapter):
             source = discord.FFmpegPCMAudio(audio_path)
             source = discord.PCMVolumeTransformer(source, volume=1.0)
             vc.play(source, after=_after)
+            duration_s = await asyncio.to_thread(self._probe_audio_duration, audio_path)
+            timeout_s = self._playback_timeout_for(duration_s)
             try:
-                await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
+                await asyncio.wait_for(done.wait(), timeout=timeout_s)
             except asyncio.TimeoutError:
-                logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                logger.warning("Voice playback timed out after %.0fs (clip duration %s)",
+                               timeout_s, f"{duration_s:.1f}s" if duration_s else "unknown")
                 vc.stop()
             self._reset_voice_timeout(guild_id)
             return True
