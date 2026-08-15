@@ -319,9 +319,19 @@ class ConnectionStore:
 
     def pop_oauth_state(self, state: str) -> Optional[Dict[str, Any]]:
         key = f"{PFX_OAUTH_STATE}{state}"
-        raw = self.r.get(key)
+        # Atomic consume: two concurrent callbacks must never both succeed
+        # with the same state (single-use guarantee). GETDEL is atomic on
+        # Redis >= 6.2; fall back to an equivalent atomic Lua script.
+        try:
+            raw = self.r.getdel(key)
+        except Exception:
+            raw = self.r.eval(
+                "local v = redis.call('GET', KEYS[1]) "
+                "if v then redis.call('DEL', KEYS[1]) end return v",
+                1, key)
         if raw:
-            self.r.delete(key)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
             try:
                 return json.loads(raw)
             except ValueError:

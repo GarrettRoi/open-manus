@@ -329,6 +329,56 @@ def require_agent(request: Request) -> str:
     return agent_name
 
 
+def _oauth_public_reason(raw_msg: str) -> str:
+    """Map a raw OAuthError to a fixed, sanitized agent-facing reason.
+
+    Provider token-endpoint responses (embedded in OAuthError text) may
+    reflect request values or diagnostics — never forward them to agents.
+    """
+    low = (raw_msg or "").lower()
+    if "no refresh token" in low or "reconnect" in low:
+        return ("No refresh token is stored for this connection — the owner "
+                "must re-authorize it.")
+    if "not connected" in low or "no access token" in low:
+        return "This connection has never completed its OAuth login."
+    if "refresh failed" in low or "refresh" in low or "expired" in low:
+        return ("The OAuth token could not be refreshed — it is expired or "
+                "was revoked by the provider.")
+    return "The stored OAuth token is no longer valid."
+
+
+def _scrub_secret_values(text: str, secrets_d: Dict[str, Any]) -> str:
+    """Remove any stored secret values from a diagnostic string."""
+    for v in (secrets_d or {}).values():
+        if isinstance(v, str) and len(v) >= 8 and v in text:
+            text = text.replace(v, "***vault***")
+    return text
+
+
+def _reauth_required_detail(cid: str, msg: str) -> Dict[str, Any]:
+    """Structured detail for an OAuth token that is expired/revoked/broken.
+
+    Marks the connection `needs_reauth` (dashboard badge) and tells the agent
+    exactly how to get a re-authorization link it can hand to the owner in
+    chat. The successful /oauth/callback resets status to `ready`.
+    `msg` must already be a sanitized public reason (see _oauth_public_reason);
+    never pass raw OAuthError/provider text.
+    """
+    r.hset(f"vault:conn:{cid}", "status", "needs_reauth")
+    return {
+        "error": "oauth_reauth_required",
+        "connection": cid,
+        "message": msg,
+        "action": (
+            "The stored OAuth token is expired, revoked, or missing. Call the "
+            f"vault tool with action='reauth' and connection='{cid}' to get a "
+            "one-time authorization link, send that link to the owner in chat "
+            "(it renders clickable in Discord), and retry the original call "
+            "after they approve."
+        ),
+    }
+
+
 def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[str, Any]:
     """Public (secret-free) view of a connection."""
     tpl = get_template(conn.get("service", "")) or {}
@@ -2670,8 +2720,11 @@ async def google_operation(conn_id: str, request: Request, body: GoogleOperation
             conn["service"], cid, store, conn=conn)
         scrub_values.append(access_token)
     except OAuthError as exc:
-        audit_log(agent_name, cid, "google_auth_error", str(exc)[:200])
-        raise HTTPException(status_code=409, detail=str(exc))
+        audit_log(agent_name, cid, "google_auth_error",
+                  _scrub_secret_values(str(exc), secrets_d)[:200])
+        raise HTTPException(
+            status_code=409,
+            detail=_reauth_required_detail(cid, _oauth_public_reason(str(exc))))
 
     kwargs: Dict[str, Any] = {
         "headers": {"Authorization": f"Bearer {access_token}"},
@@ -2715,9 +2768,68 @@ async def google_operation(conn_id: str, request: Request, body: GoogleOperation
         import base64 as _b64
         result["body_base64"] = _b64.b64encode(raw).decode()
 
+    if upstream.status_code == 401:
+        # Upstream rejected the token (expired/revoked mid-lifetime) —
+        # surface the re-auth path so the agent can unblock via the owner.
+        result["auth_hint"] = _reauth_required_detail(cid, "Upstream returned 401 — the OAuth token was rejected (expired or revoked).")
+
     audit_log(agent_name, cid, "google_operation",
               f"{body.product}.{body.operation} -> {upstream.status_code}")
     return JSONResponse(result, status_code=200)
+
+
+@app.post("/api/vault/reauth/{conn_id}")
+async def agent_reauth_link(conn_id: str, request: Request):
+    """Issue a one-time OAuth re-authorization link for a granted connection.
+
+    Used when the stored token is expired/revoked: the agent fetches this
+    link and delivers it to the owner in chat. The link reuses the normal
+    single-use, 10-minute OAuth state and the standard /oauth/callback, so
+    consent completes fully server-side — no credentials ever pass through
+    the agent (the URL only contains the public OAuth client ID).
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "reauth_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "oauth2":
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' is not an OAuth connection — the owner must update "
+                   "its credentials in the vault dashboard instead.")
+    if not PUBLIC_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="The vault's public URL is not configured — an OAuth link "
+                   "cannot be built. Ask the owner to set VAULT_PUBLIC_URL.")
+    secrets_d = store.get_secrets(cid)
+    client_id = (secrets_d.get("client_id") or "").strip()
+    if not client_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{cid}' has no OAuth client ID stored — the owner must "
+                   "reconfigure it in the vault dashboard.")
+    try:
+        url = oauth_mod.build_authorize_url(
+            conn["service"], cid, client_id, PUBLIC_URL, store, conn=conn)
+    except OAuthError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    audit_log(agent_name, cid, "reauth_link_issued")
+    return {
+        "connection": cid,
+        "url": url,
+        "expires_in_seconds": 600,
+        "note": ("Send this link to the owner in chat — Discord renders it "
+                 "clickable. It is single-use and expires in ~10 minutes. "
+                 "After the owner approves, the vault stores the new token "
+                 "automatically; retry the original call then."),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2856,7 +2968,12 @@ async def proxy_request(conn_id: str, request: Request):
         else:
             injected = build_auth(conn, secrets_d)
     except (AuthInjectionError, OAuthError) as exc:
-        audit_log(agent_name, cid, "proxy_auth_error", str(exc)[:200])
+        audit_log(agent_name, cid, "proxy_auth_error",
+                  _scrub_secret_values(str(exc), secrets_d)[:200])
+        if isinstance(exc, OAuthError):
+            raise HTTPException(
+                status_code=409,
+                detail=_reauth_required_detail(cid, _oauth_public_reason(str(exc))))
         raise HTTPException(status_code=409, detail=str(exc))
 
     headers.update(injected["headers"])
@@ -2976,6 +3093,11 @@ async def proxy_request(conn_id: str, request: Request):
             if len(sv) >= 8:
                 raw = raw.replace(sv.encode(), b"***vault***")
         result["body_base64"] = base64.b64encode(raw).decode()
+
+    if auth_kind == "oauth2" and upstream.status_code == 401:
+        # Upstream rejected the token (expired/revoked mid-lifetime) —
+        # surface the re-auth path so the agent can unblock via the owner.
+        result["auth_hint"] = _reauth_required_detail(cid, "Upstream returned 401 — the OAuth token was rejected (expired or revoked).")
 
     audit_log(agent_name, cid, "proxy_call",
               f"{method} {httpx.URL(url).path} -> {upstream.status_code}")

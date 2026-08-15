@@ -196,6 +196,10 @@ def _proxy_call(conn_id: str, args: dict) -> str:
             detail = json.loads(body).get("detail", body)
         except Exception:
             detail = body
+        if isinstance(detail, dict):
+            # Structured vault errors (e.g. oauth_reauth_required) pass
+            # through intact so the agent sees the action to take.
+            return json.dumps(detail, ensure_ascii=False)
         return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
     except URLError as e:
         return json.dumps({
@@ -231,6 +235,10 @@ def _special_call(conn_id: str, service: str, args: dict) -> str:
             detail = json.loads(body).get("detail", body)
         except Exception:
             detail = body
+        if isinstance(detail, dict):
+            # Structured vault errors (e.g. oauth_reauth_required) pass
+            # through intact so the agent sees the action to take.
+            return json.dumps(detail, ensure_ascii=False)
         return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
     except Exception as e:
         return json.dumps({"error": f"Vault call failed: {e}"})
@@ -594,6 +602,10 @@ def _email_call(conn_id: str, args: dict) -> str:
             detail = json.loads(body).get("detail", body)
         except Exception:
             detail = body
+        if isinstance(detail, dict):
+            # Structured vault errors (e.g. oauth_reauth_required) pass
+            # through intact so the agent sees the action to take.
+            return json.dumps(detail, ensure_ascii=False)
         return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
     except URLError as e:
         return json.dumps({
@@ -686,6 +698,10 @@ def _discord_read_call(conn_id: str, args: dict) -> str:
             detail = json.loads(body).get("detail", body)
         except Exception:
             detail = body
+        if isinstance(detail, dict):
+            # Structured vault errors (e.g. oauth_reauth_required) pass
+            # through intact so the agent sees the action to take.
+            return json.dumps(detail, ensure_ascii=False)
         return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
     except URLError as e:
         return json.dumps({
@@ -1055,6 +1071,10 @@ def _google_call(conn_id: str, product: str, args: dict) -> str:
             detail = json.loads(body).get("detail", body)
         except Exception:
             detail = body
+        if isinstance(detail, dict):
+            # Structured vault errors (e.g. oauth_reauth_required) pass
+            # through intact so the agent sees the action to take.
+            return json.dumps(detail, ensure_ascii=False)
         return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
     except Exception as e:
         return json.dumps({"error": f"Vault call failed: {e}"})
@@ -1396,8 +1416,32 @@ def vault_meta_handler(args: dict, **_kw) -> str:
         if result is None:
             return json.dumps({"error": "Vault unreachable — could not refresh."})
         return json.dumps({"refreshed": True, **result})
+    if action == "reauth":
+        connection = (str(args.get("connection") or "").strip().upper()
+                      .replace(" ", "_").replace("-", "_"))
+        if not connection:
+            return json.dumps({"error": "'connection' is required for reauth."})
+        try:
+            resp = _vault_http(
+                "POST", f"/api/vault/reauth/{connection}", {}, timeout=20)
+            return json.dumps(resp, ensure_ascii=False, default=str)
+        except HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode() if e.fp else ""
+            except Exception:
+                pass
+            try:
+                detail = json.loads(body).get("detail", body)
+            except Exception:
+                detail = body
+            if isinstance(detail, dict):
+                return json.dumps(detail, ensure_ascii=False)
+            return json.dumps({"error": f"Vault error ({e.code}): {detail}"})
+        except Exception as e:
+            return json.dumps({"error": f"reauth failed: {e}"})
     return json.dumps({"error": f"Unknown action '{action}'. "
-                                "Use list, request_access, or refresh."})
+                                "Use list, request_access, refresh, or reauth."})
 
 
 registry.register(
@@ -1410,8 +1454,13 @@ registry.register(
             "have been granted is ALSO exposed as its own native vault_<name> "
             "tool — prefer those for actual API calls. Use this tool to: "
             "list your connections (action='list'), ask the owner for access "
-            "to a new service (action='request_access'), or re-sync your "
-            "grants into native tools without a restart (action='refresh'). "
+            "to a new service (action='request_access'), re-sync your "
+            "grants into native tools without a restart (action='refresh'), "
+            "or get a one-time OAuth re-authorization link when a "
+            "connection's token is expired/revoked (action='reauth' with "
+            "connection=<ID> — send the returned URL to the owner in chat; "
+            "it renders as a clickable link in Discord, and after they "
+            "approve you can retry the original call). "
             "Credentials never leave the vault; you cannot read raw keys."
         ),
         "parameters": {
@@ -1419,7 +1468,11 @@ registry.register(
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "request_access", "refresh"],
+                    "enum": ["list", "request_access", "refresh", "reauth"],
+                },
+                "connection": {
+                    "type": "string",
+                    "description": "Connection ID to re-authorize (reauth).",
                 },
                 "service": {
                     "type": "string",
