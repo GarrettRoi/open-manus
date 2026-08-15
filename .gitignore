@@ -56,3 +56,4 @@ workspace/
 sessions/
 memory/
 backups/redis_backup*
+.pytest-cache/

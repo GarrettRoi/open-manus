@@ -5590,6 +5590,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        # Fleet-wide throttle: one shutdown/interrupted announcement per agent
+        # per cooldown window (crash loops and rapid redeploy waves otherwise
+        # spam every active chat and home channel on each restart). The
+        # reservation is released if nothing was actually delivered so a
+        # no-target/failed first attempt never eats the window.
+        token = None
+        try:
+            from gateway.status_notify import reserve_lifecycle_notice
+            token = reserve_lifecycle_notice("shutdown")
+            if token is None:
+                logger.info(
+                    "Shutdown notifications suppressed: within lifecycle cooldown window"
+                )
+                return
+        except Exception as e:
+            logger.debug("Lifecycle cooldown check failed, continuing: %s", e)
+
+        self._lifecycle_shutdown_delivered = False
+        try:
+            await self._notify_active_sessions_of_shutdown_inner()
+        finally:
+            if token and not self._lifecycle_shutdown_delivered:
+                try:
+                    from gateway.status_notify import release_lifecycle_notice
+                    release_lifecycle_notice("shutdown", token)
+                except Exception as e:
+                    logger.debug("Lifecycle reservation release failed: %s", e)
+
+    async def _notify_active_sessions_of_shutdown_inner(self) -> None:
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
@@ -5686,6 +5715,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                self._lifecycle_shutdown_delivered = True
                 logger.info(
                     "Sent shutdown notification to active chat %s:%s",
                     platform_str, chat_id,
@@ -5777,6 +5807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             getattr(result, "error", "send returned success=False"),
                         )
                         continue
+                    self._lifecycle_shutdown_delivered = True
                     logger.info(
                         "Sent shutdown notice to status channel %s:%s",
                         platform.value,
@@ -5816,6 +5847,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                self._lifecycle_shutdown_delivered = True
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
                     platform.value,
@@ -7228,10 +7260,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # a skip so the same chat isn't pinged twice. Per-platform opt-out via
         # gateway_restart_notification=false is honored inside the helper.
         try:
-            skip = {restart_notify_target} if restart_notify_target else None
-            await self._send_home_channel_startup_notifications(
-                skip_targets=skip,
-            )
+            # Fleet-wide throttle: one "gateway online" announcement per agent
+            # per cooldown window, so crash loops / rapid redeploys don't
+            # repost it on every boot. The precise /restart reply above is
+            # exempt — it answers an explicit command. If nothing ended up
+            # delivered (no home channels / all sends failed) the reservation
+            # is released so the next boot can still announce.
+            _online_token = None
+            try:
+                from gateway.status_notify import reserve_lifecycle_notice
+                _online_token = reserve_lifecycle_notice("online")
+            except Exception as e:
+                logger.debug("Lifecycle cooldown check failed, continuing: %s", e)
+                _online_token = "__lifecycle_open__"
+            if _online_token is not None:
+                skip = {restart_notify_target} if restart_notify_target else None
+                delivered_online = set()
+                try:
+                    delivered_online = await self._send_home_channel_startup_notifications(
+                        skip_targets=skip,
+                    )
+                finally:
+                    if not delivered_online and restart_notify_target is None:
+                        try:
+                            from gateway.status_notify import release_lifecycle_notice
+                            release_lifecycle_notice("online", _online_token)
+                        except Exception as e:
+                            logger.debug("Lifecycle reservation release failed: %s", e)
+            else:
+                logger.info(
+                    "Home-channel startup notification suppressed: within lifecycle cooldown window"
+                )
         finally:
             if planned_restart_notification_pending:
                 _clear_planned_restart_notification()

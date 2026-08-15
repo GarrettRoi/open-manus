@@ -156,3 +156,101 @@ async def prepare_shutdown_status_notice(
         # notice rather than letting a Redis blip silence the broadcast.
         logger.debug("Status-notice rate limiting failed, failing open: %s", e)
         return _solo_message(action, agent)
+
+
+_LIFECYCLE_KEY_PREFIX = "hermes:gateway:lifecycle_notice"
+_OPEN_TOKEN = "__lifecycle_open__"  # sentinel: allowed, but nothing reserved
+
+
+def _lifecycle_cooldown() -> int:
+    try:
+        return int(
+            os.environ.get("HERMES_LIFECYCLE_NOTICE_COOLDOWN", "300").strip() or 300)
+    except (TypeError, ValueError):
+        return 300
+
+
+def reserve_lifecycle_notice(kind: str) -> Optional[str]:
+    """Per-agent Redis cooldown reservation for gateway lifecycle notices.
+
+    ``kind`` is ``"shutdown"`` (covers both the active-chat "task will be
+    interrupted" message and the home-channel shutting-down/restarting
+    broadcast) or ``"online"`` (the home-channel "gateway online" message).
+
+    Returns a reservation token the first time an agent wants to send a
+    notice of this kind within the cooldown window; None when a notice of
+    the same kind already went out within the window — e.g. a crash loop,
+    a rapid double redeploy, or several SIGTERMs in a row. Shutdown and
+    online have separate windows so one restart still announces both halves.
+
+    If the caller ends up delivering nothing (no targets, all sends failed),
+    it must call :func:`release_lifecycle_notice` with the token so the next
+    restart can still announce. Cooldown seconds come from
+    ``HERMES_LIFECYCLE_NOTICE_COOLDOWN`` (default 300; ``0`` disables the
+    throttle). Without Redis or an agent identity this fails open (returns a
+    sentinel token) so a Redis blip never silences the broadcast entirely.
+    """
+    cooldown = _lifecycle_cooldown()
+    if cooldown <= 0:
+        return _OPEN_TOKEN
+    try:
+        client = _get_redis()
+        if client is None:
+            return _OPEN_TOKEN
+        agent = _agent_name()
+        if agent == "unknown":
+            # No agent identity (tests, local runs): never share a cooldown
+            # bucket across unrelated processes — fail open.
+            return _OPEN_TOKEN
+        token = f"{time.time()}:{os.getpid()}"
+        key = f"{_LIFECYCLE_KEY_PREFIX}:{kind}:{agent}"
+        if client.set(key, token, nx=True, ex=cooldown):
+            return token
+        logger.info(
+            "Lifecycle '%s' notice suppressed for %s: within %ss cooldown window",
+            kind, agent, cooldown,
+        )
+        return None
+    except Exception as e:
+        logger.debug("Lifecycle notice cooldown check failed, failing open: %s", e)
+        return _OPEN_TOKEN
+
+
+def release_lifecycle_notice(kind: str, token: Optional[str]) -> None:
+    """Release a reservation whose notice was never actually delivered.
+
+    Compare-and-delete: only removes the cooldown key if it still holds our
+    token, so a concurrent worker's fresh reservation is never clobbered.
+    Best-effort — failures are logged and swallowed.
+    """
+    if not token or token == _OPEN_TOKEN:
+        return
+    try:
+        client = _get_redis()
+        if client is None:
+            return
+        agent = _agent_name()
+        key = f"{_LIFECYCLE_KEY_PREFIX}:{kind}:{agent}"
+        try:
+            # Atomic compare-and-delete so a concurrent worker's fresh
+            # reservation is never clobbered.
+            client.eval(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                "return redis.call('DEL', KEYS[1]) end return 0",
+                1, key, token)
+        except Exception:
+            # Server without Lua scripting (e.g. fakeredis in tests):
+            # best-effort compare-then-delete.
+            if client.get(key) == token:
+                client.delete(key)
+        logger.info(
+            "Lifecycle '%s' reservation released for %s: no notice was delivered",
+            kind, agent,
+        )
+    except Exception as e:
+        logger.debug("Lifecycle notice release failed: %s", e)
+
+
+def lifecycle_notice_allowed(kind: str) -> bool:
+    """Back-compat boolean wrapper around :func:`reserve_lifecycle_notice`."""
+    return reserve_lifecycle_notice(kind) is not None
