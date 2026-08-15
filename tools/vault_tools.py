@@ -115,6 +115,45 @@ def _fetch_connections(background: bool = True) -> Optional[List[dict]]:
         return None
 
 
+def fetch_browser_credentials(conn_id: str) -> Dict[str, Any]:
+    """Fetch a browser-login connection's raw credentials for server-side
+    injection by the browser tool.
+
+    Returns {"username", "password", "login_url"} on success, or
+    {"error": "..."} on failure. The caller (browser tool) is responsible for
+    keeping these values out of the agent's LLM context, tool return payloads,
+    and logs — they must only reach the browser subprocess.
+    """
+    cid = (conn_id or "").strip().upper().replace(" ", "_").replace("-", "_")
+    if not VAULT_TOKEN:
+        return {"error": "VAULT_TOKEN not set — cannot reach the vault."}
+    try:
+        resp = _vault_http(
+            "POST", f"/api/vault/browser/{cid}/credentials", {}, timeout=15)
+        if not isinstance(resp, dict) or not resp.get("username"):
+            return {"error": "Vault returned no credentials for this connection."}
+        return {
+            "username": resp.get("username", ""),
+            "password": resp.get("password", ""),
+            "login_url": resp.get("login_url", ""),
+        }
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode() if e.fp else ""
+        except Exception:
+            pass
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        return {"error": f"Vault error ({e.code}): {detail}"}
+    except URLError as e:
+        return {"error": f"Cannot reach vault at {VAULT_URL}: {e.reason}."}
+    except Exception as e:
+        return {"error": f"Vault call failed: {e}"}
+
+
 def _proxy_call(conn_id: str, args: dict) -> str:
     """Execute an upstream API call through the vault proxy."""
     method = str(args.get("method") or "GET").upper()

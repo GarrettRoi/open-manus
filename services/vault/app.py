@@ -404,6 +404,12 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
         elif view["auth_kind"] == "basic":
             view["connected"] = bool(secrets_d.get("username") and secrets_d.get("api_key"))
             view["basic_username"] = secrets_d.get("username", "")
+        elif view["auth_kind"] == "browser":
+            view["connected"] = bool(secrets_d.get("username") and secrets_d.get("password"))
+            # Username + login URL are shown so the owner can identify the
+            # connection; the password never leaves the vault.
+            view["browser_username"] = secrets_d.get("username", "")
+            view["login_url"] = secrets_d.get("login_url", "")
         elif view["auth_kind"] == "amazon":
             view["connected"] = bool(secrets_d.get("associate_tag"))
             view["associate_tag"] = secrets_d.get("associate_tag", "")
@@ -426,7 +432,7 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
 # ---------------------------------------------------------------------------
 # Connection test engine
 # ---------------------------------------------------------------------------
-_UNTESTABLE_KINDS = {"apple", "macincloud", "email"}
+_UNTESTABLE_KINDS = {"apple", "macincloud", "email", "browser"}
 
 
 # ── Google-aware probe classification ────────────────────────────────────────
@@ -1254,6 +1260,23 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
         if not base_url:
             return RedirectResponse(url="/services?error=Site+URL+required", status_code=303)
         secrets_d = {"username": wp_username, "api_key": app_password}
+    elif auth["kind"] == "browser":
+        # Browser login: username/password stored for server-side injection
+        # into an interactive login by the agent's browser tool.
+        b_username = (form.get("browser_username") or "").strip()
+        b_password = form.get("browser_password") or ""
+        login_url = (form.get("login_url") or "").strip()
+        if not b_username or not b_password:
+            return RedirectResponse(
+                url="/services?error=Username+and+password+are+required",
+                status_code=303)
+        if not login_url or not login_url.startswith("https://"):
+            return RedirectResponse(
+                url="/services?error=Login+page+URL+is+required+and+must+use+HTTPS",
+                status_code=303)
+        secrets_d = {"username": b_username, "password": b_password,
+                     "login_url": login_url}
+        base_url = ""
     elif auth["kind"] == "amazon":
         associate_tag = (form.get("associate_tag") or "").strip()
         if not associate_tag:
@@ -1486,6 +1509,19 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
         if _wp_user:
             secrets_d["username"] = _wp_user
         # api_key rotation (application password) is handled generically above.
+    if (conn.get("auth") or {}).get("kind") == "browser":
+        _b_user = (form.get("browser_username") or "").strip()
+        if _b_user:
+            secrets_d["username"] = _b_user
+        _b_pass = form.get("browser_password") or ""
+        if _b_pass:
+            secrets_d["password"] = _b_pass
+        _b_url = (form.get("login_url") or "").strip()
+        if _b_url:
+            if not _b_url.startswith("https://"):
+                return RedirectResponse(
+                    url="/services?error=Login+URL+must+use+HTTPS", status_code=303)
+            secrets_d["login_url"] = _b_url
     if (conn.get("auth") or {}).get("kind") == "amazon":
         _tag = (form.get("associate_tag") or "").strip()
         if _tag:
@@ -2687,6 +2723,48 @@ async def google_operation(conn_id: str, request: Request, body: GoogleOperation
 # ---------------------------------------------------------------------------
 # Agent API — the proxy (the whole point)
 # ---------------------------------------------------------------------------
+@app.post("/api/vault/browser/{conn_id}/credentials")
+async def browser_credentials(conn_id: str, request: Request):
+    """Hand a browser-login connection's raw credentials to the agent's browser
+    tool for server-side injection into an interactive login.
+
+    This is the one deliberate exception to the vault's proxy-only rule: an
+    interactive browser login cannot be performed upstream by the vault, so the
+    username/password must reach the browser subprocess the agent runs. Access
+    is grant-gated and audited exactly like the proxy. The browser tool is
+    responsible for keeping these values out of the agent's LLM context, tool
+    return payloads, and logs.
+    """
+    agent_name = require_agent(request)
+    cid = normalize_id(conn_id)
+
+    if not store.has_grant(agent_name, cid):
+        audit_log(agent_name, cid, "browser_creds_denied", "No grant")
+        raise HTTPException(status_code=403,
+                            detail=f"Agent '{agent_name}' does not have access to '{cid}'")
+
+    conn = store.get(cid)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connection '{cid}' not found")
+    if (conn.get("auth") or {}).get("kind") != "browser":
+        raise HTTPException(
+            status_code=409,
+            detail=(f"'{cid}' is not a browser-login connection. This endpoint "
+                    "only serves connections created as 'Browser login'."))
+
+    secrets_d = store.get_secrets(cid)
+    username = secrets_d.get("username") or ""
+    password = secrets_d.get("password") or ""
+    login_url = secrets_d.get("login_url") or ""
+    if not username or not password:
+        raise HTTPException(status_code=409,
+                            detail=f"'{cid}' has no stored username/password")
+
+    audit_log(agent_name, cid, "browser_creds_issued",
+              f"login_url={login_url}")
+    return {"username": username, "password": password, "login_url": login_url}
+
+
 @app.post("/api/vault/proxy/{conn_id}")
 async def proxy_request(conn_id: str, request: Request):
     agent_name = require_agent(request)
@@ -3441,6 +3519,23 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
         if not base_url:
             raise HTTPException(status_code=400, detail="Site URL required (field: base_url)")
         secrets_d = {"username": wp_username, "api_key": app_password}
+    elif auth["kind"] == "browser":
+        # Update path: keep existing password if a new one isn't supplied.
+        existing = store.get_secrets(conn_id) or {}
+        b_username = (form.get("browser_username") or existing.get("username") or "").strip()
+        b_password = form.get("browser_password") or existing.get("password") or ""
+        login_url = (form.get("login_url") or existing.get("login_url") or "").strip()
+        if not b_username or not b_password:
+            raise HTTPException(
+                status_code=400,
+                detail="Username and password are required "
+                       "(fields: browser_username, browser_password)")
+        if not login_url or not login_url.startswith("https://"):
+            raise HTTPException(status_code=400,
+                                detail="login_url is required and must use HTTPS")
+        secrets_d = {"username": b_username, "password": b_password,
+                     "login_url": login_url}
+        base_url = ""
     elif auth["kind"] == "amazon":
         associate_tag = (form.get("associate_tag") or "").strip()
         if not associate_tag:
@@ -3670,6 +3765,20 @@ def _apply_connection_update(
             if fld in ("imap_port", "smtp_port") and not val.isdigit():
                 return conn, secrets_d, "Ports must be numbers"
             secrets_d[fld] = val
+
+    # ── browser: username/password/login_url edits (blank = keep) ─────────────
+    if (conn.get("auth") or {}).get("kind") == "browser":
+        _b_user = (str(body.get("browser_username") or body.get("username") or "")).strip()
+        if _b_user:
+            secrets_d["username"] = _b_user
+        _b_pass = body.get("browser_password") or body.get("password") or ""
+        if _b_pass:
+            secrets_d["password"] = _b_pass
+        _b_url = (str(body.get("login_url") or "")).strip()
+        if _b_url:
+            if not _b_url.startswith("https://"):
+                return conn, secrets_d, "Login URL must use HTTPS"
+            secrets_d["login_url"] = _b_url
 
     # ── mcp_bearer: HTTPS guard on URL edits; bearer token already handled above ─
     if (conn.get("auth") or {}).get("kind") == "mcp_bearer":

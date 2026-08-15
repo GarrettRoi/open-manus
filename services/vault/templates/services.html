@@ -154,6 +154,24 @@
             <small style="color:var(--text-muted);">Pair with an Application Password (WP Admin &rarr; Users &rarr; Profile &rarr; Application Passwords) entered in the key field above.</small>
         </div>
 
+        <div id="grp_browser" style="display:none;">
+            <div class="form-group">
+                <label>Login page URL</label>
+                <input type="url" name="login_url" placeholder="https://www.facebook.com/login">
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Username (or email)</label>
+                    <input type="text" name="browser_username" placeholder="the account login">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" name="browser_password" placeholder="agents will never see it">
+                </div>
+            </div>
+            <small style="color:var(--text-muted);">Stored encrypted. The browser tool fetches these server-side to log in; the raw values never reach the agent. Automated logins to sites like Facebook/Instagram may trigger security checkpoints or 2FA.</small>
+        </div>
+
         <div id="grp_amazon" style="display:none;">
             <div class="form-row">
                 <div class="form-group">
@@ -507,6 +525,22 @@
                 <input type="text" name="wp_username" id="e_wp_username">
                 <small style="color:var(--text-muted);">Rotate the Application Password via the key field above.</small>
             </div>
+            <div id="e_grp_browser" style="display:none;">
+                <div class="form-group">
+                    <label>Login page URL (leave blank to keep)</label>
+                    <input type="url" name="login_url" id="e_login_url">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Username / email (leave blank to keep)</label>
+                        <input type="text" name="browser_username" id="e_browser_username">
+                    </div>
+                    <div class="form-group">
+                        <label>New password (leave blank to keep)</label>
+                        <input type="password" name="browser_password">
+                    </div>
+                </div>
+            </div>
             <div id="e_grp_amazon" style="display:none;">
                 <div class="form-row">
                     <div class="form-group">
@@ -585,11 +619,13 @@ function onServiceChange() {
     const isMcp = tpl.auth.kind === 'mcp_bearer';
     const isBasic = tpl.auth.kind === 'basic';
     const isAmazon = tpl.auth.kind === 'amazon';
+    const isBrowser = tpl.auth.kind === 'browser';
     document.getElementById('grp_oauth').style.display = isOAuth ? '' : 'none';
-    document.getElementById('grp_api_key').style.display = (isOAuth || isEmail || isMcp || isAmazon) ? 'none' : '';
+    document.getElementById('grp_api_key').style.display = (isOAuth || isEmail || isMcp || isAmazon || isBrowser) ? 'none' : '';
     document.getElementById('grp_mcp_bearer').style.display = isMcp ? '' : 'none';
     document.getElementById('grp_wordpress').style.display = isBasic ? '' : 'none';
     document.getElementById('grp_amazon').style.display = isAmazon ? '' : 'none';
+    document.getElementById('grp_browser').style.display = isBrowser ? '' : 'none';
     if (isBasic) {
         document.getElementById('lbl_api_key').textContent = 'Application password';
     }
@@ -678,12 +714,19 @@ function openEdit(c) {
     const isMcp = c.auth_kind === 'mcp_bearer';
     const isBasicEdit = c.auth_kind === 'basic';
     const isAmazonEdit = c.auth_kind === 'amazon';
+    const isBrowserEdit = c.auth_kind === 'browser';
     const _editTpl = CATALOG[c.service] || {};
     const hasExtraSecretEdit = !!_editTpl.extra_secret;
     const isAlpacaEdit = c.service === 'alpaca';
-    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac || isAmazonEdit) ? 'none' : '';
+    document.getElementById('e_grp_key').style.display = (isOAuth || isEmail || isApple || isMac || isAmazonEdit || isBrowserEdit) ? 'none' : '';
     document.getElementById('e_grp_wordpress').style.display = isBasicEdit ? '' : 'none';
     document.getElementById('e_grp_amazon').style.display = isAmazonEdit ? '' : 'none';
+    document.getElementById('e_grp_browser').style.display = isBrowserEdit ? '' : 'none';
+    if (isBrowserEdit) {
+        document.getElementById('e_browser_username').placeholder = c.browser_username || '';
+        document.getElementById('e_login_url').placeholder = c.login_url || '';
+        document.getElementById('e_base_url').closest('.form-group').style.display = 'none';
+    }
     if (isBasicEdit) {
         document.getElementById('e_lbl_api_key').textContent =
             'New application password (leave blank to keep current)';

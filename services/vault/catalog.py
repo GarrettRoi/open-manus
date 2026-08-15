@@ -934,6 +934,31 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         # Generic fallback — GET / against the configured base URL
         "test_probe": {"method": "GET", "path": "/"},
     },
+    "browser_login": {
+        "label": "Browser login (username + password)",
+        # Not an HTTP-proxy credential: the raw username/password are handed to
+        # the agent's browser tool server-side so it can drive an interactive
+        # login. No upstream request is signed by the vault, so there is no
+        # host allowlist and no HTTP test probe.
+        "auth": {"kind": "browser"},
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "login_url", "label": "Login page URL",
+             "placeholder": "https://www.facebook.com/login", "required": True},
+        ],
+        "setup_help": (
+            "Store a website username/password so an agent can log in through "
+            "the browser tool WITHOUT ever seeing the credentials. Enter the "
+            "login page URL, the username (or email), and the password. The "
+            "agent calls browser_login with this connection's name; the browser "
+            "tool fetches the credentials from the vault, types them into the "
+            "login form, and the raw values never enter the agent's context or "
+            "logs. Note: automated logins to sites like Facebook/Instagram may "
+            "trigger security checkpoints or 2FA the agent cannot solve alone."
+        ),
+        "example_call": "browser_login(connection='FACEBOOK_MAIN')",
+    },
 }
 
 

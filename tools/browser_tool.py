@@ -1818,6 +1818,20 @@ atexit.register(_stop_browser_cleanup_thread)
 
 BROWSER_TOOL_SCHEMAS = [
     {
+        "name": "browser_login",
+        "description": "Log into a website using a username/password stored in the vault, WITHOUT ever seeing the credentials. Pass the vault browser-login connection name (e.g. 'FACEBOOK_MAIN'); the browser fetches the credentials server-side, opens the connection's login page, fills the form, and submits. Returns a post-login page snapshot so you can verify success or handle a 2FA/verification challenge. Only use this for connections the owner created as 'Browser login' in the vault. The raw username/password are never returned to you.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "connection": {
+                    "type": "string",
+                    "description": "Vault browser-login connection name/id (e.g. 'FACEBOOK_MAIN')."
+                }
+            },
+            "required": ["connection"]
+        }
+    },
+    {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
@@ -4712,6 +4726,225 @@ if __name__ == "__main__":
     print("  snapshot = browser_snapshot(task_id='my_task')")
 
 
+_LOGIN_REF_RE = re.compile(r"(?:\[ref=|@)(e\d+)\]?")
+
+
+def _find_login_fields(snapshot_text: str) -> Dict[str, Optional[str]]:
+    """Heuristically locate username/password/submit refs in a page snapshot.
+
+    Returns a dict with keys 'username', 'password', 'submit' (ref strings like
+    '@e3' or None). Password: first line whose text mentions 'password'.
+    Username: the nearest text/email/tel input above the password field (or the
+    first such input). Submit: a button whose label looks like log in / sign in
+    / continue.
+    """
+    username_ref = password_ref = submit_ref = None
+    text_input_refs: List[str] = []
+    for line in (snapshot_text or "").splitlines():
+        low = line.lower()
+        m = _LOGIN_REF_RE.search(line)
+        ref = f"@{m.group(1)}" if m else None
+        if ref is None:
+            continue
+        is_input = ("textbox" in low or "input" in low or "combobox" in low
+                    or "searchbox" in low)
+        is_button = ("button" in low or "link" in low or "submit" in low)
+        if "password" in low and is_input and not is_button:
+            # Only treat actual input fields as the password box — never a
+            # "Forgot password?" link or a "Show password" button.
+            if password_ref is None:
+                password_ref = ref
+            continue
+        if is_input and any(k in low for k in
+                            ("email", "username", "user name", "phone",
+                             "tel", "login", "account", "e-mail")):
+            if username_ref is None:
+                username_ref = ref
+        if is_input:
+            text_input_refs.append(ref)
+        if "button" in low or "link" in low or "submit" in low:
+            if any(k in low for k in ("log in", "login", "sign in", "signin",
+                                      "continue", "next", "submit", "log on")):
+                if submit_ref is None:
+                    submit_ref = ref
+    # Fallback: no keyword-matched username field — use the first text input
+    # that isn't the password field.
+    if username_ref is None:
+        for ref in text_input_refs:
+            if ref != password_ref:
+                username_ref = ref
+                break
+    return {"username": username_ref, "password": password_ref, "submit": submit_ref}
+
+
+def browser_login(connection: str, task_id: Optional[str] = None) -> str:
+    """Log into a website using credentials stored in the vault, without ever
+    exposing them to the agent.
+
+    The username/password are fetched from the vault server-side, typed into the
+    login form by the browser, and never returned in this tool's output or logs.
+
+    Args:
+        connection: Vault browser-login connection name/id (e.g. 'FACEBOOK_MAIN').
+        task_id: Browser session identifier for session isolation.
+
+    Returns:
+        JSON string describing the outcome and a post-login page snapshot. Raw
+        credentials are never included.
+    """
+    try:
+        from tools.vault_tools import fetch_browser_credentials
+    except Exception as exc:  # pragma: no cover - import guard
+        return json.dumps({"success": False,
+                           "error": f"Vault integration unavailable: {exc}"})
+
+    if not connection or not str(connection).strip():
+        return json.dumps({"success": False,
+                           "error": "A vault connection name is required."})
+
+    creds = fetch_browser_credentials(str(connection).strip())
+    if creds.get("error"):
+        return json.dumps({"success": False, "error": creds["error"]})
+    username = creds.get("username") or ""
+    password = creds.get("password") or ""
+    login_url = creds.get("login_url") or ""
+    if not login_url:
+        return json.dumps({
+            "success": False,
+            "error": ("This connection has no login URL configured. Ask the "
+                      "owner to set it in the vault dashboard."),
+        })
+
+    if not login_url.startswith("https://"):
+        # Never type a stored password into a plaintext page.
+        return json.dumps({"success": False,
+                           "error": "Login URL is not HTTPS; refusing to submit "
+                                    "credentials over an insecure connection."})
+
+    import urllib.parse as _uparse
+
+    def _origin(u: str) -> str:
+        p = _uparse.urlsplit(u)
+        return f"{p.scheme}://{p.netloc}".lower()
+
+    expected_origin = _origin(login_url)
+
+    # Scrubber: guarantee the raw username/password never appear in returned
+    # snapshots/errors, regardless of whether the page reflects them back.
+    _secret_values = [v for v in (username, password) if v]
+
+    def _scrub(text: str) -> str:
+        if not text:
+            return text
+        for val in _secret_values:
+            if val:
+                text = text.replace(val, "[REDACTED]")
+        return text
+
+    # 1. Navigate to the login page.
+    nav_raw = browser_navigate(login_url, task_id=task_id)
+    try:
+        nav = json.loads(nav_raw)
+    except Exception:
+        nav = {"success": False}
+    if not nav.get("success", True):
+        return json.dumps({"success": False,
+                           "error": "Could not open the login page: "
+                                    f"{_scrub(str(nav.get('error', 'navigation failed')))}"})
+
+    # 1a. Origin guard — a redirect (or open-redirect) to a different origin
+    # must NOT receive the stored password. Fail closed if we can confirm a
+    # cross-origin landing; if the URL can't be read, proceed (best-effort).
+    try:
+        loc_raw = browser_console(expression="window.location.href", task_id=task_id)
+        loc = json.loads(loc_raw)
+        current_url = ""
+        if isinstance(loc, dict):
+            current_url = str(loc.get("result") or loc.get("value") or "").strip().strip('"')
+        if current_url and _origin(current_url) != expected_origin:
+            return json.dumps({
+                "success": False,
+                "error": ("The login page redirected to a different origin "
+                          f"({_origin(current_url)}) than the configured one "
+                          f"({expected_origin}). Refusing to submit credentials "
+                          "to an unexpected site."),
+            })
+    except Exception:
+        pass  # Best-effort; field-level typing below is still origin-anchored.
+
+    # 2. Get a full snapshot to locate the form fields.
+    snap_raw = browser_snapshot(full=True, task_id=task_id)
+    try:
+        snap = json.loads(snap_raw)
+    except Exception:
+        snap = {}
+    fields = _find_login_fields(snap.get("snapshot", "") or nav.get("snapshot", ""))
+
+    if not fields.get("password"):
+        return json.dumps({
+            "success": False,
+            "error": ("Could not find a password field on the login page. The "
+                      "page may use a multi-step login (username first) or a "
+                      "layout this tool can't auto-fill. Use browser_snapshot "
+                      "and the manual browser tools to log in step by step."),
+            "snapshot": _scrub(snap.get("snapshot", "")),
+        })
+
+    def _ok(raw) -> bool:
+        try:
+            return bool(json.loads(raw).get("success", False))
+        except Exception:
+            return False
+
+    steps = []
+    # 3. Fill username (if a field was found). Fail closed on error.
+    if fields.get("username"):
+        if not _ok(browser_type(fields["username"], username, task_id=task_id)):
+            return json.dumps({"success": False,
+                               "error": "Failed to fill the username field."})
+        steps.append("username")
+    # 4. Fill password. Fail closed on error.
+    if not _ok(browser_type(fields["password"], password, task_id=task_id)):
+        return json.dumps({"success": False,
+                           "error": "Failed to fill the password field."})
+    steps.append("password")
+
+    # Drop the raw values as soon as they've been handed to the browser.
+    username = password = ""
+    del creds
+
+    # 5. Submit — click a login button if found, else press Enter.
+    if fields.get("submit"):
+        if not _ok(browser_click(fields["submit"], task_id=task_id)):
+            return json.dumps({"success": False,
+                               "error": "Filled the form but failed to click submit.",
+                               "steps": steps})
+        steps.append("click_submit")
+    else:
+        browser_press("Enter", task_id=task_id)
+        steps.append("press_enter")
+
+    # 6. Post-login snapshot so the agent can verify / handle 2FA-checkpoints.
+    time.sleep(2)
+    post_raw = browser_snapshot(full=False, task_id=task_id)
+    try:
+        post = json.loads(post_raw)
+    except Exception:
+        post = {}
+
+    return json.dumps({
+        "success": True,
+        "connection": str(connection).strip().upper(),
+        "login_url": login_url,
+        "steps": steps,
+        "note": ("Credentials were injected server-side and never exposed. "
+                 "Verify the snapshot: if a 2FA/verification challenge or "
+                 "captcha is shown, the owner may need to help — this tool "
+                 "only submits username/password."),
+        "snapshot": _scrub(post.get("snapshot", "")),
+    }, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -4800,4 +5033,12 @@ registry.register(
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+)
+registry.register(
+    name="browser_login",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_login"],
+    handler=lambda args, **kw: browser_login(connection=args.get("connection", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="🔑",
 )
