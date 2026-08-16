@@ -93,6 +93,16 @@ display:
 # =============================================================================
 # Skills Configuration
 # =============================================================================
+# =============================================================================
+# Task→model routing (see hermes_cli/model_routing.py)
+# `economy` is the fleet-standard vetted cheap model used when the owner
+# approves downshifting recurring work via the model_routing tool.
+# =============================================================================
+routing:
+  cron_job: "deepseek/deepseek-chat"
+  background_task: "google/gemini-2.5-flash-preview"
+  economy: "deepseek/deepseek-chat"
+
 skills:
   # Directories to scan for skills
   directories:

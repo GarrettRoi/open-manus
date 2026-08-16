@@ -70,3 +70,4 @@ skills:
 routing:
   cron_job: deepseek/deepseek-chat
   background_task: google/gemini-2.5-flash-preview
+  economy: deepseek/deepseek-chat

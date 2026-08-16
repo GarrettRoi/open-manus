@@ -40,6 +40,7 @@ ROUTING_CATEGORIES = (
     "chat",              # main conversational traffic (rarely set; primary wins)
     "delegation",        # delegated subagents without an explicit delegation.model
     "multimodal",        # vision / image analysis auxiliary tasks
+    "economy",           # vetted cheap model for owner-approved downshifts
 )
 
 # When a category has no rule, these are tried in order before giving up.
@@ -51,6 +52,9 @@ CATEGORY_FALLBACKS: Dict[str, tuple] = {
     "background_task": (),
     "code": (),
     "chat": (),
+    # Downshift target: when no explicit economy rule exists, fall back to
+    # the cheap models the agent already routes background work to.
+    "economy": ("cron_job", "background_task"),
 }
 
 # Auxiliary task name → routing category. Any auxiliary task not listed
@@ -138,6 +142,17 @@ def resolve_routed_model(
         if rule:
             return dict(rule)
     return None
+
+
+def resolve_economy_model(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Resolve the vetted economy-tier model for owner-approved downshifts.
+
+    Reads ``routing.economy`` (falling back to ``cron_job`` →
+    ``background_task``) so agents downshift to an operator-vetted cheap
+    model instead of inventing one. Returns ``{"model", "provider"}`` or
+    ``None`` when nothing cheap is configured (downshift must then refuse).
+    """
+    return resolve_routed_model(cfg, "economy")
 
 
 def resolve_routed_model_for_aux_task(
