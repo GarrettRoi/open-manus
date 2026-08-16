@@ -155,6 +155,33 @@ def resolve_economy_model(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, s
     return resolve_routed_model(cfg, "economy")
 
 
+def resolve_primary_model(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Resolve the agent's PRIMARY (strong) model, bypassing routing rules.
+
+    Mirrors the cron model-resolution precedence for unpinned jobs minus the
+    routing step: ``HERMES_MODEL`` env > config ``model:`` (string or
+    ``{default: ...}`` mapping). Used by economy-tier escalation so a
+    downshifted job that was originally UNPINNED still escalates to the true
+    strong model instead of re-resolving the cheap ``cron_job`` routing rule.
+    Returns ``{"model", "provider"}`` (provider may be ``""``) or ``None``.
+    """
+    import os
+    env_model = (os.getenv("HERMES_MODEL") or "").strip()
+    if env_model:
+        return {"model": env_model, "provider": ""}
+    model_cfg = (cfg or {}).get("model")
+    if isinstance(model_cfg, str) and model_cfg.strip():
+        return {"model": model_cfg.strip(), "provider": ""}
+    if isinstance(model_cfg, dict):
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        if model:
+            return {
+                "model": model,
+                "provider": str(model_cfg.get("provider") or "").strip(),
+            }
+    return None
+
+
 def resolve_routed_model_for_aux_task(
     cfg: Optional[Dict[str, Any]],
     task: str,

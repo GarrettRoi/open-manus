@@ -65,14 +65,32 @@ def is_downshifted(job: Dict[str, Any]) -> bool:
 def escalation_target(job: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """(provider, model) to escalate a downshifted job's run back to.
 
-    Empty strings mean "the job was unpinned before the downshift" — the
-    caller should clear the per-job pin so normal config resolution applies.
+    When the job was UNPINNED before the downshift, resolves the agent's
+    PRIMARY model (``HERMES_MODEL`` env > config ``model:``) — deliberately
+    bypassing the ``routing.cron_job`` rule, which for unpinned jobs would
+    re-resolve the same cheap model and make the "escalation" a no-op.
+    Returns (None, None) only when no primary model can be resolved either.
     """
     state = economy_state(job)
-    return (
-        (state.get("previous_provider") or "").strip() or None,
-        (state.get("previous_model") or "").strip() or None,
-    )
+    prev_provider = (state.get("previous_provider") or "").strip() or None
+    prev_model = (state.get("previous_model") or "").strip() or None
+    if prev_model:
+        return prev_provider, prev_model
+    primary = _resolve_primary()
+    if primary:
+        return (primary.get("provider") or None), primary["model"]
+    return None, None
+
+
+def _resolve_primary() -> Optional[Dict[str, str]]:
+    """Primary-model resolution for escalation; None when unavailable."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routing import resolve_primary_model
+        return resolve_primary_model(load_config() or {})
+    except Exception as e:  # pragma: no cover - config load env issues
+        logger.warning("economy: primary model resolution failed: %s", e)
+        return None
 
 
 def apply_downshift(
@@ -144,6 +162,11 @@ def revert_downshift(
     ``source`` is ``"owner"`` (owner feedback) or ``"auto"`` (repeated run
     escalations). Returns ``{"job_id", "name", "old_model", "new_model"}``
     or ``None`` if the job is missing or not downshifted.
+
+    A job that was UNPINNED before the downshift gets pinned to the PRIMARY
+    model instead of merely un-pinning: leaving it unpinned would re-resolve
+    the cheap ``routing.cron_job`` rule, so "moved back to the stronger
+    model" would silently keep running the economy tier.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -156,8 +179,12 @@ def revert_downshift(
             old_model = job.get("model") or "(default/routing)"
             prev_model = (state.get("previous_model") or "").strip()
             prev_provider = (state.get("previous_provider") or "").strip()
-            # Restore both pins exactly as they were before the downshift —
-            # an empty previous value means "was unpinned", so clear it.
+            if not prev_model:
+                primary = _resolve_primary()
+                if primary and primary.get("model"):
+                    prev_model = primary["model"]
+                    prev_provider = (primary.get("provider") or "").strip()
+            # Restore both pins (empty = leave unpinned as a last resort).
             job["model"] = prev_model or None
             job["provider"] = prev_provider or None
             state["active"] = False

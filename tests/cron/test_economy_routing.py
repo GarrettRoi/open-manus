@@ -85,14 +85,18 @@ class TestDownshiftPersistence:
         assert not is_downshifted(stored)
         assert stored["economy_routing"]["reverted_by"] == "owner"
 
-    def test_revert_unpinned_clears_model_pin(self, temp_home):
+    def test_revert_unpinned_job_pins_primary_model(self, temp_home):
+        """Reverting a job that was unpinned before the downshift must PIN the
+        primary model — leaving it unpinned would re-resolve the cheap
+        routing.cron_job rule and keep it on the economy tier."""
         from cron.economy import apply_downshift, revert_downshift
         from cron.jobs import get_job
 
         job = _make_job()
         apply_downshift(job["id"], model="cheap", provider=None)
         revert_downshift(job["id"], source="auto")
-        assert not get_job(job["id"]).get("model")
+        # conftest pins HERMES_MODEL=test-cron-default-model as the primary
+        assert get_job(job["id"])["model"] == "test-cron-default-model"
 
     def test_downshift_clears_foreign_provider_pin(self, temp_home):
         """A bare-string economy rule must not send the economy model to the
@@ -128,6 +132,43 @@ class TestDownshiftPersistence:
         stored = get_job(job["id"])
         assert stored["model"] == "strong"
         assert stored.get("provider") is None
+
+    def test_escalation_target_for_unpinned_job_is_primary_not_routing(self, temp_home, monkeypatch):
+        """Regression: with routing.cron_job == routing.economy (fleet default),
+        an unpinned downshifted job must escalate to the PRIMARY model, never
+        re-resolve the cheap routing rule."""
+        from cron import economy
+        from cron.economy import apply_downshift, escalation_target
+        from cron.jobs import get_job
+
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        monkeypatch.setattr(
+            economy, "_resolve_primary",
+            lambda: {"model": "anthropic/claude-opus-4.6", "provider": "openrouter"},
+        )
+        job = _make_job()  # unpinned → routing.cron_job would apply
+        apply_downshift(job["id"], model="deepseek/deepseek-chat", provider=None)
+        provider, model = escalation_target(get_job(job["id"]))
+        assert model == "anthropic/claude-opus-4.6"
+        assert provider == "openrouter"
+
+    def test_auto_pin_of_unpinned_job_pins_primary(self, temp_home, monkeypatch):
+        """Auto-pin after repeated escalations must leave the job PINNED to the
+        primary model so the owner notice ('will stay on the stronger model')
+        is true even when routing.cron_job == routing.economy."""
+        from cron import economy
+        from cron.economy import apply_downshift, revert_downshift
+        from cron.jobs import get_job
+
+        monkeypatch.setattr(
+            economy, "_resolve_primary",
+            lambda: {"model": "primary-strong", "provider": ""},
+        )
+        job = _make_job()
+        apply_downshift(job["id"], model="deepseek/deepseek-chat", provider=None)
+        res = revert_downshift(job["id"], source="auto")
+        assert res["new_model"] == "primary-strong"
+        assert get_job(job["id"])["model"] == "primary-strong"
 
     def test_revert_not_downshifted_returns_none(self, temp_home):
         from cron.economy import revert_downshift
