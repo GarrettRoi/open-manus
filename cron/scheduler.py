@@ -1,8 +1,4 @@
-b.get("id", "?"), e)
-
-    # Wake-gate: if this job has a pre-check script, run it BEFORE building
-    # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
-    # the whole agent run. We pass the result into _build_job_prompt so
+ so
     # the script is only executed once.
     prerun_script = None
     script_path = job.get("script")
@@ -809,42 +805,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
-        _escalated_run = False
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
-
-            # Automatic escalation for downshifted (economy-tier) jobs: a
-            # failed or empty run is retried ONCE on the model the job ran
-            # on before the downshift (or the config default when it was
-            # unpinned). Bookkeeping + auto-pin happens after mark_job_run
-            # below. Guarded so escalation can never break normal firing.
-            try:
-                from cron import economy as _economy
-                _initial_failed = (not success) or not (final_response or "").strip()
-                if _initial_failed and not job.get("no_agent") and _economy.is_downshifted(job):
-                    _esc_provider, _esc_model = _economy.escalation_target(job)
-                    _esc_job = dict(job)
-                    # Restore BOTH pre-downshift pins exactly: None means the
-                    # job was unpinned, so the retry resolves the normal
-                    # config default — never the economy job's provider.
-                    _esc_job["model"] = _esc_model
-                    _esc_job["provider"] = _esc_provider
-                    logger.warning(
-                        "Job '%s': economy-tier run failed (%s) — retrying once "
-                        "on %s", job["id"], error or "empty response",
-                        _esc_model or "config default model",
-                    )
-                    _escalated_run = True
-                    success, output, final_response, error = run_job(
-                        _esc_job, defer_agent_teardown=_deferred_agents
-                    )
-            except Exception as _esc_exc:
-                logger.error(
-                    "Job '%s': economy escalation retry failed: %s",
-                    job["id"], _esc_exc,
-                )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -856,6 +820,47 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        # Economy-tier escalation (agent-driven cheap-LLM routing): when a
+        # DOWNSHIFTED job's run failed or produced an empty response, retry
+        # ONCE on the job's pre-downshift (strong) model before delivery.
+        # Exception-guarded so escalation can never break normal firing.
+        _escalated_run = False
+        try:
+            from cron import economy as _economy
+            _initial_failed = (not success) or not (final_response or "").strip()
+            if (
+                _initial_failed
+                and not job.get("no_agent")
+                and _economy.is_downshifted(job)
+            ):
+                _esc_provider, _esc_model = _economy.escalation_target(job)
+                logger.info(
+                    "Job '%s': economy run failed (%s) — escalating to %s",
+                    job["id"], error or "empty response",
+                    _esc_model or "(config default)",
+                )
+                _escalated_run = True
+                _esc_job = dict(job)
+                # Restore BOTH pre-downshift pins exactly: None means the
+                # job was unpinned, so the retry resolves the normal
+                # config default — never the economy job's provider.
+                _esc_job["model"] = _esc_model
+                _esc_job["provider"] = _esc_provider
+                _scope_token = set_secret_scope(
+                    build_profile_secret_scope(_get_hermes_home())
+                )
+                try:
+                    success, output, final_response, error = run_job(
+                        _esc_job, defer_agent_teardown=_deferred_agents
+                    )
+                finally:
+                    reset_secret_scope(_scope_token)
+        except Exception as _esc_exc:
+            logger.error(
+                "Job '%s': economy escalation retry failed: %s",
+                job["id"], _esc_exc,
+            )
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -913,7 +918,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Economy-tier bookkeeping: record this run's outcome on downshifted
         # jobs and auto-pin back to the strong model after repeated
         # escalations, notifying the owner. Best-effort — must never affect
-        # the run result.
+        # the run result. Runs AFTER mark_job_run so its job rewrite cannot
+        # clobber the economy state (both use the same jobs lock).
         try:
             from cron import economy as _economy
             if _economy.is_downshifted(job):
