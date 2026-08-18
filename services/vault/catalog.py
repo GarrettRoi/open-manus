@@ -40,6 +40,19 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "GET /v1/voices",
         "test_probe": {"method": "GET", "path": "/v1/voices"},
     },
+    "fal": {
+        "label": "FAL.ai (image/media generation)",
+        "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Key "},
+        "base_url": "https://queue.fal.run",
+        "allowed_hosts": ["queue.fal.run", "fal.run", "rest.alpha.fal.ai"],
+        "setup_help": (
+            "Paste an API key from https://fal.ai/dashboard/keys. Agents "
+            "submit generation jobs through the vault proxy; the key stays "
+            "server-side and never enters agent context."
+        ),
+        "example_call": "POST /fal-ai/flux-2/klein/9b",
+        "test_probe": {"method": "GET", "path": "https://rest.alpha.fal.ai/billing/user_balance"},
+    },
     "discord": {
         "label": "Discord API",
         "auth": {"kind": "header", "header_name": "Authorization", "prefix": "Bot "},

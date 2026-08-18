@@ -59,6 +59,127 @@ def _normalize_fal_queue_url_format(queue_run_origin: str) -> str:
     return f"{normalized_origin}/"
 
 
+class VaultFalRequestHandle:
+    """Request handle for FAL jobs submitted through the vault proxy.
+
+    Mimics the ``fal_client`` handle contract callers rely on: ``.get()``
+    blocks until the queue job completes and returns the result payload.
+    The FAL credential lives only in the vault; every HTTP call here goes
+    through ``/api/vault/proxy/{conn_id}`` and the vault scrubs the stored
+    key from responses.
+    """
+
+    _TERMINAL_ERROR_STATUSES = {"ERROR", "FAILED", "CANCELLED"}
+
+    def __init__(
+        self,
+        vault_http: Any,
+        conn_id: str,
+        submit_response: Dict[str, Any],
+        *,
+        poll_interval: float = 2.0,
+        timeout: float = 600.0,
+    ):
+        self._vault_http = vault_http
+        self._conn_id = conn_id
+        self._poll_interval = poll_interval
+        self._timeout = timeout
+        self.request_id = str(submit_response.get("request_id") or "")
+        self._status_url = str(submit_response.get("status_url") or "")
+        self._response_url = str(submit_response.get("response_url") or "")
+        if not self.request_id or not self._response_url:
+            raise ValueError(
+                "Vault FAL submit returned no request_id/response_url — "
+                f"unexpected queue response keys: {sorted(submit_response)}"
+            )
+
+    def _proxy(self, method: str, path: str, json_body: Optional[Dict[str, Any]] = None,
+               timeout: float = 60.0) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"method": method, "path": path, "timeout": timeout}
+        if json_body is not None:
+            payload["json"] = json_body
+        resp = self._vault_http(
+            "POST", f"/api/vault/proxy/{self._conn_id}", payload,
+            timeout=timeout + 15,
+        )
+        if not isinstance(resp, dict):
+            raise ValueError(f"Vault proxy returned non-JSON response for {path}")
+        if resp.get("error"):
+            raise ValueError(f"Vault FAL proxy error: {resp['error']}")
+        status = resp.get("status")
+        if not isinstance(status, int) or status >= 400:
+            detail = resp.get("json") or resp.get("text") or ""
+            raise ValueError(
+                f"FAL request via vault failed (HTTP {status}): {str(detail)[:500]}"
+            )
+        body = resp.get("json")
+        if not isinstance(body, dict):
+            raise ValueError(f"FAL returned a non-JSON body via vault for {path}")
+        return body
+
+    def get(self) -> Dict[str, Any]:
+        """Block until the queue job finishes; return the result payload."""
+        import time as _time
+        deadline = _time.monotonic() + self._timeout
+        status_path = self._status_url or f"{self._response_url}/status"
+        while True:
+            status_body = self._proxy("GET", status_path, timeout=30.0)
+            state = str(status_body.get("status") or "").upper()
+            if state == "COMPLETED":
+                break
+            if state in self._TERMINAL_ERROR_STATUSES:
+                raise ValueError(
+                    f"FAL request {self.request_id} ended in state {state}: "
+                    f"{str(status_body)[:500]}"
+                )
+            if _time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"FAL request {self.request_id} did not complete within "
+                    f"{int(self._timeout)}s (last state: {state or 'unknown'})"
+                )
+            _time.sleep(self._poll_interval)
+        return self._proxy("GET", self._response_url, timeout=60.0)
+
+
+def submit_fal_via_vault(
+    vault_http: Any,
+    conn_id: str,
+    model: str,
+    arguments: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+) -> VaultFalRequestHandle:
+    """Submit a FAL queue job through the vault proxy and return a handle.
+
+    ``headers`` (e.g. the idempotency key) are forwarded as caller headers;
+    the vault strips anything auth-ish and injects the stored key itself.
+    """
+    payload: Dict[str, Any] = {
+        "method": "POST",
+        "path": "/" + str(model).strip("/"),
+        "json": arguments,
+        "timeout": 60,
+    }
+    if headers:
+        payload["headers"] = dict(headers)
+    resp = vault_http(
+        "POST", f"/api/vault/proxy/{conn_id}", payload, timeout=75,
+    )
+    if not isinstance(resp, dict):
+        raise ValueError("Vault proxy returned a non-JSON response for FAL submit")
+    if resp.get("error"):
+        raise ValueError(f"Vault FAL proxy error: {resp['error']}")
+    status = resp.get("status")
+    if not isinstance(status, int) or status >= 400:
+        detail = resp.get("json") or resp.get("text") or ""
+        raise ValueError(
+            f"FAL submit via vault failed (HTTP {status}): {str(detail)[:500]}"
+        )
+    body = resp.get("json")
+    if not isinstance(body, dict):
+        raise ValueError("FAL submit via vault returned a non-JSON body")
+    return VaultFalRequestHandle(vault_http, conn_id, body)
+
+
 def _extract_http_status(exc: BaseException) -> Optional[int]:
     """Return an HTTP status code from httpx/fal exceptions, else None.
 

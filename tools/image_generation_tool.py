@@ -61,6 +61,7 @@ from tools.fal_common import (
     _ManagedFalSyncClient,
     _extract_http_status,
     _normalize_fal_queue_url_format,  # noqa: F401 — re-exported for tests
+    submit_fal_via_vault,
 )
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
@@ -481,11 +482,38 @@ def _get_managed_fal_client(managed_gateway):
         return _managed_fal_client
 
 
+def _resolve_vault_fal_connection() -> Optional[str]:
+    """Return the vault FAL connection id when vault routing is configured.
+
+    Configured means: VAULT_FAL_CONNECTION names a vault connection AND the
+    agent has vault access (VAULT_TOKEN). When active, the FAL key lives only
+    in the vault — this process never holds or sees it.
+    """
+    conn_id = (os.environ.get("VAULT_FAL_CONNECTION") or "").strip()
+    if not conn_id:
+        return None
+    if not (os.environ.get("VAULT_TOKEN") or "").strip():
+        return None
+    return conn_id.upper().replace(" ", "_").replace("-", "_")
+
+
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
-    """Submit a FAL request using direct credentials or the managed queue gateway."""
+    """Submit a FAL request via the vault proxy, direct credentials, or the
+    managed queue gateway (in that order of preference)."""
+    request_headers = {"x-idempotency-key": str(uuid.uuid4())}
+
+    vault_conn = _resolve_vault_fal_connection()
+    if vault_conn is not None:
+        # Vault-routed path: credentials stay server-side in the vault.
+        # No fallback to other backends on failure — surfacing the vault
+        # error is more useful than silently switching credential sources.
+        from tools.vault_tools import _vault_http
+        return submit_fal_via_vault(
+            _vault_http, vault_conn, model, arguments, headers=request_headers,
+        )
+
     # Trigger the lazy import on first call. Idempotent.
     _load_fal_client()
-    request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
         return fal_client.submit(model, arguments=arguments, headers=request_headers)
@@ -927,7 +955,8 @@ def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
-        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
+        if not (_resolve_vault_fal_connection() or fal_key_is_configured()
+                or _resolve_managed_fal_gateway()):
             raise ValueError(_build_no_backend_setup_message())
 
         # If the caller supplied source images but the active model has no
@@ -1134,8 +1163,13 @@ def _save_image_locally(image_url: str, output_format: Optional[str] = None) -> 
 
 
 def check_fal_api_key() -> bool:
-    """True if the FAL.ai API key (direct or managed gateway) is available."""
-    return bool(fal_key_is_configured() or _resolve_managed_fal_gateway())
+    """True if a FAL.ai backend (vault-routed, direct key, or managed gateway)
+    is available."""
+    return bool(
+        _resolve_vault_fal_connection()
+        or fal_key_is_configured()
+        or _resolve_managed_fal_gateway()
+    )
 
 
 def _build_no_backend_setup_message() -> str:
@@ -1163,7 +1197,12 @@ def _build_no_backend_setup_message() -> str:
     lines.append("")
     lines.append("To enable image generation, do one of:")
     lines.append(
-        "  1. Get a free API key at https://fal.ai and set "
+        "  1. Vault-routed (recommended): add a FAL connection in the vault "
+        "and set VAULT_FAL_CONNECTION=<connection-name> — the key stays "
+        "server-side and never enters agent context"
+    )
+    lines.append(
+        "  2. Get a free API key at https://fal.ai and set "
         "FAL_KEY=<your-key> (then restart the session)"
     )
     if managed_nous_tools_enabled():
