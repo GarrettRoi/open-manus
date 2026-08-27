@@ -1306,6 +1306,25 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     )
 
 
+def pause_all_jobs(reason: Optional[str] = None) -> int:
+    """Atomically pause every enabled job and return the affected count."""
+    paused_at = _hermes_now().isoformat()
+    with _jobs_lock():
+        jobs = load_jobs()
+        affected = 0
+        for job in jobs:
+            if not job.get("enabled", True):
+                continue
+            job["enabled"] = False
+            job["state"] = "paused"
+            job["paused_at"] = paused_at
+            job["paused_reason"] = reason
+            affected += 1
+        if affected:
+            _save_jobs_unlocked(jobs)
+        return affected
+
+
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)

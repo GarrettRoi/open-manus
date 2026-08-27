@@ -125,3 +125,40 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
     # Once the child has released, the lock is freely acquirable again.
     with jobs._jobs_lock():
         pass
+
+
+def test_pause_all_mutates_and_saves_inside_jobs_lock(tmp_path, monkeypatch):
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    jobs.save_jobs([
+        {"id": "active", "enabled": True, "state": "scheduled"},
+        {"id": "paused", "enabled": False, "state": "paused"},
+    ])
+
+    lock_held = False
+    real_lock = jobs._jobs_lock
+    real_save = jobs._save_jobs_unlocked
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def tracked_lock():
+        nonlocal lock_held
+        with real_lock():
+            lock_held = True
+            try:
+                yield
+            finally:
+                lock_held = False
+
+    def checked_save(records):
+        assert lock_held, "bulk pause saved outside _jobs_lock"
+        real_save(records)
+
+    monkeypatch.setattr(jobs, "_jobs_lock", tracked_lock)
+    monkeypatch.setattr(jobs, "_save_jobs_unlocked", checked_save)
+
+    assert jobs.pause_all_jobs(reason="test") == 1
+    assert jobs.load_jobs()[0]["enabled"] is False

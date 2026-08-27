@@ -5070,6 +5070,26 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_stop(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/stop", "Stop requested~")
 
+        @tree.command(name="cron-off", description="Pause all active cron jobs")
+        async def slash_cron_off(interaction: discord.Interaction):
+            if not await self._check_slash_authorization(interaction, "/cron-off"):
+                return
+            try:
+                from cron.jobs import pause_all_jobs
+
+                count = pause_all_jobs(reason="paused via Discord /cron-off")
+                if count:
+                    content = (
+                        f"Paused {count} active cron job"
+                        f"{'s' if count != 1 else ''}."
+                    )
+                else:
+                    content = "No active cron jobs to pause."
+            except Exception:
+                logger.exception("[%s] /cron-off failed", self.name)
+                content = "Failed to pause cron jobs. No changes were confirmed."
+            await interaction.response.send_message(content, ephemeral=True)
+
         @tree.command(name="steer", description="Inject a message after the next tool call (no interrupt)")
         @discord.app_commands.describe(prompt="Text to inject into the agent's next tool result")
         async def slash_steer(interaction: discord.Interaction, prompt: str):

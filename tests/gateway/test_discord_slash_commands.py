@@ -158,6 +158,69 @@ async def test_registers_native_restart_slash_command(adapter):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(3, "Paused 3 active cron jobs."), (0, "No active cron jobs to pause.")],
+)
+async def test_cron_off_pauses_locally_with_ephemeral_feedback(
+    adapter, count, expected,
+):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    with patch("cron.jobs.pause_all_jobs", return_value=count) as pause_all:
+        await adapter._client.tree.commands["cron-off"](interaction)
+
+    adapter._check_slash_authorization.assert_awaited_once_with(
+        interaction, "/cron-off",
+    )
+    pause_all.assert_called_once_with(reason="paused via Discord /cron-off")
+    interaction.response.send_message.assert_awaited_once_with(
+        expected, ephemeral=True,
+    )
+    adapter._run_simple_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cron_off_rejects_unauthorized_without_mutation(adapter):
+    adapter._check_slash_authorization = AsyncMock(return_value=False)
+    adapter._register_slash_commands()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    with patch("cron.jobs.pause_all_jobs") as pause_all:
+        await adapter._client.tree.commands["cron-off"](interaction)
+
+    pause_all.assert_not_called()
+    interaction.response.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cron_off_reports_failure_ephemerally(adapter):
+    adapter._register_slash_commands()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    with patch("cron.jobs.pause_all_jobs", side_effect=RuntimeError("disk error")):
+        await adapter._client.tree.commands["cron-off"](interaction)
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "Failed to pause cron jobs. No changes were confirmed.",
+        ephemeral=True,
+    )
+
+
+def test_cron_off_is_in_native_tree_for_guild_scoped_sync(adapter):
+    adapter._register_slash_commands()
+    assert "cron-off" in adapter._client.tree.commands
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------

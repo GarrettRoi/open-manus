@@ -15,6 +15,7 @@ from cron.jobs import (
     list_jobs,
     update_job,
     pause_job,
+    pause_all_jobs,
     resume_job,
     remove_job,
     mark_job_run,
@@ -472,6 +473,33 @@ class TestPauseResumeJob:
         save_jobs([job])
         with pytest.raises(ValueError, match="in the past"):
             resume_job("test-resume-past")
+
+    def test_pause_all_only_changes_enabled_jobs_and_persists(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 8, 27, 12, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        active_a = create_job(prompt="A", schedule="every 1h")
+        active_b = create_job(prompt="B", schedule="every 2h")
+        paused = create_job(prompt="Already paused", schedule="every 3h")
+        pause_job(paused["id"], reason="keep this reason")
+        original_paused = get_job(paused["id"])
+
+        assert pause_all_jobs(reason="emergency stop") == 2
+
+        stored = {job["id"]: job for job in load_jobs()}
+        for job_id in (active_a["id"], active_b["id"]):
+            assert stored[job_id]["enabled"] is False
+            assert stored[job_id]["state"] == "paused"
+            assert stored[job_id]["paused_at"] == now.isoformat()
+            assert stored[job_id]["paused_reason"] == "emergency stop"
+        assert stored[paused["id"]] == original_paused
+
+    def test_pause_all_is_idempotent_and_handles_empty_store(self, tmp_cron_dir):
+        assert pause_all_jobs(reason="emergency stop") == 0
+        job = create_job(prompt="A", schedule="every 1h")
+        assert pause_all_jobs(reason="emergency stop") == 1
+        first = get_job(job["id"])
+        assert pause_all_jobs(reason="different reason") == 0
+        assert get_job(job["id"]) == first
 
 
 class TestResolveJobRef:
