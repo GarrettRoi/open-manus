@@ -4,11 +4,13 @@ import sys
 import time
 
 import httpx
+import fakeredis
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app as vault_app  # noqa: E402
+from cron_registry import CronRegistryStore  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
 SESSION = "cron-registry-api-session"
@@ -17,13 +19,18 @@ PREFIX = "fleet:cron:v1"
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    isolated_redis = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(vault_app, "r", isolated_redis)
+    monkeypatch.setattr(
+        vault_app,
+        "cron_registry",
+        CronRegistryStore(isolated_redis),
+    )
     vault_app.SESSION_TOKENS[SESSION] = time.time() + 600
     vault_app.SESSION_CSRF[SESSION] = CSRF
     jar = httpx.Cookies()
     jar.set("vault_session", SESSION)
-    for key in vault_app.r.scan_iter(f"{PREFIX}:*"):
-        vault_app.r.delete(key)
     with TestClient(vault_app.app, cookies=jar) as c:
         yield c
     vault_app.SESSION_TOKENS.pop(SESSION, None)
