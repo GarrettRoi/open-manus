@@ -71,6 +71,18 @@ class FakeTextChannel:
         return _iter()
 
 
+class FakeVoiceChannel(FakeTextChannel):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "voice-chat",
+        guild_name: str = "Hermes Server",
+        channel_type: int = 2,
+    ):
+        super().__init__(channel_id, name, guild_name)
+        self.type = channel_type  # discord.ChannelType.voice / stage_voice
+
+
 class FakeForumChannel:
     def __init__(self, channel_id: int = 1, name: str = "support-forum", guild_name: str = "Hermes Server"):
         self.id = channel_id
@@ -435,13 +447,18 @@ async def test_discord_dms_ignore_mention_requirement(adapter, monkeypatch):
 async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
     """Auto-threading should be enabled by default (DISCORD_AUTO_THREAD defaults to 'true')."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
-    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
 
     # Patch _auto_create_thread to return a fake thread
     fake_thread = FakeThread(channel_id=999, name="auto-thread")
     adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
-    message = make_message(channel=FakeTextChannel(channel_id=123), content="hello")
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content=f"<@{bot_user.id}> hello",
+        mentions=[bot_user],
+    )
 
     await adapter._handle_message(message)
 
@@ -564,6 +581,31 @@ async def test_discord_auto_thread_can_be_disabled(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_auto_thread_removes_failed_fallback_seed(adapter, monkeypatch):
+    """A failed seed-message fallback must not leave a false success notice."""
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", AsyncMock())
+
+    first_seed_message = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("threads unsupported")),
+        delete=AsyncMock(),
+    )
+    second_seed_message = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("threads unsupported")),
+        delete=AsyncMock(),
+    )
+    channel = SimpleNamespace(send=AsyncMock(side_effect=[first_seed_message, second_seed_message]))
+    message = make_message(channel=channel, content="thread request")
+    message.create_thread = AsyncMock(side_effect=RuntimeError("direct thread rejected"))
+
+    thread = await adapter._auto_create_thread(message)
+
+    assert thread is None
+    assert channel.send.await_count == 2
+    first_seed_message.delete.assert_awaited_once()
+    second_seed_message.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_discord_bot_thread_skips_mention_requirement(adapter, monkeypatch):
     """Messages in a thread the bot has participated in should not require @mention."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
@@ -652,6 +694,75 @@ async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_t
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "follow-up from voice text chat"
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_mapped_voice_channel_chat_stays_inline_without_mention(adapter, monkeypatch):
+    """An active voice channel stays free-response without attempting a thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._voice_text_channels[111] = 789
+    adapter._auto_create_thread = AsyncMock()
+    message = make_message(
+        channel=FakeVoiceChannel(channel_id=789),
+        content="mapped voice-chat request",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "mapped voice-chat request"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_type", [2, 13])
+async def test_discord_unmapped_voice_or_stage_chat_stays_inline_after_mention(
+    adapter, monkeypatch, channel_type
+):
+    """Voice and stage chat cannot create threads before voice state is initialized."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeVoiceChannel(channel_id=789, channel_type=channel_type),
+        content=f"<@{bot_user.id}> inline voice-chat request",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "inline voice-chat request"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_inactive_voice_channel_chat_still_requires_mention(adapter, monkeypatch):
+    """Being a voice channel only bypasses thread creation, not the mention gate."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+    message = make_message(
+        channel=FakeVoiceChannel(channel_id=789),
+        content="unmentioned voice-chat request",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -6607,6 +6607,30 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_non_threadable_channel(channel: Any) -> bool:
+        """Return whether Discord does not allow message threads in ``channel``.
+
+        Voice and stage channels expose a built-in text chat, but Discord does
+        not allow that chat to host message threads. This deliberately checks
+        the Discord channel type rather than voice-session state: a user can
+        type there before the bot joins or before its voice/text mapping exists.
+        """
+        channel_type = getattr(channel, "type", None)
+        discord_channel_type = getattr(discord, "ChannelType", None)
+        non_threadable_types = tuple(
+            channel_kind
+            for channel_kind in (
+                getattr(discord_channel_type, "voice", None),
+                getattr(discord_channel_type, "stage_voice", None),
+            )
+            if channel_kind is not None
+        )
+        if channel_type in non_threadable_types:
+            return True
+        channel_type_value = getattr(channel_type, "value", channel_type)
+        return channel_type_value in {2, 13}  # ChannelType.voice, stage_voice
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
@@ -6641,6 +6665,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                seed_msg = None
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
@@ -6653,6 +6678,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     return thread
                 except Exception as fallback_error:
                     last_fallback_error = fallback_error
+                    if seed_msg is not None:
+                        try:
+                            await seed_msg.delete()
+                        except Exception as cleanup_error:
+                            logger.warning(
+                                "[%s] Failed to remove auto-thread fallback seed: %s",
+                                self.name,
+                                cleanup_error,
+                            )
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
@@ -7348,6 +7382,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 _dispatch_steer = True
 
         is_voice_linked_channel = False
+        is_non_threadable_channel = self._is_non_threadable_channel(message.channel)
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
@@ -7428,10 +7463,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = (
+                bool(channel_keys & no_thread_channels)
+                or is_free_channel
+                or is_non_threadable_channel
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            if auto_thread and not skip_thread and not is_reply_message:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
