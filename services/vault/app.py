@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,7 @@ from oauth import OAuthError
 import backup as vault_backup
 import replit_mcp as replit_mcp_mod
 from replit_mcp import ReplitMCPError
+from cron_registry import CronRegistryStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vault")
@@ -178,6 +180,7 @@ def hash_token(token: str) -> str:
 
 store = ConnectionStore(r, encrypt_value, decrypt_value)
 item_store = PlaidItemStore(r, encrypt_value, decrypt_value)
+cron_registry = CronRegistryStore(r)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +286,7 @@ async def init_agents():
 
 
 SESSION_TOKENS: Dict[str, float] = {}
+SESSION_CSRF: Dict[str, str] = {}
 
 
 def verify_admin_session(request: Request) -> bool:
@@ -308,6 +312,28 @@ def verify_admin_api(request: Request) -> bool:
 def require_admin_api(request: Request) -> None:
     if not verify_admin_api(request):
         raise HTTPException(status_code=401, detail="Admin auth required")
+
+
+def csrf_token(request: Request) -> str:
+    """Return the session-bound token used only by browser admin mutations."""
+    session_id = request.cookies.get("vault_session")
+    if not session_id or not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+    return SESSION_CSRF.setdefault(session_id, secrets.token_urlsafe(32))
+
+
+def require_browser_csrf(request: Request) -> None:
+    """Protect cookie-authenticated JSON writes without affecting token clients."""
+    if not verify_admin_session(request):
+        return
+    origin = request.headers.get("origin")
+    if not origin or urlparse(origin).netloc != request.headers.get("host"):
+        raise HTTPException(status_code=403, detail="Same-origin request required")
+    session_id = request.cookies.get("vault_session")
+    expected = SESSION_CSRF.get(session_id or "")
+    supplied = request.headers.get("X-CSRF-Token", "")
+    if not expected or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="Valid CSRF token required")
 
 
 def verify_agent_token(token: str) -> Optional[str]:
@@ -946,6 +972,7 @@ async def login_submit(request: Request, password: str = Form(...)):
     if secrets.compare_digest(password, ADMIN_PASSWORD):
         session_id = secrets.token_urlsafe(32)
         SESSION_TOKENS[session_id] = time.time() + 86400
+        SESSION_CSRF[session_id] = secrets.token_urlsafe(32)
         response = RedirectResponse(url="/", status_code=303)
         response.set_cookie("vault_session", session_id, httponly=True, max_age=86400,
                             samesite="lax", secure=True)
@@ -958,6 +985,7 @@ async def logout(request: Request):
     session_id = request.cookies.get("vault_session")
     if session_id:
         SESSION_TOKENS.pop(session_id, None)
+        SESSION_CSRF.pop(session_id, None)
     response = RedirectResponse(url="/login", status_code=303)
     response.delete_cookie("vault_session")
     return response
@@ -1002,6 +1030,87 @@ async def dashboard(request: Request):
         "agents": agents,
         "agent_names": AGENT_NAMES,
     })
+
+
+@app.get("/cron-jobs", response_class=HTMLResponse)
+async def cron_jobs_page(request: Request):
+    if (resp := _admin_or_redirect(request)):
+        return resp
+    return templates.TemplateResponse(request, "cron_jobs.html", {
+        "csrf_token": csrf_token(request),
+    })
+
+
+@app.get("/api/admin/cron-jobs")
+async def admin_cron_jobs(request: Request, agent: Optional[str] = None,
+                          state: Optional[str] = None, search: Optional[str] = None):
+    require_admin_api(request)
+    return cron_registry.list(agent=agent, state=state, search=search)
+
+
+@app.post("/api/admin/cron-jobs/toggle")
+async def admin_cron_toggle(request: Request):
+    require_admin_api(request)
+    require_browser_csrf(request)
+    try:
+        data = await request.json()
+        agent, job_id = str(data["agent"]), str(data["job_id"])
+        if not isinstance(data["enabled"], bool):
+            raise ValueError
+        enabled = data["enabled"]
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="agent, job_id, and enabled are required")
+    try:
+        outcome = cron_registry.toggle(
+            agent, job_id, enabled, actor="admin",
+            reason=str(data.get("reason", "")),
+            expected_revision=data.get("revision"),
+            idempotency_key=request.headers.get("Idempotency-Key"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(outcome, status_code=409 if outcome["status"] == "conflict" else 200)
+
+
+@app.post("/api/admin/cron-jobs/bulk")
+async def admin_cron_bulk(request: Request):
+    require_admin_api(request)
+    require_browser_csrf(request)
+    try:
+        data = await request.json()
+        if not isinstance(data["enabled"], bool):
+            raise ValueError
+        enabled = data["enabled"]
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="enabled is required")
+    try:
+        outcomes = cron_registry.bulk(
+            enabled, keys=data.get("keys"), filters=data.get("filters"),
+            actor="admin",
+            reason=str(data.get("reason", "")),
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            freeze=data.get("freeze"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    conflict = any(x["status"] == "conflict" for x in outcomes["outcomes"])
+    return JSONResponse(outcomes, status_code=409 if conflict else 200)
+
+
+@app.post("/api/admin/cron-jobs/freeze")
+async def admin_cron_freeze(request: Request):
+    require_admin_api(request)
+    require_browser_csrf(request)
+    try:
+        data = await request.json()
+        if not isinstance(data["enabled"], bool):
+            raise ValueError
+        enabled = data["enabled"]
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="enabled is required")
+    return cron_registry.set_freeze(enabled, actor="admin",
+                                    reason=str(data.get("reason", "")),
+                                    idempotency_key=request.headers.get("Idempotency-Key"))
 
 
 @app.get("/services", response_class=HTMLResponse)

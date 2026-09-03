@@ -3563,6 +3563,18 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        # Reconcile controls and advertise liveness before inspecting due work.
+        # Registry failures are isolated inside this best-effort integration.
+        try:
+            from cron.registry import reconcile_desired_state, publish_snapshot, fleet_freeze_active
+            reconcile_desired_state()
+            publish_snapshot()
+            if fleet_freeze_active():
+                logger.warning("Fleet cron freeze is active; skipping due-job execution")
+                return 0
+        except Exception as _registry_error:
+            logger.debug("Fleet cron registry tick hook skipped: %s", _registry_error)
+
         # LOCAL feature: keep the pinned cron-jobs/cron-history Discord threads
         # in sync. Fire-and-forget on the gateway loop — never blocks the tick.
         try:

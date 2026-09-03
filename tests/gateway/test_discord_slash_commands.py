@@ -172,15 +172,19 @@ async def test_cron_off_pauses_locally_with_ephemeral_feedback(
         response=SimpleNamespace(send_message=AsyncMock()),
     )
 
-    with patch("cron.jobs.pause_all_jobs", return_value=count) as pause_all:
+    with (
+        patch("cron.jobs.pause_all_jobs", return_value=count) as pause_all,
+        patch("cron.registry.request_fleet_freeze", return_value=True) as freeze,
+    ):
         await adapter._client.tree.commands["cron-off"](interaction)
 
     adapter._check_slash_authorization.assert_awaited_once_with(
         interaction, "/cron-off",
     )
     pause_all.assert_called_once_with(reason="paused via Discord /cron-off")
+    freeze.assert_called_once()
     interaction.response.send_message.assert_awaited_once_with(
-        expected, ephemeral=True,
+        expected + " Shared fleet freeze requested.", ephemeral=True,
     )
     adapter._run_simple_slash.assert_not_awaited()
 
@@ -212,6 +216,24 @@ async def test_cron_off_reports_failure_ephemerally(adapter):
 
     interaction.response.send_message.assert_awaited_once_with(
         "Failed to pause cron jobs. No changes were confirmed.",
+        ephemeral=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cron_off_reports_shared_freeze_pending(adapter):
+    adapter._register_slash_commands()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    with (
+        patch("cron.jobs.pause_all_jobs", return_value=2),
+        patch("cron.registry.request_fleet_freeze", return_value=False),
+    ):
+        await adapter._client.tree.commands["cron-off"](interaction)
+    interaction.response.send_message.assert_awaited_once_with(
+        "Paused 2 active cron jobs. Shared fleet freeze is pending "
+        "(registry unavailable).",
         ephemeral=True,
     )
 

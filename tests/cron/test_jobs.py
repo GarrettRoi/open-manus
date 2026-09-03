@@ -409,6 +409,7 @@ class TestUpdateJob:
         assert updated["enabled"] is False
         fetched = get_job(job["id"])
         assert fetched["enabled"] is False
+        assert fetched["registry_control_revision"] == 1
 
     def test_update_nonexistent_returns_none(self, tmp_cron_dir):
         result = update_job("nonexistent_id", {"name": "X"})
@@ -444,6 +445,7 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+        assert resumed["registry_control_revision"] == 2
 
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
@@ -491,6 +493,7 @@ class TestPauseResumeJob:
             assert stored[job_id]["state"] == "paused"
             assert stored[job_id]["paused_at"] == now.isoformat()
             assert stored[job_id]["paused_reason"] == "emergency stop"
+            assert stored[job_id]["registry_control_revision"] == 1
         assert stored[paused["id"]] == original_paused
 
     def test_pause_all_is_idempotent_and_handles_empty_store(self, tmp_cron_dir):

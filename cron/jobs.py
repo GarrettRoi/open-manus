@@ -656,6 +656,14 @@ def record_ticker_heartbeat(success: bool = False) -> None:
             _atomic_write_epoch(TICKER_SUCCESS_FILE)
         except Exception:
             pass
+    # The fleet registry is deliberately fire-and-forget.  In particular this
+    # call occurs from the ticker's hot path and must not turn a Redis outage
+    # into a scheduler outage.
+    try:
+        from cron.registry import schedule_sync
+        schedule_sync()
+    except Exception:
+        pass
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:
@@ -743,6 +751,13 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, JOBS_FILE)
         _secure_file(JOBS_FILE)
+        # Never perform network I/O beneath the jobs lock.  The registry
+        # captures this list and publishes it from a debounced daemon thread.
+        try:
+            from cron.registry import schedule_sync
+            schedule_sync(jobs)
+        except Exception:
+            pass
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -1284,6 +1299,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            if (
+                updated.get("enabled", True) != job.get("enabled", True)
+                or updated.get("state") != job.get("state")
+            ):
+                updated["registry_control_revision"] = (
+                    int(job.get("registry_control_revision") or 0) + 1
+                )
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -1319,6 +1342,9 @@ def pause_all_jobs(reason: Optional[str] = None) -> int:
             job["state"] = "paused"
             job["paused_at"] = paused_at
             job["paused_reason"] = reason
+            job["registry_control_revision"] = (
+                int(job.get("registry_control_revision") or 0) + 1
+            )
             affected += 1
         if affected:
             _save_jobs_unlocked(jobs)

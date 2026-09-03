@@ -5076,8 +5076,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             try:
                 from cron.jobs import pause_all_jobs
+                from cron.registry import request_fleet_freeze
 
                 count = pause_all_jobs(reason="paused via Discord /cron-off")
+                shared = request_fleet_freeze(
+                    reason="paused via Discord /cron-off",
+                    actor=getattr(getattr(interaction, "user", None), "id", None) or self.name,
+                )
                 if count:
                     content = (
                         f"Paused {count} active cron job"
@@ -5085,6 +5090,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                 else:
                     content = "No active cron jobs to pause."
+                content += (
+                    " Shared fleet freeze requested."
+                    if shared else
+                    " Shared fleet freeze is pending (registry unavailable)."
+                )
             except Exception:
                 logger.exception("[%s] /cron-off failed", self.name)
                 content = "Failed to pause cron jobs. No changes were confirmed."
