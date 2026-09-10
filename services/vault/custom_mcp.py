@@ -240,6 +240,15 @@ async def call_tool(server_url: str, bearer_token: str,
     Returns the MCP result dict (content list, isError flag, etc.).
     """
     _validate_server_url(server_url)
+    # Vowsok advertises `name` in tools/list but its create-client backend
+    # consumes `fullName`. Keep existing agent manifests usable, and adapt
+    # only this provider/tool at the outbound boundary.
+    if (urlsplit(server_url).hostname == "app.vowsok.com"
+            and tool_name == "create_client" and "name" in arguments):
+        arguments = dict(arguments)
+        if "fullName" in arguments and arguments["fullName"] != arguments["name"]:
+            raise CustomMCPError("create_client name and fullName must match")
+        arguments["fullName"] = arguments.pop("name")
     msg = await _mcp_session(
         server_url, bearer_token,
         rpc_id=2, method="tools/call",
