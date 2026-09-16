@@ -93,9 +93,12 @@
 </div>
 
 <div class="card" id="replit-mcp-card">
-    <h3>&#128640; Dev Request Dispatch</h3>
+    <h3>&#128640; Dev Request Destinations</h3>
     <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
-        Approved dev modification requests (from Discord <code>/devrequests</code>) launch Replit Agent runs automatically once Replit is connected.
+        Approved dev modification requests (from Discord <code>/devrequests</code>)
+        launch Replit Agent runs on the selected project. Add the Replit project
+        IDs here once; this does not create an account, grant OAuth permissions,
+        or start a run.
     </p>
 
     <div id="replit-mcp-status" style="margin-bottom: 16px;">
@@ -104,9 +107,10 @@
 
     <div style="margin-bottom: 16px;">
         <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">
-            <strong style="color: var(--text);">Target Replit project ID</strong>
-            — the <code>replId</code> of the Open Manus repl that Agent runs will be launched on.
-            Required before dispatch can start.
+            <strong style="color: var(--text);">Legacy default (open-manus fallback)</strong>
+            — used only when no explicit <code>open-manus</code> row is configured.
+            Existing Replit OAuth permissions are reused; no new credentials are
+            requested.
         </p>
         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
             <input id="target-repl-input" type="text"
@@ -114,19 +118,37 @@
                    style="flex: 1; min-width: 260px; background: var(--bg); border: 1px solid var(--border);
                           border-radius: var(--radius); color: var(--text); padding: 8px 12px; font-size: 13px;"
                    maxlength="128">
-            <button class="btn btn-sm" style="background: var(--accent); color: #fff;"
-                    onclick="saveTargetRepl(this)">Save</button>
         </div>
-        <div id="target-repl-result" style="margin-top: 6px; font-size: 13px;"></div>
+    </div>
+
+    <div style="margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;">
+            <div>
+                <strong style="color: var(--text);">Explicit project overrides</strong>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">
+                    Names are what agents choose in <code>request_dev_modification</code>;
+                    IDs are the existing Replit <code>replId</code> values.
+                </div>
+            </div>
+            <button class="btn btn-sm btn-outline" type="button" onclick="addProjectRow()">+ Add project</button>
+        </div>
+        <div id="replit-project-rows"></div>
+        <div id="replit-project-empty" style="color: var(--text-muted); font-size: 13px; padding: 8px 0;">
+            No explicit overrides. Requests use the legacy default when configured.
+        </div>
     </div>
 
     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+        <button class="btn btn-primary btn-sm" type="button" onclick="saveProjectRegistry(this)">
+            Save destinations
+        </button>
         <a href="/admin/replit-mcp/connect" class="btn btn-primary btn-sm" id="replit-connect-btn">
             &#128279; Connect Replit
         </a>
         <button class="btn btn-sm" style="background: var(--surface-hover); color: var(--text);"
                 onclick="triggerSweep(this)">&#8635; Re-sweep Backlog</button>
     </div>
+    <div id="replit-project-result" style="margin-top: 10px; font-size: 13px;"></div>
     <div id="replit-sweep-result" style="margin-top: 10px; font-size: 13px;"></div>
 </div>
 
@@ -170,6 +192,8 @@
 
 {% block scripts %}
 <script>
+var vaultCsrf = {{ csrf_token|tojson }};
+
 function mkEl(tag, attrs, text) {
     var el = document.createElement(tag);
     if (attrs) Object.keys(attrs).forEach(function(k) { el.setAttribute(k, attrs[k]); });
@@ -265,6 +289,52 @@ async function loadDiscordCoverage(btn) {
 }
 loadDiscordCoverage(null);
 
+function updateProjectEmptyState() {
+    var rows = document.getElementById('replit-project-rows');
+    var empty = document.getElementById('replit-project-empty');
+    if (rows && empty) empty.style.display = rows.children.length ? 'none' : 'block';
+}
+
+function addProjectRow(name, replId) {
+    var rows = document.getElementById('replit-project-rows');
+    var row = mkEl('div', {
+        style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;',
+        class: 'replit-project-row',
+    });
+    var nameInput = mkEl('input', {
+        type: 'text',
+        placeholder: 'project name',
+        maxlength: '64',
+        class: 'replit-project-name',
+        'aria-label': 'Project name',
+        style: 'flex:1;min-width:150px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);padding:7px 10px;font-size:13px;',
+    });
+    nameInput.value = name || '';
+    var idInput = mkEl('input', {
+        type: 'text',
+        placeholder: 'Replit replId',
+        maxlength: '128',
+        class: 'replit-project-id',
+        'aria-label': 'Replit project ID',
+        style: 'flex:2;min-width:240px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);padding:7px 10px;font-size:13px;',
+    });
+    idInput.value = replId || '';
+    var remove = mkEl('button', {
+        type: 'button',
+        class: 'btn btn-sm btn-danger',
+        'aria-label': 'Remove project',
+    }, 'Remove');
+    remove.addEventListener('click', function() {
+        row.remove();
+        updateProjectEmptyState();
+    });
+    row.appendChild(nameInput);
+    row.appendChild(idInput);
+    row.appendChild(remove);
+    rows.appendChild(row);
+    updateProjectEmptyState();
+}
+
 (async function loadReplitStatus() {
     var statusEl = document.getElementById('replit-mcp-status');
     var connectBtn = document.getElementById('replit-connect-btn');
@@ -274,8 +344,16 @@ loadDiscordCoverage(null);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         var d = await resp.json();
 
-        // Populate target repl input with current value (safe — goes to value, not innerHTML)
-        if (targetInput && d.target_repl) targetInput.value = d.target_repl;
+        // Populate the legacy fallback (safe — goes to value, not innerHTML).
+        if (targetInput && d.default_target_repl != null) {
+            targetInput.value = d.default_target_repl;
+        }
+        var projectRows = document.getElementById('replit-project-rows');
+        projectRows.replaceChildren();
+        Object.keys(d.projects || {}).sort().forEach(function(name) {
+            addProjectRow(name, d.projects[name]);
+        });
+        updateProjectEmptyState();
 
         statusEl.innerHTML = '';
 
@@ -292,10 +370,10 @@ loadDiscordCoverage(null);
         }
         statusEl.appendChild(row1);
 
-        // Missing target repl warning — blocks dispatch
-        if (!d.target_repl) {
+        // Missing effective target warning — blocks dispatch
+        if (!Object.keys(d.project_targets || {}).length) {
             var warn = mkEl('div', { style: 'background:rgba(239,68,68,0.1);border:1px solid var(--danger);border-radius:6px;padding:10px 12px;margin-bottom:10px;font-size:13px;color:var(--danger);' },
-                '\u26A0 Target Replit project not configured. Dispatch is blocked until you set the Replit project ID below.');
+                '\u26A0 No Replit destination is configured. Dispatch is blocked until you add a project ID or set the legacy default below.');
             statusEl.appendChild(warn);
         }
 
@@ -352,24 +430,58 @@ async function triggerSweep(btn) {
     }
 }
 
-async function saveTargetRepl(btn) {
-    var input = document.getElementById('target-repl-input');
-    var resultEl = document.getElementById('target-repl-result');
-    var val = input.value.trim();
+async function saveProjectRegistry(btn) {
+    var targetInput = document.getElementById('target-repl-input');
+    var resultEl = document.getElementById('replit-project-result');
+    var projects = Object.create(null);
+    var names = new Set();
+    var duplicate = false;
+    var invalid = false;
+    document.querySelectorAll('#replit-project-rows .replit-project-row').forEach(function(row) {
+        var name = row.querySelector('.replit-project-name').value.trim();
+        var replId = row.querySelector('.replit-project-id').value.trim();
+        if (!name || !replId) {
+            invalid = true;
+            return;
+        }
+        var canonical = name.toLowerCase().replace(/\s+/g, '-');
+        if (names.has(canonical)) {
+            duplicate = true;
+            return;
+        }
+        names.add(canonical);
+        projects[name] = replId;
+    });
+    if (invalid) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.textContent = 'Each project row needs both a name and a Replit project ID.';
+        return;
+    }
+    if (duplicate) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.textContent = 'Project names must be unique, including after case and whitespace normalization.';
+        return;
+    }
     btn.disabled = true;
     btn.textContent = 'Saving\u2026';
     resultEl.textContent = '';
     try {
         var resp = await fetch('/api/admin/replit-mcp/config', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ target_repl: val }),
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': vaultCsrf,
+            },
+            body: JSON.stringify({
+                target_repl: targetInput.value.trim(),
+                projects: projects,
+            }),
         });
         var d = await resp.json();
         if (!resp.ok) throw new Error(d.detail || 'Error ' + resp.status);
         resultEl.style.color = 'var(--success)';
-        resultEl.textContent = val ? 'Target repl set to: ' + d.target_repl : 'Target repl cleared.';
-        // Reload status badges
+        resultEl.textContent = 'Destinations saved. No run was started.';
+        // Reload status badges and canonicalized project names.
         setTimeout(function() { location.reload(); }, 800);
     } catch (e) {
         resultEl.style.color = 'var(--danger)';

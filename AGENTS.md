@@ -337,6 +337,18 @@ The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HER
 
 ## Testing
 
+### Owner-approved multi-project dev requests
+
+Use `request_dev_modification(action="projects")` to discover configured
+destination names, then submit with an explicit `project`. Each request must
+target only one project and still requires owner approval in `/devrequests`.
+Missing or blank legacy destinations mean `open-manus`; unknown names never
+fall back to the fleet project. Resolve routing failures by asking the owner
+to correct the vault's destination configuration. Never request OAuth tokens.
+Dispatched work follows the selected project's own instructions, including
+its build, test, and deployment policies; do not assume fleet Redis access
+or Open Manus deployment branches in other projects.
+
 ```bash
 source .venv/bin/activate
 python -m pytest tests/ -q          # Full suite (~3000 tests, ~3 min)

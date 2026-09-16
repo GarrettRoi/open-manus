@@ -24,6 +24,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.registry import registry
+from services.vault.dev_projects import configured_names, normalize_project
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ def _agent_name() -> str:
 # ---------------------------------------------------------------------------
 def submit_request(title: str, description: str, project: str = "",
                    agent: str = "") -> Dict[str, Any]:
+    project = normalize_project(project)
     r = _redis()
     if r.llen("devreq:pending") >= PENDING_MAX:
         raise RuntimeError(
@@ -113,7 +115,7 @@ def submit_request(title: str, description: str, project: str = "",
         "id": req_id,
         "title": title[:TITLE_MAX],
         "description": description[:DESCRIPTION_MAX],
-        "project": (project or "open-manus")[:100],
+        "project": project,
         "agent": agent or _agent_name(),
         "status": "pending",
         "created_at": int(time.time()),
@@ -238,6 +240,9 @@ def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[
 def dev_request_tool(args: dict, **_kw) -> str:
     action = str(args.get("action") or "submit").strip().lower()
     try:
+        if action == "projects":
+            return json.dumps({"projects": configured_names(_redis()),
+                               "note": "Choose one configured project per request. Owner approval is still required."})
         if action == "submit":
             title = str(args.get("title") or "").strip()
             description = str(args.get("description") or "").strip()
@@ -249,6 +254,7 @@ def dev_request_tool(args: dict, **_kw) -> str:
             return json.dumps({
                 "submitted": True,
                 "request_id": item["id"],
+                "project": item["project"],
                 "status": "pending",
                 "note": ("Request queued for owner review. Tell the owner they can "
                          "read and approve it with /devrequests in Discord. Once "
@@ -268,7 +274,7 @@ def dev_request_tool(args: dict, **_kw) -> str:
             slim = [{k: it.get(k) for k in ("id", "title", "agent", "project", "status")}
                     for it in items]
             return json.dumps({"requests": slim, "filter": status}, ensure_ascii=False)
-        return json.dumps({"error": f"Unknown action '{action}'. Use submit, status, or list."})
+        return json.dumps({"error": f"Unknown action '{action}'. Use submit, status, list, or projects."})
     except Exception as e:
         logger.exception("dev request tool failed")
         return json.dumps({"error": f"Dev request failed: {e}"})
@@ -289,14 +295,17 @@ registry.register(
             "the complete text in Discord (/devrequests) and approves or "
             "denies; approved requests are queued for the development team to "
             "implement. Also supports checking status of an earlier request "
-            "(action='status') and listing recent requests (action='list')."
+            "(action='status') and listing recent requests (action='list'). "
+            "First discover configured destination names with action='projects'. "
+            "Choose one project per request; unknown names cannot be dispatched. "
+            "Owner approval is always required."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["submit", "status", "list"],
+                    "enum": ["submit", "status", "list", "projects"],
                 },
                 "title": {
                     "type": "string",
@@ -309,8 +318,8 @@ registry.register(
                 },
                 "project": {
                     "type": "string",
-                    "description": "Project/system the change belongs to "
-                                   "(default: open-manus).",
+                    "description": "One configured destination name from action='projects' "
+                                   "(blank defaults to open-manus).",
                 },
                 "request_id": {
                     "type": "string",

@@ -16,6 +16,7 @@ Redis keys:
   replitmcp:client        registration JSON (client_id etc.)
   replitmcp:tokens        encrypted token JSON
   replitmcp:pkce:{state}  pending PKCE verifier (10 min TTL)
+  replitmcp:projects      JSON object of project name → replId
   replitmcp:target_repl   replId of the Open Manus Replit project
 """
 
@@ -26,6 +27,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets as pysecrets
 import time
 from typing import Any, Callable, Dict, Optional
@@ -33,6 +35,21 @@ from typing import Any, Callable, Dict, Optional
 import httpx
 
 logger = logging.getLogger("vault.replit_mcp")
+
+# The vault service runs this module both as ``replit_mcp`` (its Docker
+# entrypoint is in this directory) and as ``services.vault.replit_mcp`` in
+# tests/tools.  Keep both import forms working without making the standalone
+# vault depend on the repository package layout.
+try:
+    from services.vault.dev_projects import (
+        DEFAULT_PROJECT,
+        K_PROJECTS,
+        normalize_project,
+        resolve_project,
+    )
+except ImportError:  # pragma: no cover - exercised by the standalone service
+    from dev_projects import (
+        DEFAULT_PROJECT, K_PROJECTS, normalize_project, resolve_project)
 
 MCP_URL = "https://replit-mcp.com/server/mcp"
 MCP_ORIGIN = "https://replit-mcp.com"
@@ -68,6 +85,10 @@ _SWEEP_IDLE_TICKS = 24  # BRPOP timeouts between periodic sweeps (≈ 2 min at 5
 # _RENEW_LEASE_SCRIPT: extend TTL only if we still hold the token (CAS).
 #   KEYS[1]=lease key  ARGV[1]=token  ARGV[2]=LEASE_TTL
 #   Returns 1 if renewed (token matched), 0 if lease was superseded.
+#
+# _RELEASE_LEASE_SCRIPT: delete the lease only if we still hold the token.
+#   KEYS[1]=lease key  ARGV[1]=token
+#   Returns 1 if released (token matched), 0 if lease was superseded.
 #
 # _FINALIZE_LEASE_SCRIPT: CAS write of final item state + release lease.
 #   KEYS[1]=lease key  KEYS[2]=item key
@@ -120,6 +141,16 @@ end
 return 0
 """
 
+# _RELEASE_LEASE_SCRIPT: release only if the caller still owns the token.
+# A worker must never delete a lease that a force-dispatch has superseded.
+_RELEASE_LEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    redis.call("DEL", KEYS[1])
+    return 1
+end
+return 0
+"""
+
 _FINALIZE_LEASE_SCRIPT = """
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
     return 0
@@ -131,6 +162,26 @@ else
     redis.call("SET", KEYS[2], ARGV[2])
 end
 redis.call("DEL", KEYS[1])
+return 1
+"""
+
+# Route selection is persisted before making the provider call.  The expected
+# item JSON is an optimistic-CAS guard in addition to the durable lease: a
+# force dispatch (or an administrative edit) cannot be overwritten by the
+# worker that observed the old item.
+_PIN_ROUTE_SCRIPT = """
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+if redis.call("GET", KEYS[2]) ~= ARGV[2] then
+    return 0
+end
+local ttl = tonumber(ARGV[4])
+if ttl > 0 then
+    redis.call("SET", KEYS[2], ARGV[3], "EX", ttl)
+else
+    redis.call("SET", KEYS[2], ARGV[3])
+end
 return 1
 """
 
@@ -163,9 +214,137 @@ end
 return 3
 """
 
+_REDACT_PATTERNS = (
+    # Provider diagnostics commonly echo these values in either JSON or
+    # header-like text.  Keep the key/label while removing the value.
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[redacted]"),
+    (re.compile(
+        r"(?i)((?:access|refresh)_token\s*[:=]\s*[\"']?)[^\"'\s,}]+"),
+     r"\1[redacted]"),
+    (re.compile(
+        r"(?i)((?:client_secret|api[_-]?key|authorization)\s*[:=]\s*[\"']?)[^\"'\s,}]+"),
+     r"\1[redacted]"),
+)
+
+# Provider responses are not safe diagnostic data.  In particular, Replit may
+# echo request headers, project metadata, or arbitrary tool output in an MCP
+# error.  Keep the messages below fixed so they are safe to persist in the
+# dev-request record and to show in the dashboard.
+PROVIDER_AUTH_FAILURE = (
+    "Replit authorization failed — reconnect Replit in the vault dashboard")
+PROVIDER_ACCESS_FAILURE = (
+    "Replit access was denied — verify the selected project ID and existing "
+    "OAuth access")
+PROVIDER_RETRY_FAILURE = (
+    "Replit MCP request failed — retry later and check Replit status")
+
+
+def _sanitize_text(value: Any, secret_values=()) -> str:
+    """Return bounded diagnostic text with credentials removed.
+
+    Provider error bodies and MCP results are outside our control and have
+    occasionally reflected request headers.  Redaction is intentionally
+    conservative and is applied before anything is logged or written to the
+    request item.
+    """
+    text = str(value)
+    for secret in secret_values or ():
+        if isinstance(secret, str) and len(secret) >= 4:
+            text = text.replace(secret, "[redacted]")
+    for pattern, replacement in _REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _sanitize_dispatch_value(mcp: Any, value: Any) -> str:
+    """Return a fixed provider failure message, never provider diagnostics.
+
+    This helper is retained for callers that used the old sanitizer name.
+    Credential redaction is not sufficient here: arbitrary provider bodies
+    can contain project data or credentials that are not in our local token
+    store.  Dispatch persistence must therefore never include *any* value
+    derived from an exception or provider result.
+    """
+    return _provider_failure_message(value)
+
 
 class ReplitMCPError(Exception):
     pass
+
+
+class ReplitMCPRoutingError(ReplitMCPError):
+    """A safe, actionable error resolving a request's configured route."""
+
+
+class ReplitMCPProviderError(ReplitMCPError):
+    """A provider failure whose public message is one of the fixed messages."""
+
+    _SAFE_MESSAGES = {
+        PROVIDER_AUTH_FAILURE,
+        PROVIDER_ACCESS_FAILURE,
+        PROVIDER_RETRY_FAILURE,
+    }
+
+    def __init__(self, message: str = PROVIDER_RETRY_FAILURE):
+        # Keep even accidentally constructed provider exceptions safe.  This
+        # matters for mocked clients and for future call sites that may pass a
+        # response-derived message here.
+        super().__init__(
+            message if message in self._SAFE_MESSAGES
+            else PROVIDER_RETRY_FAILURE)
+
+
+def _provider_failure_for_status(status_code: Any) -> str:
+    """Map an HTTP status to a fixed, actionable provider message."""
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        return PROVIDER_RETRY_FAILURE
+    if status == 401:
+        return PROVIDER_AUTH_FAILURE
+    if status == 403:
+        return PROVIDER_ACCESS_FAILURE
+    return PROVIDER_RETRY_FAILURE
+
+
+def _provider_failure_for_rpc_error(error: Any) -> str:
+    """Classify an RPC error without exposing its payload."""
+    code = error.get("code") if isinstance(error, dict) else None
+    if code in (401, "401", "unauthorized", "UNAUTHORIZED"):
+        return PROVIDER_AUTH_FAILURE
+    if code in (403, "403", "forbidden", "FORBIDDEN",
+                "access_denied", "ACCESS_DENIED"):
+        return PROVIDER_ACCESS_FAILURE
+    return PROVIDER_RETRY_FAILURE
+
+
+def _provider_failure_message(exc: Any) -> str:
+    """Return a safe fixed message for an arbitrary provider-side failure."""
+    if isinstance(exc, ReplitMCPProviderError):
+        # Provider errors are only constructed with the constants above.
+        return str(exc)
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        return _provider_failure_for_status(status_code)
+    if isinstance(exc, PermissionError):
+        return PROVIDER_ACCESS_FAILURE
+    return PROVIDER_RETRY_FAILURE
+
+
+def _safe_dispatch_result(result: Any) -> Dict[str, Any]:
+    """Keep only a boolean and fixed summary from a successful MCP call."""
+    accepted = True
+    if isinstance(result, dict) and "accepted" in result:
+        # MCP JSON values are normally primitive, but identity avoids invoking
+        # arbitrary truthiness hooks if a test/client supplies a custom value.
+        accepted = result.get("accepted") is True
+    return {
+        "accepted": accepted,
+        "summary": (
+            "Replit Agent accepted the request"
+            if accepted else "Replit Agent request completed"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +396,21 @@ def renew_lease(r, req_id: str, token: str) -> bool:
     return bool(result)
 
 
+def release_lease(r, req_id: str, token: str) -> bool:
+    """Release a dispatch lease only when its token still matches.
+
+    This is used for fail-closed skips (for example, a request deleted or
+    revoked after it was queued).  A superseding force-dispatch must retain
+    its lease, so a naked ``DELETE`` is unsafe here.
+    """
+    result = r.eval(
+        _RELEASE_LEASE_SCRIPT, 1,
+        K_LEASE + req_id,  # KEYS[1]
+        token,              # ARGV[1]
+    )
+    return bool(result)
+
+
 def finalize_lease(r, req_id: str, token: str, item: dict, item_ttl: int) -> bool:
     """CAS-write the final item state and release the lease atomically.
 
@@ -231,6 +425,57 @@ def finalize_lease(r, req_id: str, token: str, item: dict, item_ttl: int) -> boo
         token,                          # ARGV[1]
         json.dumps(item),               # ARGV[2]
         str(max(0, item_ttl or 0)),     # ARGV[3]
+    )
+    return bool(result)
+
+
+def pin_dispatch_route(r, req_id: str, token: str, item: dict,
+                       project: str, repl_id: str) -> bool:
+    """Persist a resolved route while *token* owns the request lease.
+
+    Returns ``False`` when the lease or the item changed before the write.
+    A route already present in *item* is never replaced; this makes retries
+    use the original destination even if an administrator changes the
+    registry between attempts.
+    """
+    raw = r.get(f"devreq:item:{req_id}")
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    if not raw:
+        return False
+    try:
+        current = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+
+    old_project = current.get("dispatch_project")
+    old_repl_id = current.get("dispatch_repl_id")
+    if old_repl_id:
+        # A complete pin is immutable.  A legacy/partially pinned item can
+        # receive its missing project label, but its explicit ID wins.
+        existing_repl_id = str(old_repl_id)
+        if existing_repl_id != str(repl_id):
+            return False
+        if old_project and str(old_project) != str(project):
+            return False
+        repl_id = existing_repl_id
+        project = str(old_project or project)
+    else:
+        current["dispatch_project"] = project
+        current["dispatch_repl_id"] = repl_id
+    if old_repl_id:
+        current["dispatch_project"] = project
+        current["dispatch_repl_id"] = repl_id
+
+    item_ttl = r.ttl(f"devreq:item:{req_id}")
+    result = r.eval(
+        _PIN_ROUTE_SCRIPT, 2,
+        K_LEASE + req_id,
+        f"devreq:item:{req_id}",
+        token,
+        raw,
+        json.dumps(current, ensure_ascii=False),
+        str(max(0, item_ttl or 0)),
     )
     return bool(result)
 
@@ -302,11 +547,31 @@ class ReplitMCP:
         toks = self._get_json(K_TOKENS, encrypted=True)
         return bool(toks and toks.get("access_token"))
 
+    def sanitize_text(self, value: Any) -> str:
+        """Sanitize provider diagnostics using the locally stored credentials."""
+        secrets = []
+        for key, encrypted in ((K_TOKENS, True), (K_CLIENT, True)):
+            try:
+                payload = self._get_json(key, encrypted=encrypted) or {}
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                secrets.extend(v for v in payload.values()
+                               if isinstance(v, str))
+        return _sanitize_text(value, secrets)
+
     def target_repl(self) -> str:
-        v = self.r.get(K_TARGET)
-        if isinstance(v, bytes):
-            v = v.decode()
-        return (v or "").strip()
+        """Return the default project's repl ID for legacy callers.
+
+        Dispatches use an explicit, pre-pinned ID instead.  This method
+        remains for existing dashboard/admin callers and is intentionally
+        scoped to the ``open-manus`` compatibility destination.
+        """
+        try:
+            _name, repl_id = resolve_project(self.r, DEFAULT_PROJECT)
+            return repl_id
+        except (TypeError, ValueError):
+            return ""
 
     # -- OAuth discovery / registration --------------------------------------
     async def _metadata(self) -> Dict[str, Any]:
@@ -373,8 +638,17 @@ class ReplitMCP:
             resp = await client.post(reg_endpoint, json=payload)
         if resp.status_code not in (200, 201):
             raise ReplitMCPError(
-                f"Client registration failed ({resp.status_code}): {resp.text[:300]}")
-        reg = resp.json()
+                "Replit MCP client registration failed — retry Connect Replit")
+        try:
+            reg = resp.json()
+        except Exception:
+            raise ReplitMCPError(
+                "Replit MCP returned an invalid client registration — "
+                "retry Connect Replit") from None
+        if not isinstance(reg, dict):
+            raise ReplitMCPError(
+                "Replit MCP returned an invalid client registration — "
+                "retry Connect Replit")
         reg["redirect_uri"] = self.redirect_uri
         self._set_json(K_CLIENT, reg, encrypted=True)
         return reg
@@ -440,13 +714,24 @@ class ReplitMCP:
                                      headers={"Accept": "application/json"})
         if resp.status_code >= 400:
             raise ReplitMCPError(
-                f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
-        self._store_tokens(resp.json())
+                "Replit authorization failed — restart Connect Replit")
+        try:
+            token_payload = resp.json()
+        except Exception:
+            raise ReplitMCPError(
+                "Replit MCP returned an invalid token response — "
+                "restart Connect Replit") from None
+        if not isinstance(token_payload, dict):
+            raise ReplitMCPError(
+                "Replit MCP returned an invalid token response — "
+                "restart Connect Replit")
+        self._store_tokens(token_payload)
         logger.info("Replit MCP connected (tokens stored)")
 
     def _store_tokens(self, payload: Dict[str, Any]) -> None:
         if not payload.get("access_token"):
-            raise ReplitMCPError("Token response had no access_token")
+            raise ReplitMCPError(
+                "Replit MCP returned no access token — restart Connect Replit")
         old = self._get_json(K_TOKENS, encrypted=True) or {}
         toks = {
             "access_token": payload["access_token"],
@@ -463,13 +748,11 @@ class ReplitMCP:
     async def _access_token(self) -> str:
         toks = self._get_json(K_TOKENS, encrypted=True)
         if not toks or not toks.get("access_token"):
-            raise ReplitMCPError(
-                "Replit is not connected yet — open the vault dashboard and "
-                "click Connect Replit")
+            raise ReplitMCPProviderError(PROVIDER_AUTH_FAILURE)
         expires_at = toks.get("expires_at")
         if expires_at and time.time() >= float(expires_at) - _EXPIRY_SLACK:
             if not toks.get("refresh_token"):
-                raise ReplitMCPError("Replit login expired — reconnect in the dashboard")
+                raise ReplitMCPProviderError(PROVIDER_AUTH_FAILURE)
             meta = await self._metadata()
             reg = await self._client_registration()
             data = {
@@ -484,10 +767,17 @@ class ReplitMCP:
                 resp = await client.post(meta["token_endpoint"], data=data,
                                          headers={"Accept": "application/json"})
             if resp.status_code >= 400:
-                raise ReplitMCPError(
-                    f"Token refresh failed ({resp.status_code}) — reconnect "
-                    f"Replit in the dashboard: {resp.text[:200]}")
-            self._store_tokens(resp.json())
+                raise ReplitMCPProviderError(
+                    _provider_failure_for_status(resp.status_code)
+                    if resp.status_code == 401
+                    else PROVIDER_AUTH_FAILURE)
+            try:
+                token_payload = resp.json()
+            except Exception:
+                raise ReplitMCPProviderError(PROVIDER_AUTH_FAILURE) from None
+            if not isinstance(token_payload, dict):
+                raise ReplitMCPProviderError(PROVIDER_AUTH_FAILURE)
+            self._store_tokens(token_payload)
             toks = self._get_json(K_TOKENS, encrypted=True)
         return toks["access_token"]
 
@@ -499,7 +789,13 @@ class ReplitMCP:
         if resp.status_code == 202 or not resp.content:
             return None
         if ctype == "application/json":
-            return resp.json()
+            try:
+                msg = resp.json()
+            except Exception:
+                raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
+            if not isinstance(msg, dict):
+                raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
+            return msg
         if ctype == "text/event-stream":
             last = None
             for line in resp.text.splitlines():
@@ -514,70 +810,109 @@ class ReplitMCP:
                     if isinstance(msg, dict) and ("result" in msg or "error" in msg):
                         last = msg
             return last
-        raise ReplitMCPError(f"Unexpected MCP response type {ctype!r} "
-                             f"(HTTP {resp.status_code}): {resp.text[:200]}")
+        raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
 
     async def _mcp_call_tool(self, tool: str, arguments: Dict[str, Any],
                              timeout: float = 120.0) -> Dict[str, Any]:
-        token = await self._access_token()
+        try:
+            token = await self._access_token()
+        except ReplitMCPProviderError:
+            raise
+        except Exception:
+            # Do not let a token-provider exception (which may contain an
+            # echoed response body) cross this boundary.
+            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            init = await client.post(MCP_URL, headers=headers, json={
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "open-manus-vault", "version": "1.0"},
-                },
-            })
-            if init.status_code == 401:
-                raise ReplitMCPError("Replit rejected the login (401) — "
-                                     "reconnect Replit in the vault dashboard")
-            init_msg = self._parse_mcp_response(init)
-            if not init_msg or init_msg.get("error"):
-                raise ReplitMCPError(f"MCP initialize failed: "
-                                     f"{json.dumps(init_msg)[:300] if init_msg else init.status_code}")
-            session_id = init.headers.get("mcp-session-id")
-            if session_id:
-                headers["Mcp-Session-Id"] = session_id
-            await client.post(MCP_URL, headers=headers, json={
-                "jsonrpc": "2.0", "method": "notifications/initialized"})
-            resp = await client.post(MCP_URL, headers=headers, json={
-                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": tool, "arguments": arguments},
-            })
-            msg = self._parse_mcp_response(resp)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                init = await client.post(MCP_URL, headers=headers, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "open-manus-vault", "version": "1.0"},
+                    },
+                })
+                if init.status_code >= 400:
+                    raise ReplitMCPProviderError(
+                        _provider_failure_for_status(init.status_code))
+                init_msg = self._parse_mcp_response(init)
+                if not init_msg:
+                    raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
+                if init_msg.get("error"):
+                    raise ReplitMCPProviderError(
+                        _provider_failure_for_rpc_error(init_msg["error"]))
+                session_id = init.headers.get("mcp-session-id")
+                if session_id:
+                    headers["Mcp-Session-Id"] = session_id
+                await client.post(MCP_URL, headers=headers, json={
+                    "jsonrpc": "2.0", "method": "notifications/initialized"})
+                resp = await client.post(MCP_URL, headers=headers, json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments},
+                })
+                if resp.status_code >= 400:
+                    raise ReplitMCPProviderError(
+                        _provider_failure_for_status(resp.status_code))
+                msg = self._parse_mcp_response(resp)
+        except ReplitMCPProviderError:
+            raise
+        except Exception:
+            # HTTP client and parser failures must not reflect arbitrary
+            # provider response text to the caller or dispatch record.
+            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
         if not msg:
-            raise ReplitMCPError(f"Empty MCP response (HTTP {resp.status_code})")
+            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
         if msg.get("error"):
             err = msg["error"]
             # -32001 timeout means Agent is still working — treat as accepted.
-            if err.get("code") == -32001:
+            if isinstance(err, dict) and err.get("code") == -32001:
                 return {"accepted": True, "note": "MCP timeout — Agent run continues in background"}
-            raise ReplitMCPError(f"MCP tool error: {json.dumps(err)[:300]}")
+            raise ReplitMCPProviderError(_provider_failure_for_rpc_error(err))
         result = msg.get("result") or {}
+        if not isinstance(result, dict):
+            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
         if result.get("isError"):
-            texts = [c.get("text", "") for c in result.get("content", [])
-                     if isinstance(c, dict)]
-            raise ReplitMCPError(f"Replit reported an error: {' '.join(texts)[:300]}")
+            raise ReplitMCPProviderError(PROVIDER_ACCESS_FAILURE)
         return result
 
-    async def start_agent_run(self, change_description: str,
-                              user_quotes: Optional[str] = None) -> Dict[str, Any]:
-        repl_id = self.target_repl()
+    async def start_agent_run(
+            self, change_description: str,
+            user_quotes: Optional[str] = None,
+            repl_id: Optional[str] = None) -> Dict[str, Any]:
+        """Start an Agent run on an explicit repl ID.
+
+        ``repl_id`` is supplied by the dispatcher after its durable route pin.
+        Omitting it preserves the old default-project API for dashboard callers;
+        it must never be used by the multi-project dispatch path.
+        """
+        repl_id = (self.target_repl() if repl_id is None
+                   else str(repl_id).strip())
         if not repl_id:
-            raise ReplitMCPError("No target Replit project configured "
-                                 "(replitmcp:target_repl)")
+            raise ReplitMCPError(
+                "No target Replit project configured for 'open-manus'")
+        if (len(repl_id) > 128
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", repl_id)):
+            raise ReplitMCPError("Configured Replit project ID is invalid")
         args: Dict[str, Any] = {"replId": repl_id,
                                 "changeDescription": change_description}
         if user_quotes:
             args["userQuotes"] = user_quotes
-        return await self._mcp_call_tool("update_app_using_prompt", args)
+        try:
+            return await self._mcp_call_tool("update_app_using_prompt", args)
+        except ReplitMCPProviderError:
+            raise
+        except PermissionError:
+            raise ReplitMCPProviderError(PROVIDER_ACCESS_FAILURE) from None
+        except Exception:
+            # A provider-side exception must not cross the public dispatch
+            # boundary with arbitrary response text attached.
+            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
 
 
 # ---------------------------------------------------------------------------
@@ -622,16 +957,98 @@ def sweep_dispatch_backlog(r) -> list:
     return requeued
 
 
+def _pinned_route(item: Dict[str, Any]) -> Optional[tuple[str, str]]:
+    """Read a previously persisted route without consulting current config."""
+    repl_id = item.get("dispatch_repl_id")
+    if not repl_id:
+        return None
+    try:
+        project = normalize_project(
+            item.get("dispatch_project") or item.get("project"))
+    except ValueError as exc:
+        raise ReplitMCPRoutingError("Stored dispatch project is invalid") from exc
+    return project, str(repl_id)
+
+
+async def _resolve_and_pin_route(mcp: ReplitMCP, req_id: str,
+                                 lease_token: str,
+                                 item: Dict[str, Any]) -> tuple[str, str]:
+    """Resolve a request destination and durably pin it before the MCP call."""
+    pinned = _pinned_route(item)
+    if pinned:
+        project, repl_id = pinned
+        # Older/partially written items may have an ID but no display name.
+        # Fill the label without ever resolving the ID through live config.
+        if item.get("dispatch_project") != project:
+            if not await asyncio.to_thread(
+                    pin_dispatch_route, mcp.r, req_id, lease_token, item,
+                    project, repl_id):
+                raise ReplitMCPRoutingError(
+                    "Dispatch route changed before it could be pinned; retrying")
+            item["dispatch_project"] = project
+        item["dispatch_repl_id"] = repl_id
+        return project, repl_id
+
+    requested = item.get("project") or DEFAULT_PROJECT
+    try:
+        project, repl_id = await asyncio.to_thread(
+            resolve_project, mcp.r, requested)
+    except ValueError as exc:
+        # Registry/configuration details are safe and actionable for the
+        # operator.  Keep them distinct from opaque provider failures so the
+        # dispatcher can persist the useful routing explanation.
+        raise ReplitMCPRoutingError(str(exc)) from exc
+    if not await asyncio.to_thread(
+            pin_dispatch_route, mcp.r, req_id, lease_token, item,
+            project, repl_id):
+        # A concurrent worker may have pinned the route just before our CAS.
+        # If so, use that durable value.  Never resolve the current registry
+        # again, since it may now point to a different project.
+        raw = await asyncio.to_thread(mcp.r.get, f"devreq:item:{req_id}")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            current = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            current = {}
+        pinned = _pinned_route(current)
+        if pinned:
+            item.clear()
+            item.update(current)
+            return pinned
+        raise ReplitMCPRoutingError(
+            "Dispatch route could not be pinned; retry after the request is "
+            "re-queued")
+    item["dispatch_project"] = project
+    item["dispatch_repl_id"] = repl_id
+    return project, repl_id
+
+
 def _build_prompt(item: Dict[str, Any]) -> str:
+    try:
+        project = normalize_project(
+            item.get("dispatch_project") or item.get("project"))
+    except ValueError as exc:
+        raise ReplitMCPRoutingError("Stored dispatch project is invalid") from exc
+    if project == DEFAULT_PROJECT:
+        destination = (
+            "Please implement this request in the Open Manus project only. "
+            "Follow that project's existing repository, test, and release "
+            "conventions.")
+    else:
+        destination = (
+            f"Please implement this request in the '{project}' project only. "
+            "Follow that project's own repository, test, and release "
+            "conventions; do not modify or deploy unrelated projects.")
     return (
-        f"Approved dev modification request #{item.get('id')} from Open Manus "
-        f"agent '{item.get('agent', 'unknown')}' (approved by the owner in "
-        f"Discord).\n\nTitle: {item.get('title', '')}\n\n"
+        f"Approved dev modification request #{item.get('id')} for project "
+        f"'{project}', submitted by agent '{item.get('agent', 'unknown')}' "
+        "(approved by the owner in Discord).\n\n"
+        f"Title: {item.get('title', '')}\n\n"
         f"Details:\n{(item.get('description') or '')[:6000]}\n\n"
-        "Please implement this request in the Open Manus fleet codebase, "
-        "test it, and deploy by pushing to the deploy branch as usual. When "
-        "done, update the request status in Redis (devreq:item:"
-        f"{item.get('id')}) to 'done'."
+        f"{destination}\n"
+        "Do not assume access to another project's files, deployment branch, "
+        "or infrastructure."
     )
 
 
@@ -665,7 +1082,9 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
          If another worker holds it, skip — the item is already being worked.
       3. Start a background lease-renewal coroutine (renews every 20 s) so the
          lease survives the full MCP call (up to 120 s + token refresh).
-      4. Re-check dispatch_status; skip if already "started".
+     4. Re-read the current item under the lease; if it is missing or no
+        longer approved, fail closed and release via token CAS.  Also skip if
+        already "started".
       5. Call start_agent_run.
       6. Finalize via Lua CAS: verify the token still matches, write the item,
          delete the lease. If the token no longer matches (force-dispatch
@@ -763,28 +1182,81 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                 # Re-read dispatch_status under the lease; another worker may
                 # have written "started" between enqueue and now.
                 raw2 = await asyncio.to_thread(mcp.r.get, f"devreq:item:{req_id}")
-                if raw2:
-                    item = json.loads(
+                if not raw2:
+                    logger.warning(
+                        "Dispatch: request %s disappeared under its lease — "
+                        "releasing without dispatch", req_id)
+                    await asyncio.to_thread(
+                        release_lease, mcp.r, req_id, lease_token)
+                    continue
+                try:
+                    current = json.loads(
                         raw2 if isinstance(raw2, str) else raw2.decode())
+                except (TypeError, ValueError, UnicodeDecodeError):
+                    current = None
+                if not isinstance(current, dict):
+                    logger.warning(
+                        "Dispatch: request %s has an invalid current record — "
+                        "releasing without dispatch", req_id)
+                    await asyncio.to_thread(
+                        release_lease, mcp.r, req_id, lease_token)
+                    continue
+                item = current
+                if item.get("status") != "approved":
+                    logger.info(
+                        "Dispatch: request %s is no longer approved (%s) — "
+                        "releasing without dispatch",
+                        req_id, item.get("status") or "missing status")
+                    await asyncio.to_thread(
+                        release_lease, mcp.r, req_id, lease_token)
+                    continue
                 if item.get("dispatch_status") == "started":
                     logger.info(
                         "Dispatch: request %s already started — releasing lease",
                         req_id)
-                    await asyncio.to_thread(mcp.r.delete, K_LEASE + req_id)
+                    await asyncio.to_thread(
+                        release_lease, mcp.r, req_id, lease_token)
                     continue
 
-                # Call the MCP (may take up to 120 s + token refresh)
                 try:
-                    result = await mcp.start_agent_run(_build_prompt(item))
+                    # Resolve and persist the destination while the lease is
+                    # held, before any provider call.  A later retry must
+                    # honor this route even if the administrator edits the
+                    # registry.
+                    _project, dispatch_repl_id = await _resolve_and_pin_route(
+                        mcp, req_id, lease_token, item)
+
+                    # A force-dispatch may supersede this worker after route
+                    # resolution (especially on a pinned retry or when route
+                    # pinning failed over to a concurrently written item).
+                    # Renew is a token-CAS ownership check; fail closed and
+                    # never start a provider run without the current lease.
+                    if not await asyncio.to_thread(
+                            renew_lease, mcp.r, req_id, lease_token):
+                        raise ReplitMCPError(
+                            "Dispatch lease was lost before the provider call")
+
+                    # Call the MCP (may take up to 120 s + token refresh)
+                    result = await mcp.start_agent_run(
+                        _build_prompt(item), repl_id=dispatch_repl_id)
                     item["dispatch_status"] = "started"
                     item["dispatched_at"] = int(time.time())
-                    item["dispatch_result"] = str(result)[:500]
+                    item["dispatch_result"] = _safe_dispatch_result(result)
+                    # A successful retry supersedes any prior provider
+                    # failure.  Do not leave stale error text in the record.
+                    item.pop("dispatch_error", None)
                     logger.info("Dispatched dev request %s to Replit Agent", req_id)
+                except ReplitMCPRoutingError as exc:
+                    item["dispatch_status"] = "failed"
+                    # Routing details are generated locally from the
+                    # configured registry and are intentionally kept separate
+                    # from opaque provider diagnostics.
+                    item["dispatch_error"] = str(exc)[:500]
                 except Exception as exc:
                     item["dispatch_status"] = "failed"
-                    item["dispatch_error"] = str(exc)[:500]
+                    item["dispatch_error"] = _provider_failure_message(exc)
                     logger.error("Dispatch of dev request %s failed: %s",
-                                 req_id, exc)
+                                 req_id, item["dispatch_error"])
 
                 # CAS finalize: write item + release lease atomically.
                 # Returns False if a force-dispatch superseded our token.

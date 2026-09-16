@@ -1029,6 +1029,7 @@ async def dashboard(request: Request):
         "connections": conns,
         "agents": agents,
         "agent_names": AGENT_NAMES,
+        "csrf_token": csrf_token(request),
     })
 
 
@@ -4216,6 +4217,58 @@ async def admin_set_grant(request: Request):
 # run starts automatically on the Open Manus project.
 # ---------------------------------------------------------------------------
 replit_mcp = replit_mcp_mod.ReplitMCP(r, encrypt_value, decrypt_value, PUBLIC_URL)
+_REPLIT_PROJECTS_KEY = "replitmcp:projects"
+
+
+def _project_registry():
+    """Load the shared project-registry contract lazily.
+
+    ``app.py`` is also imported by a few lightweight admin/API test harnesses
+    that stub the vault dependencies.  Keeping this import at call time means
+    those harnesses can still import the app while the registry module is
+    deployed independently.
+    """
+    try:
+        from services.vault import dev_projects
+    except ImportError:
+        # ``app.py`` is run directly from services/vault in the container.
+        import dev_projects
+    return dev_projects
+
+
+def _explicit_projects() -> Dict[str, str]:
+    """Return the validated, explicit project mapping from Redis."""
+    return _project_registry().list_projects(r)
+
+
+def _legacy_default_target() -> str:
+    """Return the compatibility target without applying explicit overrides."""
+    value = r.get(replit_mcp_mod.K_TARGET)
+    if isinstance(value, bytes):
+        value = value.decode()
+    return str(value or "").strip()
+
+
+def _project_targets() -> Dict[str, str]:
+    """Return configured names and their effective target IDs.
+
+    ``open-manus`` may be supplied by the legacy target key even when it is
+    absent from the explicit registry.  The effective view is useful to the
+    owner dashboard, while ``projects`` in the API response remains the
+    explicit mapping so saving the form cannot accidentally turn a fallback
+    into an override.
+    """
+    registry = _project_registry()
+    targets = dict(_explicit_projects())
+    for name in registry.configured_names(r):
+        if name in targets:
+            continue
+        try:
+            resolved_name, repl_id = registry.resolve_project(r, name)
+        except (KeyError, ValueError):
+            continue
+        targets[resolved_name] = repl_id
+    return targets
 
 
 @app.get("/api/admin/replit-mcp/status")
@@ -4259,9 +4312,16 @@ async def replit_mcp_status(request: Request):
 
     import asyncio as _asyncio
     stats = await _asyncio.to_thread(_gather_stats)
+    legacy_target = _legacy_default_target()
     return {
         "connected": replit_mcp.connected(),
-        "target_repl": replit_mcp.target_repl(),
+        # Keep both names for old dashboard/API callers. These are the
+        # fallback value, not the effective explicit open-manus override.
+        "target_repl": legacy_target,
+        "default_target_repl": legacy_target,
+        "projects": _explicit_projects(),
+        "project_targets": _project_targets(),
+        "project_names": _project_registry().configured_names(r),
         "redirect_uri": replit_mcp.redirect_uri,
         **stats,
     }
@@ -4293,7 +4353,7 @@ async def replit_mcp_callback(code: str = "", state: str = "", error: str = ""):
         # a fixed message — the provider's error text is only logged.
         if state:
             replit_mcp._consume_pkce_state(state)
-        logger.warning("Replit MCP OAuth denied: %s", error[:200])
+        logger.warning("Replit MCP OAuth denied or cancelled")
         return HTMLResponse("<h3>Replit login was denied or cancelled.</h3>"
                             "<p>You can close this tab and try again from the "
                             "dashboard.</p>", status_code=400)
@@ -4326,29 +4386,97 @@ async def replit_mcp_sweep(request: Request):
 
 
 class ReplitMCPConfigBody(BaseModel):
-    target_repl: str = Field("", max_length=128)
+    # ``None`` means the caller is using the registry-only form and wants the
+    # legacy default preserved.  An empty string explicitly clears it.
+    target_repl: Optional[str] = Field(None, max_length=128)
+    projects: Optional[Dict[str, str]] = None
 
 
 @app.post("/api/admin/replit-mcp/config")
 async def replit_mcp_config(body: ReplitMCPConfigBody, request: Request):
-    """Set the target Replit project ID (replitmcp:target_repl).
+    """Atomically save the owner-managed Replit project registry.
 
-    This is the replId of the Open Manus Replit project that Replit Agent
-    runs will be started on when approved dev requests are dispatched.
+    ``target_repl`` remains the legacy default for ``open-manus``.  An
+    explicit ``projects.open-manus`` entry wins over that fallback when a
+    request is resolved.  Omitting ``projects`` preserves the old single-target
+    API behavior; supplying it replaces the explicit mapping, which makes
+    dashboard deletes deterministic.
     """
     require_admin_api(request)
-    repl_id = body.target_repl.strip()
-    # Basic sanity check: Replit replIds are alphanumeric with hyphens.
-    if repl_id and not re.match(r'^[A-Za-z0-9_-]+$', repl_id):
-        raise HTTPException(status_code=422,
-                            detail="target_repl must be alphanumeric (hyphens/underscores allowed)")
-    if repl_id:
-        r.set(replit_mcp_mod.K_TARGET, repl_id)
-        audit_log("admin", "REPLIT_MCP", "replit_mcp_set_target", f"target_repl={repl_id}")
-    else:
-        r.delete(replit_mcp_mod.K_TARGET)
-        audit_log("admin", "REPLIT_MCP", "replit_mcp_clear_target", "")
-    return {"ok": True, "target_repl": repl_id}
+    _require_json_content_type(request)
+    require_browser_csrf(request)
+
+    registry = _project_registry()
+    try:
+        normalized = (
+            registry.validate_projects(body.projects)
+            if body.projects is not None
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    default_changed = body.target_repl is not None
+    default_target = (
+        body.target_repl.strip() if body.target_repl is not None else None
+    )
+    if default_target and not re.match(r"^[A-Za-z0-9_-]+$", default_target):
+        raise HTTPException(
+            status_code=422,
+            detail="target_repl must be alphanumeric (hyphens/underscores allowed)",
+        )
+
+    # Validate the legacy target with the same project-ID rules as an explicit
+    # open-manus entry, without forcing it into the explicit mapping.
+    if default_target:
+        try:
+            registry.validate_projects({"open-manus": default_target})
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    # Redis MULTI/EXEC keeps a registry replacement and a legacy-target
+    # replacement from being observed half-written by a dispatcher or status
+    # reader.  All validation happens before opening the transaction.
+    pipe = r.pipeline(transaction=True)
+    if normalized is not None:
+        pipe.set(
+            _REPLIT_PROJECTS_KEY,
+            json.dumps(normalized, ensure_ascii=False, sort_keys=True),
+        )
+    if default_changed:
+        if default_target:
+            pipe.set(replit_mcp_mod.K_TARGET, default_target)
+        else:
+            pipe.delete(replit_mcp_mod.K_TARGET)
+    pipe.execute()
+
+    if normalized is not None:
+        audit_log(
+            "admin",
+            "REPLIT_MCP",
+            "replit_mcp_set_projects",
+            f"projects={','.join(normalized)}",
+        )
+    if default_changed:
+        audit_log(
+            "admin",
+            "REPLIT_MCP",
+            "replit_mcp_set_target" if default_target else "replit_mcp_clear_target",
+            f"target_repl={default_target}" if default_target else "",
+        )
+    return {
+        "ok": True,
+        "target_repl": _legacy_default_target(),
+        "projects": _explicit_projects(),
+        "project_names": registry.configured_names(r),
+    }
+
+
+@app.get("/api/vault/projects")
+async def vault_project_names(request: Request):
+    """Return destination names to a granted agent, never Replit IDs."""
+    require_agent(request)
+    return {"projects": _project_registry().configured_names(r)}
 
 
 @app.post("/api/admin/replit-mcp/dispatch/{req_id}")

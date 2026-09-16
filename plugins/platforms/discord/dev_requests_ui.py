@@ -45,7 +45,7 @@ def _store():
     return dev_requests
 
 
-async def _poll_dispatch_outcome(channel, req_id: str, title: str) -> None:
+async def _poll_dispatch_outcome(channel, req_id: str, title: str, project: str = "open-manus") -> None:
     """Post a follow-up in the channel once the vault resolves the dispatch.
 
     Polls devreq:item:{req_id} every _POLL_INTERVAL seconds for up to
@@ -62,11 +62,12 @@ async def _poll_dispatch_outcome(channel, req_id: str, title: str) -> None:
             logger.debug("Dispatch poller: could not read request %s", req_id)
             continue
         ds = (item or {}).get("dispatch_status")
+        destination = (item or {}).get("dispatch_project") or (item or {}).get("project") or project
         if ds == "started":
             try:
                 await channel.send(
                     f"✅ Replit Agent run started for dev request "
-                    f"#{req_id} \"{title}\" — work is underway."
+                    f"#{req_id} \"{title}\" in `{destination}` — work is underway."
                 )
             except Exception:
                 logger.exception("Dispatch poller: could not post success for %s", req_id)
@@ -76,10 +77,10 @@ async def _poll_dispatch_outcome(channel, req_id: str, title: str) -> None:
             try:
                 await channel.send(
                     f"❌ Auto-dispatch failed for dev request "
-                    f"#{req_id} \"{title}\".\n"
+                    f"#{req_id} \"{title}\" in `{destination}`.\n"
                     f"Reason: `{err}`\n"
-                    "Retry via the vault dashboard, or complete the Replit "
-                    "OAuth connection at `/admin/replit-mcp/connect` first."
+                    "Correct the destination mapping or Replit access in the vault dashboard, "
+                    "then re-sweep the backlog or retry the existing admin dispatch endpoint."
                 )
             except Exception:
                 logger.exception("Dispatch poller: could not post failure for %s", req_id)
@@ -88,7 +89,7 @@ async def _poll_dispatch_outcome(channel, req_id: str, title: str) -> None:
     try:
         await channel.send(
             f"⏳ No dispatch result yet for dev request "
-            f"#{req_id} \"{title}\" after 90 s — "
+            f"#{req_id} \"{title}\" in `{project}` after 90 s — "
             "check the vault dashboard (`/api/admin/replit-mcp/status`) for status."
         )
     except Exception:
@@ -165,13 +166,14 @@ class DevRequestApprovalView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         title = item.get("title", "")
+        project = item.get("project") or "open-manus"
         if status == "approved":
             note = "approved — queued for Replit Agent dispatch (result will follow)"
         else:
             note = "closed"
         try:
             await interaction.edit_original_response(
-                content=f"{label} — request #{self.req_id} \"{title}\" {note}.",
+                content=f"{label} — request #{self.req_id} \"{title}\" in `{project}` {note}.",
                 view=self)
         except Exception:
             logger.exception(
@@ -179,7 +181,7 @@ class DevRequestApprovalView(discord.ui.View):
             # Best-effort fallback: at least send a followup so the reviewer knows
             try:
                 await interaction.followup.send(
-                    f"{label} — request #{self.req_id} \"{title}\" {note} "
+                    f"{label} — request #{self.req_id} \"{title}\" in `{project}` {note} "
                     "(could not update original card).",
                     ephemeral=True)
             except Exception:
@@ -187,7 +189,7 @@ class DevRequestApprovalView(discord.ui.View):
                     "dev request decision: all delivery paths failed for %s", self.req_id)
         if status == "approved":
             asyncio.create_task(
-                _poll_dispatch_outcome(interaction.channel, self.req_id, title)
+                _poll_dispatch_outcome(interaction.channel, self.req_id, title, project)
             )
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
@@ -201,7 +203,7 @@ class DevRequestApprovalView(discord.ui.View):
 
 def _format_request(item: dict) -> str:
     head = (f"**Dev request #{item['id']}** — {item.get('title', '')}\n"
-            f"From: `{item.get('agent', '?')}` · Project: `{item.get('project', '?')}`\n\n")
+            f"From: `{item.get('agent', '?')}` · Project: `{item.get('project') or 'open-manus'}`\n\n")
     body = item.get("description", "")
     if len(head) + len(body) > MSG_LIMIT:
         body = body[: MSG_LIMIT - len(head) - 20] + "\n… (truncated)"
