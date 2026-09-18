@@ -156,7 +156,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         },
     },
     "google": {
-        "label": "Google Workspace (Gmail / Drive / Sheets / Docs / Slides / Forms / Tasks / Chat / People / Calendar)",
+        "label": "Google Workspace (Gmail / Drive / Sheets / Docs / Slides / Forms / Tasks / Chat / People / Calendar / Meet / Apps Script)",
         "auth": {"kind": "oauth2"},
         "base_url": "https://www.googleapis.com",
         "allowed_hosts": [
@@ -164,7 +164,8 @@ CATALOG: Dict[str, Dict[str, Any]] = {
             "drive.googleapis.com", "calendar-json.googleapis.com",
             "people.googleapis.com", "oauth2.googleapis.com",
             "docs.googleapis.com", "slides.googleapis.com", "forms.googleapis.com",
-            "tasks.googleapis.com", "chat.googleapis.com",
+            "tasks.googleapis.com", "chat.googleapis.com", "meet.googleapis.com",
+            "script.googleapis.com",
         ],
         "oauth": {
             "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
@@ -181,17 +182,22 @@ CATALOG: Dict[str, Dict[str, Any]] = {
                 "https://www.googleapis.com/auth/tasks",
                 "https://www.googleapis.com/auth/chat.messages",
                 "https://www.googleapis.com/auth/contacts.readonly",
+                "https://www.googleapis.com/auth/meetings.space.created",
+                "https://www.googleapis.com/auth/meetings.space.readonly",
+                "https://www.googleapis.com/auth/script.projects",
+                "https://www.googleapis.com/auth/script.projects.readonly",
             ],
             "extra_authorize_params": {"access_type": "offline", "prompt": "consent"},
         },
         "setup_help": (
             "One-time setup: in Google Cloud Console create an OAuth client "
             "(type: Web application), add the redirect URL shown below, enable the "
-            "Gmail, Drive, Sheets, Docs, Slides, Forms, Tasks, Chat, People, and "
-            "Calendar APIs, then paste the client ID and secret here and click "
+            "Gmail, Drive, Sheets, Docs, Slides, Forms, Tasks, Chat, People, "
+            "Calendar, Meet, and Apps Script APIs, then paste the client ID and "
+            "secret here and click "
             "Connect to log in with your Google account. Existing connections must "
             "reconnect once to grant the newer scopes (Docs/Slides/Forms/Tasks/"
-            "Chat/Contacts)."
+            "Chat/Contacts/Meet/Apps Script)."
         ),
         "example_call": "GET /gmail/v1/users/me/messages",
         # Probe: Drive "about" endpoint — covered by auth/drive scope (always granted)

@@ -340,7 +340,10 @@ The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HER
 ### Owner-approved multi-project dev requests
 
 Use `request_dev_modification(action="projects")` to discover configured
-destination names, then submit with an explicit `project`. Each request must
+destination names and scope guidance, then submit with explicit `work_scope`
+and `project`. `fleet_platform` work (shared vault, credentials/OAuth, agent
+runtime, and dispatch) must target `open-manus`; `project_app` work must target
+the actual application project. Each request must
 target only one project and still requires owner approval in `/devrequests`.
 Missing or blank legacy destinations mean `open-manus`; unknown names never
 fall back to the fleet project. Resolve routing failures by asking the owner

@@ -24,7 +24,12 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.registry import registry
-from services.vault.dev_projects import configured_names, normalize_project
+from services.vault.dev_projects import (
+    DEFAULT_PROJECT,
+    configured_names,
+    resolve_project,
+    validate_work_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +107,13 @@ def _agent_name() -> str:
 # ---------------------------------------------------------------------------
 # Store operations (also used by the Discord /devrequests review UI)
 # ---------------------------------------------------------------------------
-def submit_request(title: str, description: str, project: str = "",
-                   agent: str = "") -> Dict[str, Any]:
-    project = normalize_project(project)
+def submit_request(title: str, description: str, project: str,
+                   work_scope: str, agent: str = "") -> Dict[str, Any]:
     r = _redis()
+    work_scope, project = validate_work_scope(work_scope, project)
+    # Resolve before allocating an ID or writing any queue/record state.  There
+    # is deliberately no "only configured project" fallback.
+    project, submitted_repl_id = resolve_project(r, project)
     if r.llen("devreq:pending") >= PENDING_MAX:
         raise RuntimeError(
             f"The pending request queue is full ({PENDING_MAX}). "
@@ -116,6 +124,8 @@ def submit_request(title: str, description: str, project: str = "",
         "title": title[:TITLE_MAX],
         "description": description[:DESCRIPTION_MAX],
         "project": project,
+        "work_scope": work_scope,
+        "submitted_repl_id": submitted_repl_id,
         "agent": agent or _agent_name(),
         "status": "pending",
         "created_at": int(time.time()),
@@ -214,6 +224,25 @@ def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[
     if item.get("status") != "pending":
         item["conflict"] = "already decided"
         return item
+    if status == "approved" and item.get("work_scope"):
+        # Scoped records are new submissions.  Revalidate their exact
+        # submission-time destination before consuming the pending claim, then
+        # pin that approved target for every dispatch/retry.
+        scope, project = validate_work_scope(
+            item.get("work_scope"), item.get("project"))
+        submitted_repl_id = str(item.get("submitted_repl_id") or "")
+        if not submitted_repl_id:
+            raise ValueError(
+                "request has no submission-time destination snapshot; "
+                "refusing approval")
+        current_project, current_repl_id = resolve_project(r, project)
+        if current_project != project or current_repl_id != submitted_repl_id:
+            raise ValueError(
+                f"destination mapping for '{project}' changed since submission; "
+                "deny this request and submit a new one")
+        item["work_scope"] = scope
+        item["dispatch_project"] = project
+        item["dispatch_repl_id"] = submitted_repl_id
     if r.lrem("devreq:pending", 0, req_id) == 0:
         item = get_request(req_id) or item
         item["conflict"] = "already decided"
@@ -241,20 +270,41 @@ def dev_request_tool(args: dict, **_kw) -> str:
     action = str(args.get("action") or "submit").strip().lower()
     try:
         if action == "projects":
-            return json.dumps({"projects": configured_names(_redis()),
-                               "note": "Choose one configured project per request. Owner approval is still required."})
+            return json.dumps({
+                "projects": configured_names(_redis()),
+                "work_scopes": {
+                    "fleet_platform": {
+                        "project": DEFAULT_PROJECT,
+                        "purpose": (
+                            "Open Manus owns shared vault, credentials/OAuth, "
+                            "agent runtime, and dispatch infrastructure.")
+                    },
+                    "project_app": {
+                        "project": "explicit actual app project name",
+                        "purpose": (
+                            "App features and app-specific bugs belong to the "
+                            "actual app, never a convenient fallback.")
+                    },
+                },
+                "note": (
+                    "Choose an explicit work_scope and configured project. "
+                    "No destination is inferred; owner approval is still required.")
+            })
         if action == "submit":
             title = str(args.get("title") or "").strip()
             description = str(args.get("description") or "").strip()
             if not title or not description:
                 return json.dumps({"error": "Both 'title' and 'description' are required. "
                                             "Describe the problem, the suggested change, and why."})
-            item = submit_request(title, description,
-                                  project=str(args.get("project") or "").strip())
+            item = submit_request(
+                title, description,
+                project=str(args.get("project") or "").strip(),
+                work_scope=str(args.get("work_scope") or "").strip())
             return json.dumps({
                 "submitted": True,
                 "request_id": item["id"],
                 "project": item["project"],
+                "work_scope": item["work_scope"],
                 "status": "pending",
                 "note": ("Request queued for owner review. Tell the owner they can "
                          "read and approve it with /devrequests in Discord. Once "
@@ -271,7 +321,8 @@ def dev_request_tool(args: dict, **_kw) -> str:
         if action == "list":
             status = str(args.get("filter") or "pending").strip().lower()
             items = list_requests(status=status)
-            slim = [{k: it.get(k) for k in ("id", "title", "agent", "project", "status")}
+            slim = [{k: it.get(k) for k in
+                     ("id", "title", "agent", "work_scope", "project", "status")}
                     for it in items]
             return json.dumps({"requests": slim, "filter": status}, ensure_ascii=False)
         return json.dumps({"error": f"Unknown action '{action}'. Use submit, status, list, or projects."})
@@ -296,8 +347,10 @@ registry.register(
             "denies; approved requests are queued for the development team to "
             "implement. Also supports checking status of an earlier request "
             "(action='status') and listing recent requests (action='list'). "
-            "First discover configured destination names with action='projects'. "
-            "Choose one project per request; unknown names cannot be dispatched. "
+            "First use action='projects' for destination and scope guidance. "
+            "Every new submission must explicitly provide work_scope and project. "
+            "fleet_platform always targets open-manus; project_app targets the "
+            "actual application. Unknown names cannot be submitted. "
             "Owner approval is always required."
         ),
         "parameters": {
@@ -319,7 +372,16 @@ registry.register(
                 "project": {
                     "type": "string",
                     "description": "One configured destination name from action='projects' "
-                                   "(blank defaults to open-manus).",
+                                   "(required for submit; never inferred).",
+                },
+                "work_scope": {
+                    "type": "string",
+                    "enum": ["fleet_platform", "project_app"],
+                    "description": (
+                        "Required for submit. fleet_platform is shared vault, "
+                        "credentials/OAuth, agent runtime, or dispatch work and "
+                        "must target open-manus. project_app is app feature work "
+                        "and must name the actual app project."),
                 },
                 "request_id": {
                     "type": "string",

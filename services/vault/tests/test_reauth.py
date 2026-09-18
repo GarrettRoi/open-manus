@@ -147,6 +147,34 @@ def test_oauth_state_is_single_use(client):
     assert second is None
 
 
+def test_oauth_denial_consumes_state_and_never_reflects_provider_error(client):
+    state = "denied-state-secret-test"
+    provider_error = "denied-SUPER-SECRET-provider-body"
+    vault_app.store.put_oauth_state(
+        state, {"conn_id": _CONN_ID, "service": "google"})
+    response = client.get(
+        "/oauth/callback",
+        params={"state": state, "error": provider_error},
+        follow_redirects=False)
+    assert response.status_code == 303
+    assert provider_error not in response.headers.get("location", "")
+    assert vault_app.store.pop_oauth_state(state) is None
+
+
+def test_oauth_denial_html_never_reflects_provider_error(client):
+    state = "denied-state-html-test"
+    provider_error = "denied-SUPER-SECRET-provider-body"
+    vault_app.store.put_oauth_state(
+        state, {"conn_id": _CONN_ID, "service": "google"})
+    response = client.get(
+        "/oauth/callback",
+        params={"state": state, "error": provider_error},
+        cookies={"vault_session": "invalid-session"})
+    assert response.status_code == 400
+    assert provider_error not in response.text
+    assert vault_app.store.pop_oauth_state(state) is None
+
+
 def test_reauth_detail_helper_flags_connection(client):
     _save_oauth_conn()
     detail = vault_app._reauth_required_detail(_CONN_ID, "token expired")

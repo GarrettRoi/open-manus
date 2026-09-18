@@ -16,6 +16,9 @@ from typing import Any, Mapping
 K_PROJECTS = "replitmcp:projects"
 K_TARGET = "replitmcp:target_repl"
 DEFAULT_PROJECT = "open-manus"
+FLEET_PLATFORM_SCOPE = "fleet_platform"
+PROJECT_APP_SCOPE = "project_app"
+WORK_SCOPES = (FLEET_PLATFORM_SCOPE, PROJECT_APP_SCOPE)
 
 # These limits are intentionally conservative: project names and repl IDs are
 # operator configuration, not arbitrary request payloads.  They also keep
@@ -50,6 +53,32 @@ def normalize_project(value: Any) -> str:
             "invalid project name; use letters, numbers, and single hyphens "
             f"(maximum {PROJECT_NAME_MAX} characters)")
     return name
+
+
+def validate_work_scope(scope: Any, project: Any) -> tuple[str, str]:
+    """Validate the explicit work scope and return it with canonical project.
+
+    This is intentionally declarative rather than a title/description keyword
+    classifier.  The submitting agent must say whether work belongs to shared
+    fleet infrastructure or to a specific application.
+    """
+    scope = str(scope or "").strip().lower()
+    if scope not in WORK_SCOPES:
+        raise ValueError(
+            "work_scope is required and must be 'fleet_platform' or "
+            "'project_app'")
+    if project is None or not str(project).strip():
+        raise ValueError("project is required and must name a configured destination")
+    name = _validate_name(project)
+    if scope == FLEET_PLATFORM_SCOPE and name != DEFAULT_PROJECT:
+        raise ValueError(
+            "fleet_platform work must target 'open-manus'; shared vault, "
+            "credentials/OAuth, agent runtime, and dispatch are owned there")
+    if scope == PROJECT_APP_SCOPE and name == DEFAULT_PROJECT:
+        raise ValueError(
+            "project_app work must target the actual app project, not "
+            "'open-manus'")
+    return scope, name
 
 
 def _validate_name(raw_name: Any) -> str:
@@ -206,14 +235,18 @@ def configured_names(r) -> list[str]:
 
 __all__ = [
     "DEFAULT_PROJECT",
+    "FLEET_PLATFORM_SCOPE",
     "K_PROJECTS",
     "K_TARGET",
     "MAX_PROJECTS",
     "PROJECT_NAME_MAX",
+    "PROJECT_APP_SCOPE",
     "REPL_ID_MAX",
+    "WORK_SCOPES",
     "configured_names",
     "list_projects",
     "normalize_project",
     "resolve_project",
+    "validate_work_scope",
     "validate_projects",
 ]

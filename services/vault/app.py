@@ -373,6 +373,10 @@ def _oauth_public_reason(raw_msg: str) -> str:
     return "The stored OAuth token is no longer valid."
 
 
+def _oauth_is_transient(exc: OAuthError) -> bool:
+    return isinstance(exc, oauth_mod.OAuthRefreshError) and exc.transient
+
+
 def _scrub_secret_values(text: str, secrets_d: Dict[str, Any]) -> str:
     """Remove any stored secret values from a diagnostic string."""
     for v in (secrets_d or {}).values():
@@ -459,10 +463,48 @@ def _conn_view(conn: Dict[str, Any], include_secret_state: bool = True) -> Dict[
         if view["auth_kind"] == "oauth2":
             view["connected"] = bool(secrets_d.get("access_token"))
             exp = secrets_d.get("expires_at")
-            view["token_expires_at"] = (
-                datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat() if exp else ""
-            )
+            try:
+                view["token_expires_at"] = (
+                    datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat()
+                    if exp else "")
+            except (TypeError, ValueError, OverflowError):
+                view["token_expires_at"] = ""
             view["has_client"] = bool(secrets_d.get("client_id"))
+            view["has_refresh_token"] = bool(secrets_d.get("refresh_token"))
+            view["auto_refresh"] = oauth_mod.is_google_service(
+                conn.get("service") or "")
+            refresh_state = conn.get("oauth_refresh_status") or "not_run"
+            view["oauth_refresh_status"] = refresh_state
+            view["oauth_refresh_reason"] = (
+                "Reauthorization is required."
+                if refresh_state == "reauthorization_required" else
+                "A temporary provider error will be retried."
+                if refresh_state == "retrying" else "")
+            refresh_at = conn.get("oauth_refresh_at") or ""
+            attempt_at = conn.get("oauth_last_attempt_at") or ""
+            next_retry_at = conn.get("oauth_next_retry_at") or ""
+            view["oauth_last_refresh_at"] = ""
+            view["oauth_last_attempt_at"] = ""
+            view["oauth_next_retry_at"] = ""
+            if refresh_at:
+                try:
+                    refreshed = float(refresh_at)
+                    view["oauth_last_refresh_at"] = datetime.fromtimestamp(
+                        refreshed, tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if attempt_at:
+                try:
+                    view["oauth_last_attempt_at"] = datetime.fromtimestamp(
+                        float(attempt_at), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if refresh_state == "retrying" and next_retry_at:
+                try:
+                    view["oauth_next_retry_at"] = datetime.fromtimestamp(
+                        float(next_retry_at), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError):
+                    pass
         elif view["auth_kind"] == "apple":
             view["connected"] = bool(secrets_d.get("apple_id") and secrets_d.get("app_password"))
         elif view["auth_kind"] == "mcp_bearer":
@@ -803,7 +845,9 @@ async def _run_connection_test(conn_id: str) -> Dict[str, Any]:
             injected = build_auth(conn, secrets_d, access_token=access_token)
         except OAuthError as exc:
             msg = str(exc).lower()
-            if ("not connected" in msg or "no access token" in msg
+            if _oauth_is_transient(exc):
+                reason = "OAuth provider temporarily unavailable — retry later"
+            elif ("not connected" in msg or "no access token" in msg
                     or "complete the oauth" in msg or "service not connected" in msg):
                 reason = "not connected — complete the OAuth login first"
             elif "no refresh token" in msg or "reconnect" in msg:
@@ -1818,11 +1862,20 @@ async def oauth_callback(request: Request, background_tasks: BackgroundTasks,
     # the vault UI or the token-authed dashboard API — started the flow).
     # Requiring a vault session here would break dashboard-initiated logins.
     has_session = verify_admin_session(request)
-    if error:
-        if has_session:
-            return RedirectResponse(url=f"/services?error=OAuth+denied:+{error}", status_code=303)
-        return HTMLResponse(f"<h3>OAuth denied: {error}</h3><p>You can close this tab.</p>", status_code=400)
+    # Consume provider-returned state even on denial/error. OAuth state is
+    # single-use and must not remain replayable after a completed provider trip.
     pending = store.pop_oauth_state(state) if state else None
+    if error:
+        target = pending.get("conn_id", "oauth") if pending else "oauth"
+        audit_log("admin", target, "oauth_denied", "authorization denied")
+        if has_session:
+            return RedirectResponse(
+                url="/services?error=OAuth+authorization+was+denied",
+                status_code=303)
+        return HTMLResponse(
+            "<h3>OAuth authorization was denied.</h3>"
+            "<p>You can close this tab.</p>",
+            status_code=400)
     if not pending or not code:
         if has_session:
             return RedirectResponse(url="/services?error=Invalid+or+expired+OAuth+state", status_code=303)
@@ -1834,22 +1887,48 @@ async def oauth_callback(request: Request, background_tasks: BackgroundTasks,
         if has_session:
             return RedirectResponse(url="/services?error=Connection+vanished", status_code=303)
         return HTMLResponse("<h3>Connection no longer exists.</h3>", status_code=404)
-    secrets_d = store.get_secrets(conn_id)
     try:
-        tokens = await oauth_mod.exchange_code(
-            pending["service"], code, secrets_d.get("client_id", ""),
-            secrets_d.get("client_secret", ""), PUBLIC_URL, conn=conn,
+        saved_secrets = await oauth_mod.exchange_and_store_code(
+            pending["service"], conn_id, code, PUBLIC_URL, store, conn=conn,
             code_verifier=pending.get("code_verifier"))
     except OAuthError as exc:
-        audit_log("admin", conn_id, "oauth_failed", str(exc)[:200])
-        return RedirectResponse(url=f"/services?error={str(exc)[:120].replace(' ', '+')}", status_code=303)
+        retryable = _oauth_is_transient(exc)
+        audit_log(
+            "admin", conn_id, "oauth_failed",
+            "temporary provider failure" if retryable else "authorization failed")
+        public_error = (
+            "OAuth+provider+is+temporarily+unavailable.+Please+try+again"
+            if retryable else
+            "OAuth+authorization+could+not+be+completed.+Please+reconnect")
+        if has_session:
+            return RedirectResponse(
+                url=f"/services?error={public_error}", status_code=303)
+        return HTMLResponse(
+            "<h3>OAuth authorization could not be completed.</h3>"
+            "<p>Please start the connection flow again.</p>",
+            status_code=400)
 
-    secrets_d.update(tokens)
-    store.set_secrets(conn_id, secrets_d)
-    r.hset(f"vault:conn:{conn_id}", "status", "ready")
-    audit_log("admin", conn_id, "oauth_connected", f"Service: {pending['service']}")
+    refresh_missing = (
+        oauth_mod.is_google_service(conn.get("service") or "")
+        and not saved_secrets.get("refresh_token"))
+    audit_log(
+        "admin", conn_id,
+        "oauth_refresh_token_missing" if refresh_missing else "oauth_connected",
+        f"Service: {pending['service']}")
     # Fire a connection test in the background now that we have a live token.
     background_tasks.add_task(_run_connection_test, conn_id)
+    if refresh_missing:
+        message = (
+            "Google+did+not+return+a+refresh+token.+Reconnect+this+connection+"
+            "and+complete+the+consent+screen.")
+        if has_session:
+            return RedirectResponse(
+                url=f"/services?error={message}", status_code=303)
+        return HTMLResponse(
+            "<h3>Reauthorization still required</h3>"
+            "<p>Google did not return a refresh token. Reconnect this "
+            "connection and complete the consent screen.</p>",
+            status_code=409)
     if has_session:
         return RedirectResponse(url="/services?notice=Connected+successfully", status_code=303)
     return HTMLResponse(
@@ -2830,8 +2909,14 @@ async def google_operation(conn_id: str, request: Request, body: GoogleOperation
             conn["service"], cid, store, conn=conn)
         scrub_values.append(access_token)
     except OAuthError as exc:
-        audit_log(agent_name, cid, "google_auth_error",
-                  _scrub_secret_values(str(exc), secrets_d)[:200])
+        if _oauth_is_transient(exc):
+            audit_log(agent_name, cid, "google_auth_retryable", "temporary refresh failure")
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "oauth_refresh_temporarily_unavailable",
+                        "connection": cid,
+                        "message": "OAuth refresh is temporarily unavailable; retry later."})
+        audit_log(agent_name, cid, "google_auth_error", "reauthorization required")
         raise HTTPException(
             status_code=409,
             detail=_reauth_required_detail(cid, _oauth_public_reason(str(exc))))
@@ -3079,8 +3164,16 @@ async def proxy_request(conn_id: str, request: Request):
             injected = build_auth(conn, secrets_d)
     except (AuthInjectionError, OAuthError) as exc:
         audit_log(agent_name, cid, "proxy_auth_error",
-                  _scrub_secret_values(str(exc), secrets_d)[:200])
+                  "temporary OAuth refresh failure"
+                  if isinstance(exc, OAuthError) and _oauth_is_transient(exc)
+                  else "authorization unavailable")
         if isinstance(exc, OAuthError):
+            if _oauth_is_transient(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "oauth_refresh_temporarily_unavailable",
+                            "connection": cid,
+                            "message": "OAuth refresh is temporarily unavailable; retry later."})
             raise HTTPException(
                 status_code=409,
                 detail=_reauth_required_detail(cid, _oauth_public_reason(str(exc))))
@@ -4562,6 +4655,10 @@ async def startup():
     # Nightly backups of all vault:* keys to local disk (Railway volume).
     import asyncio
     asyncio.create_task(vault_backup.backup_loop(r))
+    # Refresh expiring Google tokens before request traffic reaches the lazy
+    # refresh path. This does not prevent provider revocation or testing-mode
+    # expiry; permanent failures still require explicit authorization.
+    asyncio.create_task(oauth_mod.google_refresh_loop(store))
     # Re-queue approved requests missed before this deploy (backlog sweep).
     requeued = await asyncio.to_thread(replit_mcp_mod.sweep_dispatch_backlog, r)
     if requeued:

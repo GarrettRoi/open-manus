@@ -14,8 +14,8 @@ request_dev_modification(action="projects")
 ```
 
 The response contains names only. An agent should use one of those names in
-the `project` field when it submits a request. A blank project keeps the
-legacy `open-manus` default.
+the `project` field when it submits a request. New submissions must provide a
+project; a blank value has no default.
 
 ## 2. Add the second project in the vault
 
@@ -46,9 +46,24 @@ request_dev_modification(
   action="submit",
   title="Example change",
   description="Full problem and proposed implementation details",
+  work_scope="project_app",
   project="research-lab"
 )
 ```
+
+Every new submission declares its scope; routing is not inferred from title or
+description. Use `fleet_platform` only with `project="open-manus"` for shared
+vault, credentials/OAuth, agent runtime, and dispatch infrastructure. Use
+`project_app` with the explicitly named actual application for app feature
+work. A missing destination, an unknown destination, or a scope/project
+mismatch is rejected before a request record is created. The system never
+falls back to the sole configured destination.
+
+The resolved repl ID is snapshotted at submission and revalidated at approval.
+Approval is refused if the mapping disappeared or changed. A successful
+approval pins that exact target for dispatch and retries; later registry edits
+cannot silently move the request. Legacy stored requests remain readable and
+dispatchable under their existing compatibility behavior.
 
 The owner reviews the full request in Discord with `/devrequests` and clicks
 **Approve**. Approval is still required for every project. Once approved, the
@@ -69,7 +84,8 @@ The status endpoint shows aggregate counts; use the native tool's
 dispatch error. A successfully resolved route is pinned before the provider
 call: retries keep that original ID even if its mapping is edited or deleted.
 To intentionally use another target, submit a new request for owner approval.
-An unresolved unknown name has no pin; correct its mapping and retry normally.
+New requests with unknown names never reach approval or dispatch. For a stored
+legacy request that has no pin, correct its mapping before retrying.
 
 If an approved request has a `failed` dispatch status, retry it through the
 existing admin endpoint (using the vault admin authentication):

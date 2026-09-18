@@ -1,0 +1,19 @@
+Approved dev modification request #61 for project 'vowsok', submitted by agent 'valentina' (approved by the owner in Discord).
+
+Title: Google Workspace auto-refresh: vault/n8n refresh-token cycle so Gmail+suite stay authed with no per-cycle user approval
+
+Details: Problem (verified): User (Garrett) wants all Google Workspace connections (Gmail + suite) to stay authed without manual Google approval. Real verified state from this session (2026-09-18): vault(action='list') returns ONLY GITHUB_ALL_ACCESS_OAUTH + MAC_IN_CLOUD — NO 'GOOGLE'/'GMAIL' vault grant exists. So any Gmail/N8N OAuth connection relying on vault would be 409 (not set up). User explicitly wants: (a) applies to ALL Google suite connections, not just Gmail — IMAP is out; (b) automatic refresh cycle without him clicking approve; (c) wants recommendation filed as a dev request.
+
+Recommendation (NOT fabricated as implemented): Use OAuth refresh-token flow (standard for Google Workspace APIs). One-time user consent grants a refresh token; after that the vault/n8n can refresh the access token silently (no manual approval on each cycle) via the OAuth 2.0 refresh endpoint. This is the only approach that (i) avoids per-cycle approval, (ii) keeps full OAuth scope for Gmail + Drive + Calendar + Docs (not IMAP-only), and (iii) doesn't require a GCP service account with domain-wide delegation (which DOES need admin-level approval but is different from per-user OAuth). If user wants zero user-interaction EVER, service-account with domain-wide delegation is the alternative — but that requires GCP admin consent once at org level, not per-user.
+
+What needs build (not yet done):
+
+Confirm whether the consumer is a vault 'GOOGLE' connection (not granted — needs request_access) OR n8n OAuth credentials (out of scope for vault refresh logic).
+Implement refresh-token storage + automatic refresh loop (cron or webhook) that calls Google's token endpoint with grant_type=refresh_token BEFORE expiration.
+If using vault: add 'GOOGLE' connection, store refresh_token securely (not just access_token), hook vault refresh.
+If using n8n: n8n's Gmail OAuth credential already has a refresh flow — verify it's configured to use refresh_token and that the n8n instance has the credential saved (not just an access_token).
+Unverified gaps (NOT fabricated): I don't have access to the user's n8n instance or vault dashboard; I have not verified whether an n8n Gmail OAuth credential exists, whether a refresh_token is already present, or which connections in 'all of my Google suite' are in scope (Gmail, Drive, Calendar, Docs?). ask_owner is blocked (12 pending, verified). So this request files the recommendation; actual implementation requires Garrett to confirm scope + approve vault/n8n access before deployment.
+
+No retired protocols used. Filing as dev request, not as completed fix.
+
+Please implement this request in the 'vowsok' project only. Follow that project's own repository, test, and release conventions; do not modify or deploy unrelated projects. Do not assume access to another project's files, deployment branch, or infrastructure.

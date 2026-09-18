@@ -166,14 +166,16 @@ class DevRequestApprovalView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         title = item.get("title", "")
-        project = item.get("project") or "open-manus"
+        project = item.get("project") or "(legacy default: open-manus)"
+        scope = item.get("work_scope") or "legacy"
         if status == "approved":
             note = "approved — queued for Replit Agent dispatch (result will follow)"
         else:
             note = "closed"
         try:
             await interaction.edit_original_response(
-                content=f"{label} — request #{self.req_id} \"{title}\" in `{project}` {note}.",
+                content=(f"{label} — request #{self.req_id} \"{title}\" "
+                         f"[scope `{scope}`] in `{project}` {note}."),
                 view=self)
         except Exception:
             logger.exception(
@@ -202,8 +204,11 @@ class DevRequestApprovalView(discord.ui.View):
 
 
 def _format_request(item: dict) -> str:
+    scope = item.get("work_scope") or "legacy (stored before scoped routing)"
+    project = item.get("project") or "legacy default: open-manus"
     head = (f"**Dev request #{item['id']}** — {item.get('title', '')}\n"
-            f"From: `{item.get('agent', '?')}` · Project: `{item.get('project') or 'open-manus'}`\n\n")
+            f"From: `{item.get('agent', '?')}` · Scope: `{scope}` · "
+            f"Project: `{project}`\n\n")
     body = item.get("description", "")
     if len(head) + len(body) > MSG_LIMIT:
         body = body[: MSG_LIMIT - len(head) - 20] + "\n… (truncated)"

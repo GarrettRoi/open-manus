@@ -690,7 +690,10 @@ class TestSubmitListApproveFlow:
 
         with patch("tools.dev_requests._redis", return_value=r):
             # Submit
-            item = dr.submit_request("Add X tool", "We need tool X because Y")
+            r.set("replitmcp:target_repl", "open-manus-id")
+            item = dr.submit_request(
+                "Add X tool", "We need tool X because Y",
+                "open-manus", "fleet_platform")
             req_id = item["id"]
             assert item["status"] == "pending"
 
@@ -719,7 +722,9 @@ class TestSubmitListApproveFlow:
         import tools.dev_requests as dr
 
         with patch("tools.dev_requests._redis", return_value=r):
-            dr.submit_request("Title", "Desc")
+            r.set("replitmcp:target_repl", "open-manus-id")
+            dr.submit_request(
+                "Title", "Desc", "open-manus", "fleet_platform")
             req_id = "1"
             with patch("tools.dev_requests._enqueue_if_unclaimed", return_value=True):
                 dr.set_status(req_id, "approved", decided_by="owner")
@@ -733,8 +738,11 @@ class TestSubmitListApproveFlow:
         import tools.dev_requests as dr
 
         with patch("tools.dev_requests._redis", return_value=r):
-            dr.submit_request("T1", "D1")
-            dr.submit_request("T2", "D2")
+            r.set("replitmcp:target_repl", "open-manus-id")
+            dr.submit_request(
+                "T1", "D1", "open-manus", "fleet_platform")
+            dr.submit_request(
+                "T2", "D2", "open-manus", "fleet_platform")
             req_id = "1"
             with patch("tools.dev_requests._enqueue_if_unclaimed", return_value=True):
                 dr.set_status(req_id, "approved", decided_by="owner")

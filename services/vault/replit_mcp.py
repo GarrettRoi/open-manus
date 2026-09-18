@@ -46,10 +46,12 @@ try:
         K_PROJECTS,
         normalize_project,
         resolve_project,
+        validate_work_scope,
     )
 except ImportError:  # pragma: no cover - exercised by the standalone service
     from dev_projects import (
-        DEFAULT_PROJECT, K_PROJECTS, normalize_project, resolve_project)
+        DEFAULT_PROJECT, K_PROJECTS, normalize_project, resolve_project,
+        validate_work_scope)
 
 MCP_URL = "https://replit-mcp.com/server/mcp"
 MCP_ORIGIN = "https://replit-mcp.com"
@@ -990,6 +992,12 @@ async def _resolve_and_pin_route(mcp: ReplitMCP, req_id: str,
         return project, repl_id
 
     requested = item.get("project") or DEFAULT_PROJECT
+    if item.get("work_scope"):
+        try:
+            _scope, requested = validate_work_scope(
+                item.get("work_scope"), item.get("project"))
+        except ValueError as exc:
+            raise ReplitMCPRoutingError(str(exc)) from exc
     try:
         project, repl_id = await asyncio.to_thread(
             resolve_project, mcp.r, requested)
@@ -998,6 +1006,12 @@ async def _resolve_and_pin_route(mcp: ReplitMCP, req_id: str,
         # operator.  Keep them distinct from opaque provider failures so the
         # dispatcher can persist the useful routing explanation.
         raise ReplitMCPRoutingError(str(exc)) from exc
+    submitted_repl_id = str(item.get("submitted_repl_id") or "")
+    if item.get("work_scope") and (
+            not submitted_repl_id or repl_id != submitted_repl_id):
+        raise ReplitMCPRoutingError(
+            "Destination mapping changed since submission and was not pinned "
+            "at approval; refusing dispatch")
     if not await asyncio.to_thread(
             pin_dispatch_route, mcp.r, req_id, lease_token, item,
             project, repl_id):
@@ -1043,6 +1057,7 @@ def _build_prompt(item: Dict[str, Any]) -> str:
     return (
         f"Approved dev modification request #{item.get('id')} for project "
         f"'{project}', submitted by agent '{item.get('agent', 'unknown')}' "
+        f"with work scope '{item.get('work_scope') or 'legacy'}' "
         "(approved by the owner in Discord).\n\n"
         f"Title: {item.get('title', '')}\n\n"
         f"Details:\n{(item.get('description') or '')[:6000]}\n\n"
