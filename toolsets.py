@@ -54,7 +54,7 @@ _HERMES_CORE_TOOLS = [
     # toolset dynamically at runtime; only the static meta-tool lives here
     # so platform reverse-mapping can recover the toolset — see
     # hermes_cli/tools_config.py::_get_platform_tools recovery block).
-    "vault",
+    "vault", "crm",
     # Planning & memory
     "todo", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
@@ -180,7 +180,7 @@ TOOLSETS = {
             "tool; each granted connection is also registered dynamically as "
             "its own vault_<name> tool (credentials stay server-side)."
         ),
-        "tools": ["vault"],
+        "tools": ["vault", "crm"],
         "includes": []
     },
     

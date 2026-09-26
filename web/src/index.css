@@ -8,6 +8,47 @@
 @import '@nous-research/ui/styles/fonts.css';
 @import '@nous-research/ui/styles/globals.css';
 
+/* CRM workspace: semantic surfaces inherit the dashboard's active theme. */
+.crm-workspace {
+  --crm-line: color-mix(in srgb, var(--midground-base) 19%, transparent);
+  --crm-soft: color-mix(in srgb, var(--midground-base) 6%, var(--background-base));
+  --crm-raised: color-mix(in srgb, var(--midground-base) 9%, var(--background-base));
+  --crm-ink: var(--midground-base);
+  color: var(--midground-base);
+  font-family: var(--theme-font-sans);
+}
+.crm-workspace * { box-sizing: border-box; }
+.crm-workspace button, .crm-workspace input, .crm-workspace select, .crm-workspace textarea { font: inherit; }
+.crm-workspace button { cursor: pointer; }
+.crm-workspace button:disabled { opacity: .48; cursor: not-allowed; }
+.crm-workspace :focus-visible { outline: 2px solid var(--crm-ink); outline-offset: 2px; }
+.crm-kicker { font-size: .68rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; opacity: .62; }
+.crm-title { font-family: var(--theme-font-display); font-size: clamp(2rem,4vw,3.1rem); letter-spacing: -.05em; line-height: 1.1; font-weight: 700; }
+.crm-panel { border: 1px solid var(--crm-line); background: var(--crm-soft); border-radius: var(--theme-radius); }
+.crm-raised { background: var(--crm-raised); }
+.crm-input { width: 100%; min-height: 2.55rem; border: 1px solid var(--crm-line); border-radius: calc(var(--theme-radius) * .8); background: var(--background-base); color: var(--midground-base); padding: .55rem .8rem; outline: none; }
+.crm-input::placeholder { color: color-mix(in srgb, var(--midground-base) 45%, transparent); }
+.crm-input:focus { border-color: var(--midground-base); }
+.crm-label { display: grid; gap: .38rem; font-size: .75rem; font-weight: 650; letter-spacing: .02em; }
+.crm-btn { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; min-height: 2.45rem; padding: .55rem .85rem; border: 1px solid var(--crm-line); border-radius: calc(var(--theme-radius) * .8); color: var(--midground-base); background: var(--crm-raised); font-size: .8rem; font-weight: 650; transition: background .15s, transform .15s; white-space: nowrap; }
+.crm-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--midground-base) 17%, var(--background-base)); transform: translateY(-1px); }
+.crm-btn-primary { color: var(--background-base); background: var(--midground-base); border-color: var(--midground-base); }
+.crm-btn-primary:hover:not(:disabled) { background: color-mix(in srgb, var(--midground-base) 82%, var(--background-base)); }
+.crm-tab { border-bottom: 2px solid transparent; padding: .7rem .2rem; opacity: .65; font-size: .82rem; font-weight: 650; }
+.crm-tab[aria-selected="true"] { border-color: var(--midground-base); opacity: 1; }
+.crm-pill { display: inline-flex; align-items: center; gap: .35rem; border: 1px solid var(--crm-line); border-radius: 99px; padding: .18rem .55rem; font-size: .7rem; font-weight: 650; white-space: nowrap; }
+.crm-dot { width: .42rem; height: .42rem; border-radius: 50%; background: currentColor; }
+.crm-table { width: 100%; border-collapse: collapse; text-align: left; font-size: .82rem; }
+.crm-table th { padding: .8rem 1rem; font-size: .68rem; text-transform: uppercase; letter-spacing: .1em; opacity: .55; font-weight: 700; }
+.crm-table td { border-top: 1px solid var(--crm-line); padding: .85rem 1rem; vertical-align: middle; }
+.crm-table tbody tr:hover { background: var(--crm-raised); }
+.crm-muted { opacity: .63; }
+.crm-skeleton { min-height: 1rem; border-radius: .3rem; background: var(--crm-raised); animation: crm-pulse 1.5s ease-in-out infinite; }
+@keyframes crm-pulse { 50% { opacity: .38; } }
+.crm-modal-backdrop { position: fixed; z-index: 100; inset: 0; background: color-mix(in srgb, var(--background-base) 76%, transparent); display: flex; align-items: center; justify-content: center; padding: 1rem; }
+.crm-modal { width: min(100%, 780px); max-height: min(92dvh, 940px); overflow: auto; background: var(--background-base); border: 1px solid var(--crm-line); border-radius: var(--theme-radius); box-shadow: 0 20px 60px color-mix(in srgb, var(--background-base) 55%, transparent); padding: clamp(1rem,3vw,2rem); }
+@media (max-width: 767px) { .crm-table thead { display:none; } .crm-table, .crm-table tbody, .crm-table tr, .crm-table td { display:block; } .crm-table tr { border-top: 1px solid var(--crm-line); padding: .5rem 0; } .crm-table td { border: 0; padding: .18rem 1rem; } }
+
 /* Scan the published design-system bundle so its utility classes survive
    Tailwind's JIT purge. */
 @source '../node_modules/@nous-research/ui/dist';

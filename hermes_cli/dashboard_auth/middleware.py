@@ -270,6 +270,10 @@ async def gated_auth_middleware(
     if _path_is_public(path):
         return await call_next(request)
 
+    from crm.api import is_webhook_request
+    if is_webhook_request(path, request.method):
+        return await call_next(request)
+
     at, _rt = read_session_cookies(request)
     if not at and not _rt:
         # Neither token present — no session at all. Nothing to verify or

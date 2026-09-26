@@ -104,7 +104,7 @@ def get_chain(r, chain_id: str) -> Optional[Dict[str, Any]]:
 def save_chain(r, chain: Dict[str, Any]) -> None:
     chain["updated_at"] = int(time.time())
     r.set(f"dispatch:chain:{chain['id']}", json.dumps(chain, ensure_ascii=False),
-          ex=CHAIN_TTL)
+          ex=None if chain.get("origin") == "crm" else CHAIN_TTL)
     if chain.get("status") in _ACTIVE_STATUSES:
         r.sadd("dispatch:active", chain["id"])
     else:
@@ -139,7 +139,8 @@ def save_chain_guarded(r, chain: Dict[str, Any],
                         f"refusing transition to {chain['status']}.")
                 chain["updated_at"] = int(time.time())
                 pipe.multi()
-                pipe.set(key, json.dumps(chain, ensure_ascii=False), ex=CHAIN_TTL)
+                pipe.set(key, json.dumps(chain, ensure_ascii=False),
+                         ex=None if chain.get("origin") == "crm" else CHAIN_TTL)
                 if chain.get("status") in _ACTIVE_STATUSES:
                     pipe.sadd("dispatch:active", chain["id"])
                 else:
@@ -155,6 +156,22 @@ def push_inbox(r, agent: str, event: Dict[str, Any]) -> None:
     r.rpush(key, json.dumps(event, ensure_ascii=False))
     r.ltrim(key, -INBOX_MAX, -1)
     r.expire(key, CHAIN_TTL)
+
+
+def notification_chain(chain_id: str, recipient: str, task: str, event_id: str) -> dict:
+    """Build a trusted CRM intake root, committed atomically with its outbox.
+
+    This is not agent delegation (no fake sender adapter or self-dispatch).
+    Subsequent agent delegation still uses create_chain's lineage/depth rails.
+    """
+    return {
+        "id": chain_id, "root_id": chain_id, "parent_id": "", "depth": 0,
+        "from": "crm-system", "to": recipient, "task": task,
+        "status": "pending", "thread_id": "", "order_message_id": "",
+        "agents": [recipient], "waiting_on": "", "question": "", "result": "",
+        "origin": "crm", "crm_event_id": event_id, "created_at": int(time.time()),
+        "updated_at": int(time.time()),
+    }
 
 
 def push_outbox(r, agent: str, action: Dict[str, Any]) -> None:

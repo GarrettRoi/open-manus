@@ -258,6 +258,9 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
 
+from crm.api import router as _crm_router, is_webhook_request as _crm_webhook_request
+app.include_router(_crm_router)
+
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # The desktop shell mints the token and injects it via
@@ -566,6 +569,8 @@ async def _dashboard_auth_gate(request: Request, call_next):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
+    if _crm_webhook_request(request.url.path, request.method):
+        return await call_next(request)
     # A request already authenticated by the token-auth seam (a service caller
     # presenting a bearer token on a registered token route) carries
     # ``token_authenticated`` — never bounce it through the cookie/session gate.

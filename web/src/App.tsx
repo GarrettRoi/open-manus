@@ -23,6 +23,7 @@ import {
   BarChart3,
   BookOpen,
   Clock,
+  ContactRound,
   Code,
   Cpu,
   Database,
@@ -95,6 +96,7 @@ import AccountsPage from "@/pages/AccountsPage";
 import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
+import CrmPage from "@/pages/CrmPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -137,6 +139,7 @@ const CHAT_NAV_ITEM: NavItem = {
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
+  "/crm": CrmPage,
   "/files": FilesPage,
   "/videos": VideosPage,
   "/analytics": AnalyticsPage,
@@ -173,6 +176,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
+  { path: "/crm", label: "Lead desk", icon: ContactRound },
   { path: "/files", label: "Files", icon: FolderOpen },
   { path: "/videos", label: "Videos", icon: Film },
   {
@@ -385,6 +389,7 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  const isCrmRoute = normalizedPath === "/crm";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
@@ -728,6 +733,7 @@ export default function App() {
             <div
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
+                isCrmRoute && "overflow-y-auto",
                 "px-3 sm:px-6",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"

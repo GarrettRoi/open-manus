@@ -90,6 +90,7 @@ class DispatchManager:
         self._tasks.append(asyncio.create_task(self._safe(self._publish_roster())))
         self._tasks.append(asyncio.create_task(self._safe(self._outbox_loop())))
         self._tasks.append(asyncio.create_task(self._safe(self._intake_loop())))
+        self._tasks.append(asyncio.create_task(self._safe(self._crm_loop())))
         if self.agent == "harmony":
             self._tasks.append(asyncio.create_task(self._safe(self._pm_loop())))
         logger.info("[%s] dispatch: started (channel=%s, pm=%s)",
@@ -260,7 +261,24 @@ class DispatchManager:
             ch = await client.fetch_channel(int(channel_id))
         return ch
 
-    async def _open_chain(self, r, store, chain: Dict[str, Any]) -> None:
+    async def _crm_loop(self) -> None:
+        """Each recipient drains its own durable CRM events, without a sender bot."""
+        from crm.delivery import CRMDelivery
+        while True:
+            try:
+                r = await asyncio.to_thread(self._redis)
+
+                async def prepare(chain):
+                    await self._open_chain(r, _store(), chain, enqueue_order=False)
+
+                await CRMDelivery(r, self.agent, prepare, self._inject_turn).run()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[%s] CRM delivery unavailable; retrying", self.agent)
+                await asyncio.sleep(10)
+
+    async def _open_chain(self, r, store, chain: Dict[str, Any], *, enqueue_order=True) -> None:
         """Create the chain thread in the dispatch channel and post the order.
 
         Idempotent: a retry after a partial failure reuses the existing
@@ -268,7 +286,8 @@ class DispatchManager:
         claim dedups a re-pushed order event.
         """
         if chain.get("thread_id"):
-            store.push_inbox(r, chain["to"], {"kind": "order", "chain_id": chain["id"]})
+            if enqueue_order:
+                store.push_inbox(r, chain["to"], {"kind": "order", "chain_id": chain["id"]})
             return
         channel = await self._get_channel(self.channel_id)
         title = f"#{chain['id']} {chain['from']}→{chain['to']}: {chain['task'][:60]}"
@@ -290,11 +309,12 @@ class DispatchManager:
         msg = await thread.send(order_text)
         chain["thread_id"] = str(thread.id)
         chain["order_message_id"] = str(msg.id)
-        store.save_chain(r, chain)
+        store.save_chain_guarded(r, chain, {"pending", "acked"})
         await asyncio.to_thread(
             lambda: r.set(f"dispatch:thread:{thread.id}", chain["id"], ex=store.CHAIN_TTL))
         # Hand the order to the assignee's intake watcher.
-        store.push_inbox(r, chain["to"], {"kind": "order", "chain_id": chain["id"]})
+        if enqueue_order:
+            store.push_inbox(r, chain["to"], {"kind": "order", "chain_id": chain["id"]})
         logger.info("[%s] dispatch: opened chain %s thread %s → %s",
                     self.agent, chain["id"], thread.id, chain["to"])
 
@@ -473,6 +493,7 @@ class DispatchManager:
         )
         event = MessageEvent(
             text=text,
+            message_id=f"crm:{chain['crm_event_id']}" if chain.get("origin") == "crm" else None,
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
