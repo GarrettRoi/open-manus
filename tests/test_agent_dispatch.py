@@ -101,6 +101,30 @@ def test_auto_parent_inference_while_working_an_order():
     assert sub["depth"] == 1
 
 
+def test_legacy_auto_parent_is_ambiguous_with_overlapping_assignments():
+    """Historical reproduction only: v2 requires explicit parent_chain_id.
+
+    The old inference picks whichever active assignment was updated last,
+    even if the new work actually belongs to another assignment. This fake
+    Redis fixture never probes or connects to the workspace datastore.
+    """
+    r = _r()
+    _seed_roster(r, "a", "b", "c", "d")
+    intended = store.create_chain(r, "a", "b", "first assignment")
+    newer = store.create_chain(r, "d", "b", "unrelated assignment")
+    store.mark_working(r, intended["id"], "b")
+    store.mark_working(r, newer["id"], "b")
+    # Distinct timestamps make the historical heuristic deterministic.
+    first = store.get_chain(r, intended["id"])
+    second = store.get_chain(r, newer["id"])
+    first["updated_at"] = 100
+    second["updated_at"] = 200
+    r.set(f"dispatch:chain:{intended['id']}", json.dumps(first))
+    r.set(f"dispatch:chain:{newer['id']}", json.dumps(second))
+    sub = store.create_chain(r, "b", "c", "research for first assignment")
+    assert sub["parent_id"] == newer["id"]  # reproduces the old defect
+
+
 def test_parent_requires_participation():
     r = _r()
     _seed_roster(r, "a", "b", "c", "d")
@@ -241,14 +265,22 @@ def test_tool_dispatch_and_roster():
     _seed_roster(r, "aria", "lexi")
     with patch.object(store, "_redis", return_value=r), \
          patch.dict("os.environ", {"AGENT_NAME": "aria"}):
-        out = json.loads(store.agent_dispatch_tool({"action": "roster"}))
-        assert {e["agent"] for e in out["roster"]} == {"aria", "lexi"}
+        with patch("tools.vault_tools.discover_agents",
+                   return_value={"agents": [{"agent": "lexi"}]}) as discovery:
+            out = json.loads(store.agent_dispatch_tool({"action": "search", "service": "email"}))
+            assert out["agents"] == [{"agent": "lexi"}]
+            discovery.assert_called_once_with({"action": "search", "service": "email"})
         out = json.loads(store.agent_dispatch_tool(
             {"action": "dispatch", "to": "lexi", "task": "audit the vault"}))
-        assert out["dispatched"] and out["chain_id"]
+        assert "retired" in out["error"]
+        assert not list(r.scan_iter("dispatch:chain:*"))
         out = json.loads(store.agent_dispatch_tool(
-            {"action": "status", "chain_id": out["chain_id"]}))
-        assert out["chain"]["to"] == "lexi"
+            {"action": "submit", "to": "lexi", "objective": "Audit the vault",
+             "inputs": {}, "constraints": ["Read only"], "expected_output": "Report"}))
+        assert out["ticket"]["status"] == "queued"
+        out = json.loads(store.agent_dispatch_tool(
+            {"action": "status", "chain_id": out["ticket"]["id"]}))
+        assert out["ticket"]["to"] == "lexi"
 
 
 def test_tool_error_paths():

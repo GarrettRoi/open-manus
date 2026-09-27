@@ -428,6 +428,89 @@ def _slim(chain: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def agent_dispatch_tool(args: dict, **_kw) -> str:
+    """V2 native interface; legacy records remain readable and cancellable."""
+    from tools.dispatch_tickets import TicketStore, ticket_execution_context
+    action = str(args.get("action") or "").strip().lower()
+    me = _agent_name()
+    try:
+        if action in ("search", "inspect_access", "roster"):
+            from tools.vault_tools import discover_agents
+            query = dict(args)
+            if action == "inspect_access" and not args.get("agent"):
+                raise ValueError("agent is required for inspect_access.")
+            return json.dumps(discover_agents(query), ensure_ascii=False)
+        r = _redis()
+        tickets = TicketStore(r)
+        cid = str(args.get("chain_id") or args.get("ticket_id") or "").strip()
+        if action in ("dispatch", "submit"):
+            if "task" in args and not args.get("objective"):
+                raise ValueError("Legacy task-only dispatch is retired. Submit objective, inputs, constraints, expected_output and to; no text was truncated or queued.")
+            t = tickets.submit(
+                me, str(args.get("to") or ""), args.get("objective"),
+                args.get("inputs"), args.get("constraints"), args.get("expected_output"),
+                artifacts=args.get("artifacts"), parent_id=str(args.get("parent_chain_id") or ""),
+                dedup_key=str(args.get("dedup_key") or ""))
+            return json.dumps({"ticket": t, "note": "Durably queued. Result retrieval is explicit; no completion conversation is scheduled."})
+        if action == "continue_parent":
+            return json.dumps({"ticket": tickets.continue_parent(cid, me)})
+        if action == "list":
+            return json.dumps({"tickets": tickets.list_for(me, int(args.get("limit", 50))),
+                               "legacy_chains": [_slim(c) for c in list_chains_for(r, me)],
+                               "legacy_note": "Legacy chains retain history; waiting/question flow is retired. Cancel and submit a complete structured ticket."})
+        if action in ("status", "result", "cancel", "complete", "blocked", "working",
+                      "question", "answer"):
+            chain = _require_chain(r, cid)
+            if me not in (chain.get("from"), chain.get("to")):
+                raise PermissionError("Not a ticket participant.")
+            if chain.get("version") != 2:
+                # Trusted CRM intake and existing legacy/dev-request callers
+                # still finish already-issued work. Only conversational
+                # negotiation/new legacy submission is retired.
+                if action in ("working", "complete"):
+                    if action == "working":
+                        updated = mark_working(r, cid, me)
+                    else:
+                        text = str(args.get("text") or "").strip()
+                        if not text or len(text) > RESULT_MAX:
+                            raise ValueError(f"Legacy result requires 1..{RESULT_MAX} characters; use artifact references.")
+                        updated = complete_chain(r, cid, me, text, success=args.get("success", True))
+                    return json.dumps({"legacy_chain": updated,
+                                       "note": "Existing work completed through compatibility path; new requests use structured tickets."})
+                if action in ("status", "result"):
+                    return json.dumps({"legacy_chain": chain, "migration_required": True,
+                                       "note": "Legacy record preserved. Cancel and resubmit a structured ticket; no automatic question/answer migration."})
+                if action == "cancel":
+                    return json.dumps({"legacy_chain": cancel_chain(r, cid, me, str(args.get("text") or ""))})
+                raise ValueError("Legacy workflow retired for this interface. Cancel and resubmit structured work; stored history is preserved.")
+            if action in ("status", "result"):
+                return json.dumps({"ticket": tickets.get(cid, me)})
+            if action == "cancel":
+                return json.dumps({"ticket": tickets.cancel(cid, me, str(args.get("text") or ""))})
+            if action in ("question", "answer"):
+                raise ValueError("Conversational negotiation is retired. Return blocked with required_inputs; requester may submit new complete work.")
+            ctx = ticket_execution_context.get() or {}
+            if ctx.get("ticket_id") != cid or me != chain["to"]:
+                raise PermissionError("Completion requires the current fenced ticket execution context.")
+            if action == "working":
+                return json.dumps({"ticket": tickets.get(cid, me),
+                                   "note": "Running state is recorded by durable runtime acceptance."})
+            status = "blocked" if action == "blocked" else ("succeeded" if args.get("success", True) else "failed")
+            if ctx.get("approval_required"):
+                return json.dumps({"ticket": tickets.finish(
+                    cid, ctx.get("token"), "blocked",
+                    "Owner approval is required for this unattended ticket.",
+                    required_inputs=["Explicit owner authorization in an interactive session"])})
+            return json.dumps({"ticket": tickets.finish(cid, ctx.get("token"), status,
+                              str(args.get("text") or ""), args.get("artifacts"),
+                              args.get("required_inputs"))})
+        raise ValueError("Unknown action. Use submit, search, inspect_access, list, status, result, complete, blocked, cancel, continue_parent.")
+    except Exception as e:
+        logger.exception("agent ticket tool failed")
+        return json.dumps({"error": str(e)})
+
+
+def _legacy_agent_dispatch_tool(args: dict, **_kw) -> str:
+    """Historical implementation retained only for source compatibility."""
     action = str(args.get("action") or "").strip().lower()
     me = _agent_name()
     try:
@@ -503,32 +586,40 @@ registry.register(
     schema={
         "name": "agent_dispatch",
         "description": (
-            "Delegate a task to another agent in the fleet, or manage a "
-            "dispatch chain you are part of. Each chain gets a Discord thread "
-            "in the shared dispatch channel — that thread is the audit trail. "
-            "PROTOCOL: never post chat messages in dispatch threads; all "
-            "communication goes through this tool. When you RECEIVE an order "
-            "you are auto-acked with 👀 — call action='working' when you "
-            "start, action='question' if blocked (addressee 'owner' for the "
-            "human owner, or an agent name), and action='complete' with the "
-            "result when finished (success=false if you failed). When you "
-            "DISPATCH (action='dispatch', with 'to' and 'task'), you'll be "
-            "notified in a new turn on completion — do not poll. Peer-to-peer "
-            "dispatch is preferred for simple work; check action='roster' for "
-            "who can do what. If you are working a dispatched order and need "
-            "to sub-delegate, pass parent_chain_id so depth/fan-out rails "
-            "apply. action='list' shows your active chains."
+            "Submit durable targeted work with objective, inputs, constraints and "
+            "expected_output. Discord and Harmony are not delivery prerequisites. "
+            "Search or inspect_access for current grant-backed discovery. Return "
+            "one complete result or blocked with required_inputs, never questions. "
+            "Results are stored without automatic LLM wakeups. continue_parent is "
+            "an explicit requester-only bounded, deduplicated synthesis request "
+            "for a blocked parent whose children finished. External actions still "
+            "require normal approvals; delegation never transfers grants. Legacy "
+            "records remain inspectable/cancellable, not conversationally resumed."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["dispatch", "working", "question", "answer",
-                             "complete", "cancel", "status", "list", "roster"],
+                    "enum": ["submit", "dispatch", "search", "inspect_access",
+                             "complete", "blocked", "cancel", "status", "result",
+                             "list", "continue_parent"],
                 },
+                "objective": {"type": "string"},
+                "inputs": {"type": "object", "description": "Required input values or artifact references; explicitly empty if none."},
+                "constraints": {"type": "array", "items": {"type": "string"}},
+                "expected_output": {"type": "string"},
+                "artifacts": {"type": "array", "items": {"type": "string"}},
+                "required_inputs": {"type": "array", "items": {"type": "string"}},
+                "dedup_key": {"type": "string"},
+                "query": {"type": "string"},
+                "service": {"type": "string"},
+                "capability": {"type": "string"},
+                "account": {"type": "string"},
+                "agent": {"type": "string"},
+                "limit": {"type": "integer"},
                 "to": {"type": "string",
-                       "description": "Target agent name (dispatch) or question addressee (question; 'owner' = human owner)."},
+                       "description": "Explicit assignee agent name."},
                 "task": {"type": "string",
                          "description": "Full task description with success criteria (dispatch)."},
                 "chain_id": {"type": "string",
@@ -544,6 +635,6 @@ registry.register(
         },
     },
     handler=agent_dispatch_tool,
-    check_fn=lambda: bool(os.getenv("REDIS_URL")) and bool(os.getenv("DISPATCH_CHANNEL_ID")),
-    description="Discord-native inter-agent task dispatch (chains, threads, reactions)",
+    check_fn=lambda: bool(os.getenv("REDIS_URL")),
+    description="Durable targeted agent request tickets and grant-backed discovery",
 )

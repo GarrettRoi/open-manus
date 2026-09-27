@@ -218,7 +218,7 @@ def _collect_legacy_board(agent: str) -> List[Dict[str, Any]]:
 
 
 def _collect_dispatch(agent: str) -> List[Dict[str, Any]]:
-    """Active dispatch chains where this agent is the assignee."""
+    """Legacy active chains and durable tickets, including recent outcomes."""
     try:
         from tools import agent_dispatch as store
         r = store._redis()
@@ -235,6 +235,38 @@ def _collect_dispatch(agent: str) -> List[Dict[str, Any]]:
                 "from": (chain.get("from") or "").lower(),
                 "thread_id": str(chain.get("thread_id") or ""),
             })
+        from tools.dispatch_tickets import TicketStore
+        now = time.time()
+        for ticket in TicketStore(r).list_for(agent, limit=100):
+            if ticket.get("to") != agent:
+                continue
+            if ticket.get("status") in {"succeeded", "failed", "cancelled"}:
+                if now - float(ticket.get("updated_at", 0)) > DONE_WINDOW_SECONDS:
+                    continue
+            delivery = ticket.get("delivery") or {}
+            availability = r.get(f"dispatch:availability:{agent}")
+            try:
+                available_at = float(json.loads(availability or "{}").get("updated_at", 0))
+            except (ValueError, TypeError):
+                available_at = 0
+            offline_reason = (
+                "No fresh recipient heartbeat; awaiting running gateway"
+                if ticket["status"] == "queued" and now - available_at > 90 else ""
+            )
+            result = ticket.get("result") or ""
+            if isinstance(result, dict):
+                result = result.get("summary") or result.get("text") or ""
+            item = {
+                "kind": "dispatch", "id": str(ticket["id"]),
+                "title": str(ticket.get("objective") or ticket.get("task") or "")[:120],
+                "status": ticket["status"], "from": ticket.get("from", ""),
+                "thread_id": "", "ticket": True,
+                "delivery": str(delivery.get("state") or delivery.get("status") or "unknown"),
+                "delivery_reason": str(delivery.get("reason") or delivery.get("last_error") or offline_reason)[:160],
+                "result": str(result)[:160],
+            }
+            out = [old for old in out if old["id"] != item["id"]]
+            out.append(item)
         return out
     except Exception:
         logger.debug("taskboard: dispatch read failed", exc_info=True)
@@ -250,6 +282,7 @@ _KANBAN_EMOJI = {
     "running": "🔧", "blocked": "⛔", "review": "🔎", "done": "✅",
 }
 _DISPATCH_EMOJI = {
+    "queued": "📨", "running": "🔧", "succeeded": "✅", "blocked": "⛔",
     "pending": "📨", "acked": "👀", "working": "🔧",
     "waiting": "❓", "done": "✅", "failed": "❌", "cancelled": "🚫",
 }
@@ -261,6 +294,13 @@ def _line(item: Dict[str, Any]) -> str:
         return f"{icon} {item['title']}"
     if item["kind"] == "dispatch":
         icon = _DISPATCH_EMOJI.get(item["status"], "📨")
+        if item.get("ticket"):
+            detail = f" · delivery: {item.get('delivery', 'unknown')}"
+            if item.get("delivery_reason"):
+                detail += f" ({item['delivery_reason']})"
+            result = f" · {item['result']}" if item.get("result") else ""
+            return (f"{icon} ticket #{item['id']} **{item['status']}** from "
+                    f"**{item.get('from', '?')}**: {item['title']}{detail}{result}")
         link = f" → <#{item['thread_id']}>" if item.get("thread_id") else ""
         return f"{icon} chain #{item['id']} from **{item.get('from', '?')}**: {item['title']}{link}"
     icon = _KANBAN_EMOJI.get(item["status"], "•")
@@ -329,6 +369,9 @@ def diff_updates(old: Dict[str, Dict[str, Any]],
             label = item["title"] if item["kind"] != "kanban" else \
                 f"`{item['id']}` {item['title']}"
             updates.append(f"{icon} {label}: **{prev['status']}** → **{item['status']}**")
+        elif item.get("ticket") and any(prev.get(k) != item.get(k) for k in
+                                       ("delivery", "delivery_reason", "result")):
+            updates.append(_line(item))
     for key, item in old.items():
         if key in new:
             continue

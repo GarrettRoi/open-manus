@@ -91,8 +91,8 @@ class DispatchManager:
         self._tasks.append(asyncio.create_task(self._safe(self._outbox_loop())))
         self._tasks.append(asyncio.create_task(self._safe(self._intake_loop())))
         self._tasks.append(asyncio.create_task(self._safe(self._crm_loop())))
-        if self.agent == "harmony":
-            self._tasks.append(asyncio.create_task(self._safe(self._pm_loop())))
+        # Legacy PM nudges/dialogue are retired. V2 work is supervised by the
+        # gateway; Discord remains a mirror, never an execution dependency.
         logger.info("[%s] dispatch: started (channel=%s, pm=%s)",
                     self.agent, self.channel_id, self.agent == "harmony")
 
@@ -234,6 +234,11 @@ class DispatchManager:
         kind = action.get("kind")
         chain_id = str(action.get("chain_id") or "")
         chain = store.get_chain(r, chain_id) if chain_id else None
+        if chain and chain.get("version") == 2:
+            return  # exclusively owned by gateway.ticket_consumer
+        if chain and chain.get("origin") not in ("crm", "devreq"):
+            logger.warning("Legacy outbox chain %s requires explicit migration", chain_id)
+            return
         if not chain:
             logger.warning("[%s] dispatch: outbox action for missing chain %s",
                            self.agent, chain_id)
@@ -401,6 +406,13 @@ class DispatchManager:
         kind = event.get("kind")
         chain = store.get_chain(r, str(event.get("chain_id") or ""))
         if not chain:
+            return
+        if chain.get("version") == 2:
+            return  # no legacy ack/injection, even for stale queued events
+        if chain.get("origin") not in ("crm", "devreq"):
+            logger.warning(
+                "Legacy chain %s requires explicit migration; no conversational intake",
+                chain.get("id"))
             return
         if kind == "order":
             # One-ack-per-order dedup: SETNX claim.

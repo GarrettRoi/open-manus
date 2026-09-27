@@ -4042,7 +4042,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.platform.value,
                 )
 
-        if not self.adapters and not self._failed_platforms:
+        if (not self.adapters and not self._failed_platforms
+                and getattr(self, "_ticket_consumer", None) is None):
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
                 self._exit_with_failure = True
@@ -7200,6 +7201,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        # Durable request intake belongs to the gateway, not any messaging
+        # adapter. This also runs when no platform credentials are configured.
+        from gateway.ticket_consumer import configured_consumer
+        self._ticket_consumer = configured_consumer(
+            self._handle_message, self._interrupt_ticket_execution)
+        if self._ticket_consumer is not None:
+            self._ticket_consumer.start()
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -8028,6 +8036,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
+            consumer = getattr(self, "_ticket_consumer", None)
+            if consumer is not None:
+                await consumer.stop()
             def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 
@@ -8799,6 +8810,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _adapter_for_source(self, source):
+        consumer = getattr(self, "_ticket_consumer", None)
+        if (consumer is not None and source is not None
+                and source.platform == Platform.LOCAL
+                and str(source.chat_id).startswith("ticket:")
+                and source.user_id == "ticket-system"):
+            return consumer.adapter
+        return super()._adapter_for_source(source)
+
+    async def _interrupt_ticket_execution(self, source):
+        await self._interrupt_and_clear_session(
+            build_session_key(source), source,
+            interrupt_reason="Ticket execution finished, cancelled, or lease lost",
+            invalidation_reason="ticket_execution_ended")
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8813,6 +8839,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+
+        if (source is not None and source.platform == Platform.LOCAL
+                and str(source.chat_id).startswith("ticket:")):
+            from tools.dispatch_tickets import ticket_execution_context
+            ticket_ctx = ticket_execution_context.get() or {}
+            if (not event.internal or source.user_id != "ticket-system"
+                    or source.chat_id != f"ticket:{ticket_ctx.get('ticket_id')}"
+                    or not ticket_ctx.get("token")):
+                raise PermissionError("Ticket intake requires a fenced internal execution context")
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -18407,6 +18442,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+                from tools.approval import _block_ticket_approval
+                if _block_ticket_approval() is not None:
+                    raise RuntimeError("Unattended ticket cannot request interactive approval")
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
                 # assistant_threads_setStatus disables the compose box — the

@@ -2009,6 +2009,46 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     return env_type in ("singularity", "modal", "daytona")
 
 
+def _ticket_context():
+    """Execution identity, not a user/owner authorization grant."""
+    import sys
+    module = sys.modules.get("tools.dispatch_tickets")
+    return module.ticket_execution_context.get() if module is not None else None
+
+
+def _block_ticket_approval():
+    ctx = _ticket_context()
+    if ctx is None:
+        return None
+    ctx["approval_required"] = True
+    return {
+        "approved": False,
+        "message": "BLOCKED: This unattended ticket requires explicit owner approval. "
+                   "Return blocked with required_inputs; do not retry the action.",
+    }
+
+
+def _ticket_command_guard(command, *, scan=False):
+    # Ticket work cannot inherit CLI yolo, permanent owner approvals, smart
+    # approval, or mode=off. Detect before those interactive shortcuts.
+    if _ticket_context() is None:
+        return None
+    if (detect_dangerous_command(command)[0]
+            or detect_hardline_command(command)[0]
+            or _match_user_deny_rule(command) is not None
+            or _check_sudo_stdin_guard(command)[0]):
+        return _block_ticket_approval()
+    if scan:
+        try:
+            from tools.tirith_security import check_command_security
+            finding = check_command_security(command)
+        except Exception:
+            return _block_ticket_approval()
+        if finding.get("action") != "allow":
+            return _block_ticket_approval()
+    return None
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
                             has_host_access: bool = False) -> dict:
@@ -2027,6 +2067,9 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
+    ticket_block = _ticket_command_guard(command)
+    if ticket_block is not None:
+        return ticket_block
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
@@ -2174,6 +2217,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    if _block_ticket_approval() is not None:
+        return {"resolved": True, "choice": "deny"}
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
@@ -2291,6 +2336,9 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
+    ticket_block = _ticket_command_guard(command, scan=True)
+    if ticket_block is not None:
+        return ticket_block
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
@@ -2712,6 +2760,9 @@ def check_execute_code_guard(code: str, env_type: str,
     trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
     require approval).
     """
+    ticket_block = _block_ticket_approval()
+    if ticket_block is not None:
+        return ticket_block
     pattern_key = "execute_code"
     description = (
         "execute_code script execution. The script can spawn subprocesses or "
@@ -2919,6 +2970,8 @@ def request_elicitation_consent(
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
+    if _block_ticket_approval() is not None:
+        return "decline"
     try:
         session_key = get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive

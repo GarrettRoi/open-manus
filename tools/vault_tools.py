@@ -33,6 +33,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlencode, quote
 
 from tools.registry import registry
 
@@ -1368,6 +1369,33 @@ def _ensure_refresh_thread():
 # ---------------------------------------------------------------------------
 # Static `vault` meta-tool
 # ---------------------------------------------------------------------------
+
+def discover_agents(args: dict) -> dict:
+    """Query vault-owned, grant-scoped public directory; never use roster as authority."""
+    if not VAULT_TOKEN:
+        return {"error": "VAULT_TOKEN not set — agent discovery unavailable."}
+    agent = str(args.get("agent") or "").strip().lower()
+    if agent:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", agent):
+            return {"error": "Invalid agent name"}
+        path = f"/api/vault/discovery/{quote(agent)}"
+    else:
+        params = {key: str(args[key]) for key in
+                  ("query", "service", "capability", "account", "limit")
+                  if args.get(key) is not None}
+        path = "/api/vault/discovery"
+        if params:
+            path += "?" + urlencode(params)
+    try:
+        result = _vault_http("GET", path)
+        if not isinstance(result, dict):
+            return {"error": "Vault discovery returned an invalid response"}
+        return result
+    except HTTPError as exc:
+        return {"error": f"Vault discovery rejected request (HTTP {exc.code})"}
+    except Exception as exc:
+        logger.warning("Vault discovery unavailable: %s", type(exc).__name__)
+        return {"error": "Vault discovery unavailable; check vault connectivity and authorization."}
 
 def check_vault_requirements() -> bool:
     return bool(VAULT_TOKEN)

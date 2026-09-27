@@ -37,6 +37,7 @@ import amazon_ops
 from amazon_ops import AmazonOpsError
 import custom_mcp
 import discord_ops
+import discovery as discovery_mod
 from discord_ops import DiscordOpsError
 import email_ops
 import google_ops
@@ -2240,6 +2241,50 @@ async def fetch_key_removed(key_name: str, request: Request):
             "credential for you. See /api/vault/list for your connections."
         ),
     )
+
+
+@app.get("/api/vault/discovery")
+async def discover_agents(request: Request, query: str = "", service: str = "",
+                          capability: str = "", account: str = "", limit: int = 10):
+    require_agent(request)
+    return discovery_mod.search_agents(
+        r, store, AGENT_NAMES, query=query, service=service,
+        capability=capability, account=account, limit=limit)
+
+
+@app.get("/api/vault/discovery/{agent}")
+async def inspect_agent(request: Request, agent: str):
+    require_agent(request)
+    if agent not in AGENT_NAMES:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return discovery_mod.public_agent(r, store, agent)
+
+
+@app.put("/api/admin/discovery/{agent}")
+async def admin_discovery_metadata(request: Request, agent: str):
+    require_admin_api(request)
+    require_browser_csrf(request)
+    _require_json_content_type(request)
+    if agent not in AGENT_NAMES:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    metadata = discovery_mod.validate_metadata(await request.json(), agent, store)
+    r.set(f"{discovery_mod.KEY_PREFIX}{agent}", json.dumps(metadata))
+    audit_log("admin", agent, "discovery_metadata_updated",
+              f"{len(metadata['connections'])} approved connection entries")
+    return {"ok": True, "agent": agent, "connections": len(metadata["connections"])}
+
+
+@app.get("/api/admin/discovery/{agent}")
+async def admin_get_discovery_metadata(request: Request, agent: str):
+    require_admin_api(request)
+    if agent not in AGENT_NAMES:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    raw = r.get(f"{discovery_mod.KEY_PREFIX}{agent}")
+    try:
+        metadata = json.loads(raw) if raw else {"connections": []}
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=500, detail="Stored discovery metadata is invalid")
+    return metadata
 
 
 @app.get("/api/vault/list")

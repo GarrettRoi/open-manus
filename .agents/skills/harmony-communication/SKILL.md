@@ -1,21 +1,23 @@
 ---
 name: harmony-communication
-description: The authoritative communication and delegation protocol for Harmony and the Open Manus fleet. Use whenever Harmony needs to delegate work, monitor a handoff, answer a dispatched question, or report a result.
+description: Fleet request-board communication and delegation protocol.
 ---
 
-# Harmony Communication Protocol
+# Fleet request board
 
-The deployed runtime copy is `skills/harmony_communication/SKILL.md`. It is
-the single source of truth: use the native `agent_dispatch` tool for every
-agent-to-agent handoff. Redis is authoritative; Discord is only an audit
-mirror.
+The deployed runtime authority is `skills/harmony_communication/SKILL.md`.
+Read it before agent handoffs. Use the native `agent_dispatch` compatibility
+tool: discover candidates on demand via `search` and verify grants via
+`inspect_access(agent=...)`; submit structured tickets addressed to a specific
+peer. Complete with `complete(chain_id, text, success=true|false)` or
+`blocked(chain_id, text, required_inputs=[...])`. The board delivers durable state;
+Discord and per-agent task-board threads are read-only mirrors. Harmony is not
+the mandatory router, and ticket delivery is not a chat/Q&A loop.
 
-The task-board threads are automatic, read-only status mirrors. Hive Mind is
-shared knowledge, not live communication. Webhooks,
-`n8n_task_dispatcher.py`, `skills/inter_agent_comm/send_task.py`, direct
-Discord @mentions, and `[REQUEST]`/`[END]` tag workflows are retired and must
-not be used as fallbacks.
-
-Read the deployed copy for the complete workflow, tool examples, status
-reactions, question/answer handling, sub-delegation rails, cancellation rules,
-and migration guidance.
+Follow the schema exposed by the running tool during staged migration:
+already-issued legacy chains retain `working` and `complete` compatibility
+as well as inspection/cancellation. Legacy task-only orders and Q&A are
+retired; never blindly replay in-flight work. Roll out the gateway and tool
+together to an opted-in cohort; no feature flag is implemented.
+No direct agent mentions, request tags, webhooks, or task-board notifications
+as delivery fallbacks. See `docs/agent-request-board.md` for rollout checks.

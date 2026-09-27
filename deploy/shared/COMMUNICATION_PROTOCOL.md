@@ -1,40 +1,24 @@
-# Agent Communication Protocol
+# Fleet agent request board
 
-> **Authoritative fleet rule:** use the native `agent_dispatch` tool for all
-> live agent-to-agent communication. Read
-> `/app/skills/harmony_communication/SKILL.md` for the complete protocol.
+The detailed authority is `/app/skills/harmony_communication/SKILL.md`.
+`agent_dispatch` is the compatibility tool name; use the running tool's schema
+during migration. Already-issued legacy chains can still be inspected, marked
+`working`, completed, or cancelled through controlled compatibility; new
+task-only orders and legacy question/answer negotiation are retired.
 
-## System boundaries
+For new work, search for a specialist on demand, inspect their current grants
+with `inspect_access(agent=...)`, then submit one ticket to that peer with
+`to`, `objective`, `inputs` (object), `constraints` (array),
+`expected_output`, and `artifacts` (array). Harmony is not a mandatory
+router. The recipient performs the work silently and calls
+`complete(chain_id, text, success=true|false)` or
+`blocked(chain_id, text, required_inputs=[...])`. Do not use a ticket as an
+automated Q&A conversation.
+Read status only when needed.
 
-1. **`agent_dispatch` is the only communication bus.** It creates a Redis-backed
-   chain, injects the assignee's turn, and mirrors the chain to a Discord
-   thread.
-2. **Discord dispatch threads are an audit surface, not a chat room.** Agents
-   use the tool for dispatch, working, questions, answers, completion, and
-   cancellation. They do not post instructions or acknowledgements there.
-3. **Task-board threads are read-only mirrors.** They show state and updates;
-   posting there never delegates work and must not trigger a response.
-4. **Hive Mind is memory, not messaging.** Use it for reusable lessons only.
-5. **Webhooks, `inter_agent_comm`, `n8n_task_dispatcher`, and `[REQUEST]`,
-   `[NOTIFY]`, `[END]`, and `[BLOCKED]` tag workflows are retired.** Do not
-   use them as fallbacks.
-
-## Minimal protocol
-
-```text
-agent_dispatch(action="dispatch", to="<agent>", task="<self-contained task>")
-agent_dispatch(action="working", chain_id="<id>")
-agent_dispatch(action="question", chain_id="<id>", to="owner", text="<question>")
-agent_dispatch(action="answer", chain_id="<id>", text="<answer>")
-agent_dispatch(action="complete", chain_id="<id>", text="<result>", success=true)
-```
-
-Use `status`, `list`, and `roster` for inspection; use `cancel` only for
-intentional cancellation. If `agent_dispatch` is unavailable, report the
-configuration problem rather than silently switching buses.
-
-## Historical note
-
-Older deployments used Discord tags, webhooks, and separate Redis inbox
-scripts. Those paths are retained only so historical messages and old files
-remain understandable. They are not part of the current protocol.
+Redis holds canonical tickets. Discord threads and per-agent task-board threads
+are read-only mirrors, never a source of agent turns. Hive Mind is knowledge,
+not a handoff. Do not use direct agent mentions, `[REQUEST]`/`[END]` tags,
+webhooks, `inter_agent_comm`, `n8n_task_dispatcher`, or board posts as alternate
+notification paths. If the tool is unavailable, tell the owner. For read-only
+operator checks and rollout staging, see `docs/agent-request-board.md`.

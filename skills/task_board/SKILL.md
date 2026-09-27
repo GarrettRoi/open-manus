@@ -6,16 +6,20 @@
 > commands to notify an agent, and do not post instructions in the automatic
 > per-agent Discord board threads.
 
-This skill provides a shared task board backed by Redis. Harmony uses it to track delegated work across all agents, and agents use it to report progress and completion.
+This skill provides optional task record tracking backed by Redis. It is not
+the request-board delivery or result channel. Only create a separate task
+record when tracking beyond the request ticket is explicitly needed; never
+require Harmony to create one before another agent can submit a ticket.
 
 ## When to Use
 
-- **Harmony**: Use this whenever you delegate a task to an agent. Add the task to the board, then check the board periodically to follow up.
-- **Worker Agents**: Use this to update your task status or mark tasks as complete.
+- **Any agent**: Use this to track an independently useful task record when
+  requested. Use the canonical request-board ticket for agent handoff and
+  completion, not the legacy board status.
 
 ## Commands
 
-### Add a new task (Harmony)
+### Add an optional task record
 
 ```bash
 python3 /app/skills/task_board/task_board.py add \
@@ -63,7 +67,7 @@ python3 /app/skills/task_board/task_board.py list --status "in_progress"
 python3 /app/skills/task_board/task_board.py view --task-id "TASK-001"
 ```
 
-### Get board summary (Harmony's periodic check)
+### Get board summary (task tracking only)
 
 ```bash
 python3 /app/skills/task_board/task_board.py summary
@@ -104,17 +108,17 @@ python3 /app/skills/task_board/task_board.py delete --task-id "TASK-001"
 
 ## Workflow
 
-1. **Harmony** receives a task from Garrett or identifies work to do
-2. **Harmony** breaks it into sub-tasks and adds each to the board with `add`
-3. **Harmony** delegates via Discord @mention with `[REQUEST]` tag
-4. **Agent** updates status to `in_progress` when starting
-5. **Agent** adds notes for progress updates
-6. **Agent** marks `completed` when done, or `blocked` if stuck
-7. **Harmony** checks `summary` periodically and follows up on stale tasks
+1. An agent identifies a task that benefits from a separate tracking record.
+2. Optionally create that record with `add`. It neither delivers nor accepts
+   work; use the native request-board ticket for any agent handoff.
+3. Keep the tracking record current if its extra status or deadline details
+   matter. The request board, not this record, carries the assignee's outcome
+   and any missing required inputs.
+4. Inspect `summary` when a board-level task-tracking overview is requested.
 
 ## Important Notes
 
 - Task data persists in Redis across agent restarts
 - Task IDs are sequential (TASK-001, TASK-002, etc.)
-- The `summary` command is designed for Harmony's periodic review
-- Always include enough context in the `--details` field so the assignee can work independently
+- `summary` gives a legacy task-record overview, not authoritative ticket status
+- Avoid duplicating private ticket inputs in task-record details
