@@ -31,6 +31,19 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "POST /v1/chat/completions",
         "test_probe": {"method": "GET", "path": "/v1/models"},
     },
+    "firecrawl": {
+        "label": "Firecrawl (web search and scrape)",
+        "auth": {"kind": "bearer"},
+        "base_url": "https://api.firecrawl.dev",
+        "allowed_hosts": ["api.firecrawl.dev"],
+        "setup_help": (
+            "Paste a Firecrawl API key from https://www.firecrawl.dev/app/api-keys. "
+            "Grant this connection to each fleet agent. Keys remain in the vault; "
+            "agents only need VAULT_URL and their own VAULT_TOKEN."
+        ),
+        "example_call": "POST /v2/search or POST /v2/scrape",
+        "test_probe": {"method": "GET", "path": "/v2/team/credit-usage"},
+    },
     "elevenlabs": {
         "label": "ElevenLabs",
         "auth": {"kind": "header", "header_name": "xi-api-key", "prefix": ""},

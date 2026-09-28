@@ -98,6 +98,7 @@ from tools.tool_backend_helpers import (  # noqa: F401
     prefers_gateway,
 )
 from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
+from tools.web_reliability import candidates, content_problem, terminal_error, NEXT_STEP
 import sys
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,16 @@ def _get_backend() -> str:
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
         return configured
+
+    # Vault grants are the preferred automatic route; explicit config above
+    # always wins. A disabled plugin cannot register and hence cannot qualify.
+    vault = _registered_web_provider("vault_firecrawl")
+    if vault is not None:
+        try:
+            if vault.is_available():
+                return "vault_firecrawl"
+        except Exception:
+            pass
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
@@ -697,11 +708,41 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     ),
                 }
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
-            )
-            response_data = provider.search(query, limit)
+            attempts = []
+            for candidate in candidates(
+                provider.name, _wsp_get_provider, _list_registered_web_providers,
+                "search", active=provider,
+            ):
+                try:
+                    response_data = candidate.search(query, limit)
+                    if (not isinstance(response_data, dict)
+                            or response_data.get("success") is not True
+                            or not isinstance(response_data.get("data"), dict)
+                            or not isinstance(response_data["data"].get("web"), list)
+                            or not response_data["data"]["web"]
+                            or not all(
+                                isinstance(entry, dict)
+                                and isinstance(entry.get("url"), str)
+                                and entry["url"].startswith(("http://", "https://"))
+                                for entry in response_data["data"]["web"]
+                            )):
+                        reason = "empty or malformed results" if (
+                            isinstance(response_data, dict)
+                            and response_data.get("success") is True
+                        ) else "provider error"
+                        attempts.append({"provider": candidate.name, "status": reason})
+                        continue
+                    attempts.append({"provider": candidate.name, "status": "success"})
+                    response_data["attempts"] = attempts
+                    break
+                except Exception:
+                    attempts.append({"provider": candidate.name, "status": "provider error"})
+            else:
+                response_data = {
+                    "success": False,
+                    "error": "No usable search results from available providers. " + NEXT_STEP,
+                    "attempts": attempts,
+                }
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -711,7 +752,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return result_json
 
     except Exception as e:
-        error_msg = f"Error searching web: {str(e)}"
+        error_msg = "Error searching web: provider dispatch failed. " + NEXT_STEP
         logger.debug("%s", error_msg)
 
         debug_call_data["error"] = error_msg
@@ -890,27 +931,118 @@ async def web_extract_tool(
                         ensure_ascii=False,
                     )
 
-            logger.info(
-                "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
-            )
-
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
             import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
-                )
+            remaining = list(dict.fromkeys(safe_urls))
+            by_url = {}
+            attempts = []
+            for candidate in candidates(
+                provider.name, _wsp_get_provider, _list_registered_web_providers,
+                "extract", active=provider,
+            ):
+                if not remaining:
+                    break
+                batch = remaining[:]
+                try:
+                    if inspect.iscoroutinefunction(candidate.extract):
+                        payload = await candidate.extract(batch, format=format)
+                    else:
+                        payload = await asyncio.to_thread(candidate.extract, batch, format=format)
+                except Exception:
+                    payload = None
+                if not isinstance(payload, list):
+                    payload = []
+                # Match exact URLs first; providers such as vault_firecrawl
+                # return an empty URL on failure and the final URL on redirect.
+                # Attribute these by position only for a complete positional
+                # batch. Never guess on a sparse multi-URL response.
+                accounted = set()
+                for index, item in enumerate(payload):
+                    if not isinstance(item, dict):
+                        continue
+                    url = item.get("url")
+                    source = (
+                        url if url in batch else
+                        batch[index] if len(payload) == len(batch) else
+                        batch[0] if len(batch) == 1 else None
+                    )
+                    if source is None or source in accounted:
+                        continue
+                    accounted.add(source)
+                    if isinstance(url, str) and url and url != source:
+                        from agent.redact import _PREFIX_RE
+                        from urllib.parse import unquote
+                        if (_PREFIX_RE.search(unquote(url))
+                                or sensitive_query_param_name(url)
+                                or not await async_is_safe_url(url)):
+                            by_url[source] = {
+                                "url": source, "title": "", "content": "",
+                                "error": "Blocked: redirected URL is unsafe or contains credentials",
+                            }
+                            continue
+                    if terminal_error(item):
+                        policy_error = str(item.get("error") or "").lower()
+                        by_url[source] = {
+                            "url": url or source, "title": item.get("title", ""),
+                            "content": "", "error": (
+                                "Blocked: URL targets a private or internal network address"
+                                if "private or internal network" in policy_error
+                                else "Blocked by website policy"
+                                if item.get("blocked_by_policy") or (
+                                    "website policy" in policy_error
+                                    or "website access policy" in policy_error
+                                )
+                                else "Blocked: URL access denied by policy"
+                            ),
+                            **({"blocked_by_policy": item["blocked_by_policy"]}
+                               if "blocked_by_policy" in item else {}),
+                        }
+                        continue
+                    raw = item.get("raw_content") or item.get("content")
+                    problem = content_problem(raw)
+                    if not item.get("error") and problem is None:
+                        by_url[source] = item
+                    else:
+                        # Provider errors are untrusted (may contain API tokens).
+                        by_url[source] = {
+                            "url": source, "title": "", "content": "",
+                            "error": "Extraction failed: " + (
+                                problem or "provider error"
+                            ),
+                        }
+                status = "success" if all(
+                    u in by_url and not by_url[u].get("error") for u in batch
+                ) else "partial" if any(
+                    u in by_url and not by_url[u].get("error") for u in batch
+                ) else "failed"
+                attempts.append({
+                    "provider": candidate.name, "status": status,
+                    "succeeded": sum(
+                        u in by_url and not by_url[u].get("error") for u in batch
+                    ),
+                    "requested": len(batch),
+                })
+                remaining = [
+                    u for u in remaining
+                    if u not in by_url or (
+                        by_url[u].get("error") and not terminal_error(by_url[u])
+                    )
+                ]
+            results = [
+                by_url.get(u, {"url": u, "title": "", "content": "",
+                               "error": "No content returned by provider"})
+                for u in safe_urls
+            ]
+            for item in results:
+                if item.get("error") and not terminal_error(item):
+                    item["next_step"] = NEXT_STEP
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
 
         response = {"results": results}
+        if safe_urls:
+            response["attempts"] = attempts
         
         pages_extracted = len(response.get('results', []))
         logger.info("Extracted content from %d pages", pages_extracted)
@@ -962,6 +1094,10 @@ async def web_extract_tool(
             for r in response.get("results", [])
         ]
         trimmed_response = {"results": trimmed_results}
+        if "attempts" in response:
+            trimmed_response["attempts"] = response["attempts"]
+        if any(r.get("next_step") for r in response["results"]):
+            trimmed_response["next_step"] = NEXT_STEP
 
         if trimmed_response.get("results") == []:
             result_json = tool_error("Content was inaccessible or not found")
@@ -983,7 +1119,7 @@ async def web_extract_tool(
         return cleaned_result
             
     except Exception as e:
-        error_msg = f"Error extracting content: {str(e)}"
+        error_msg = "Error extracting content: provider dispatch failed. " + NEXT_STEP
         logger.debug("%s", error_msg)
         
         debug_call_data["error"] = error_msg

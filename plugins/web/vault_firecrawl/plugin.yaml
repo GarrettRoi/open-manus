@@ -1,0 +1,7 @@
+name: web-vault-firecrawl
+version: 1.0.0
+description: "Firecrawl v2 search and rendered extraction through an agent-granted vault connection; no provider key on agents."
+author: Open Manus
+kind: backend
+provides_web_providers:
+  - vault_firecrawl

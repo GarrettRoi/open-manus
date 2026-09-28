@@ -487,7 +487,11 @@ class TestWebSearchSchema:
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("docs", limit=500))
 
-        assert result == {"success": True, "data": {"web": []}}
+        assert result["success"] is False
+        assert result["attempts"][0] == {
+            "provider": "parallel", "status": "empty or malformed results",
+        }
+        assert "No usable search results" in result["error"]
         fake_search.assert_called_once_with("docs", 100)
 
 
@@ -515,12 +519,14 @@ class TestWebSearchErrorHandling:
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
 
-        assert result == {"error": "Error searching web: boom"}
+        assert result["success"] is False
+        assert result["attempts"][0] == {"provider": "firecrawl", "status": "provider error"}
+        assert "browser_navigate" in result["error"]
+        assert "boom" not in json.dumps(result)
 
         debug_payload = mock_log_call.call_args.args[1]
-        assert debug_payload["error"] == "Error searching web: boom"
-        assert "traceback" not in debug_payload["error"]
-        assert "exception_type" not in debug_payload["error"]
+        assert debug_payload["error"] is None
+        assert "boom" not in json.dumps(debug_payload)
         assert "config" not in result
         assert "exception_type" not in result
         assert "exception_chain" not in result
