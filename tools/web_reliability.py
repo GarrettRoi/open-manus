@@ -6,10 +6,11 @@ No network calls or browser session mutation live here.
 import re
 
 PREFERENCE = (
-    "vault_firecrawl", "firecrawl", "tavily", "exa", "parallel",
+    "vault_keenable", "vault_firecrawl", "firecrawl", "tavily", "exa", "parallel",
     "searxng", "brave-free", "ddgs",
 )
 MAX_ATTEMPTS = 3
+_FREE_BACKENDS = frozenset({"searxng", "brave-free", "ddgs"})
 NEXT_STEP = (
     "Try browser_navigate with the public URL, then browser_snapshot "
     "to inspect the page (or open the URL manually and provide its text). "
@@ -34,6 +35,10 @@ def candidates(primary, get_provider, list_providers, capability, active=None):
         if not name or name in seen:
             continue
         seen.add(name)
+        # A Keenable pro request must not silently degrade to a free/public
+        # search backend. Explicitly selecting a free backend still works.
+        if primary == "vault_keenable" and name in _FREE_BACKENDS:
+            continue
         try:
             provider = get_provider(name)
             if provider is None or not getattr(provider, f"supports_{capability}")():

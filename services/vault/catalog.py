@@ -44,6 +44,23 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "POST /v2/search or POST /v2/scrape",
         "test_probe": {"method": "GET", "path": "/v2/team/credit-usage"},
     },
+    "keenable": {
+        "label": "Keenable (web search and fetch)",
+        "auth": {"kind": "header", "header_name": "X-API-Key", "prefix": ""},
+        "base_url": "https://api.keenable.ai",
+        "allowed_hosts": ["api.keenable.ai"],
+        "setup_help": (
+            "Paste a Keenable API key from your Keenable account. Grant this "
+            "connection to each fleet agent. Keep the key in the vault; agents "
+            "only need VAULT_URL and their own VAULT_TOKEN. Pro search and live "
+            "fetch consume account credits; no public-tier downgrade is requested."
+        ),
+        "example_call": "POST /v1/search or GET /v1/fetch",
+        "test_probe": {
+            "method": "POST", "path": "/v1/search",
+            "json": {"query": "Keenable", "mode": "pro", "max_results": 1},
+        },
+    },
     "elevenlabs": {
         "label": "ElevenLabs",
         "auth": {"kind": "header", "header_name": "xi-api-key", "prefix": ""},

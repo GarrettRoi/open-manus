@@ -1,0 +1,7 @@
+name: web-vault-keenable
+version: 1.0.0
+description: "Keenable pro search and live fetch through an agent-granted vault connection; no provider key on agents."
+author: Open Manus
+kind: backend
+provides_web_providers:
+  - vault_keenable

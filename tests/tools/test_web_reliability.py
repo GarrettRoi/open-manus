@@ -67,6 +67,34 @@ def test_auto_vault_precedes_paid_but_explicit_wins(isolated, monkeypatch):
     assert wt._get_backend() == "tavily"
 
 
+def test_keenable_precedes_firecrawl_in_auto_and_bounded_fallback(isolated, monkeypatch):
+    monkeypatch.setattr(wt, "_load_web_config", lambda: {})
+    monkeypatch.setattr(wt, "_has_env", lambda key: key == "TAVILY_API_KEY")
+    monkeypatch.setattr(wt, "_get_search_backend", wt._get_backend)
+    isolated["vault_keenable"] = Provider("vault_keenable", search=lambda: {"success": True, "data": {"web": []}})
+    isolated["vault_firecrawl"] = Provider("vault_firecrawl", search=lambda: {
+        "success": True, "data": {"web": [{"url": "https://article.test", "title": "Article"}]}})
+    assert wt._get_backend() == "vault_keenable"
+    result = json.loads(wt.web_search_tool("query"))
+    assert [attempt["provider"] for attempt in result["attempts"]] == ["vault_keenable", "vault_firecrawl"]
+    assert result["success"] is True
+    monkeypatch.setattr(wt, "_load_web_config", lambda: {"backend": "vault_firecrawl"})
+    assert wt._get_backend() == "vault_firecrawl"
+
+
+def test_keenable_never_silently_falls_back_to_public_tier(isolated, monkeypatch):
+    monkeypatch.setattr(wt, "_get_search_backend", lambda: "vault_keenable")
+    isolated["vault_keenable"] = Provider("vault_keenable", search=lambda: {"success": False})
+    isolated["ddgs"] = Provider("ddgs", search=lambda: {
+        "success": True, "data": {"web": [{"url": "https://public.example/a"}]}})
+    result = json.loads(wt.web_search_tool("query"))
+    assert result["success"] is False
+    assert [attempt["provider"] for attempt in result["attempts"]] == ["vault_keenable"]
+    assert isolated["ddgs"].calls == []
+    monkeypatch.setattr(wt, "_get_search_backend", lambda: "ddgs")
+    assert json.loads(wt.web_search_tool("query"))["success"] is True
+
+
 def test_search_bounded_fallback_and_sanitized_exhaustion(isolated):
     secret = "secret-value-must-not-appear"
     isolated["vault_firecrawl"] = Provider("vault_firecrawl", search=lambda: {"success": True, "data": {"web": []}})

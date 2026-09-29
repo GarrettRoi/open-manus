@@ -215,13 +215,14 @@ def _get_backend() -> str:
 
     # Vault grants are the preferred automatic route; explicit config above
     # always wins. A disabled plugin cannot register and hence cannot qualify.
-    vault = _registered_web_provider("vault_firecrawl")
-    if vault is not None:
-        try:
-            if vault.is_available():
-                return "vault_firecrawl"
-        except Exception:
-            pass
+    for vault_name in ("vault_keenable", "vault_firecrawl"):
+        vault = _registered_web_provider(vault_name)
+        if vault is not None:
+            try:
+                if vault.is_available():
+                    return vault_name
+            except Exception:
+                pass
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
