@@ -31,6 +31,10 @@ author = "agent"
 task = "workflow.run"
 args = "CRM isolated preview"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Household spending preview"
+
 [[workflows.workflow]]
 name = "CRM isolated preview"
 author = "agent"
@@ -42,3 +46,15 @@ waitForPort = 5000
 
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow]]
+name = "Household spending preview"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "HOUSEHOLD_PORT=8099 python scripts/household_preview.py"
+waitForPort = 8099
+
+[workflows.workflow.metadata]
+outputType = "console"
