@@ -5,5 +5,5 @@ COPY services/household/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY services/household /app/services/household
 RUN useradd --uid 10001 --create-home household
-USER household
+ENTRYPOINT ["python", "/app/services/household/entrypoint.py"]
 CMD ["python", "-m", "services.household.app"]
