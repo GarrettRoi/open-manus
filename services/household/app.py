@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import time
 import unicodedata
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -35,6 +35,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
 
+from services.household.domain import Domain, actor_for, migrate
+from services.household.queue import MAX_FILE, ScanQueue
+from services.household.agent_tools import AgentTools, TOOLS as WRITE_TOOLS, SCOPES as WRITE_TOOL_SCOPES
+
 BASE = Path(__file__).resolve().parent
 CATALOG_URL = "https://openrouter.ai/api/v1/models"
 INFERENCE_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -42,7 +46,8 @@ COOKIE = "household_session"
 MAX_UPLOAD = 10 * 1024 * 1024
 MAX_PAGES = 20
 MAX_RECORDS = 10_000
-SCOPES = {"purchases:read", "summary:read"}
+READ_SCOPES = {"purchases:read", "summary:read", "drafts:read"}
+SCOPES = READ_SCOPES | {"purchases:write", "purchases:delete", "uploads:create", "drafts:write", "drafts:confirm"}
 CURRENCIES = {"USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "SGD", "HKD", "INR"}
 EDITABLE = {"store", "date", "currency", "person_id", "items", "subtotal_cents",
             "tax_cents", "discount_cents", "total_cents", "notes"}
@@ -217,6 +222,7 @@ class Store:
                     id TEXT PRIMARY KEY, at TEXT NOT NULL, user_id TEXT NOT NULL,
                     model TEXT NOT NULL, status TEXT NOT NULL, usage TEXT);
             """)
+            migrate(db)
         os.chmod(self.path, 0o600)
 
     @contextmanager
@@ -246,7 +252,7 @@ class Store:
 
     def read(self, ident, kind):
         with self.db() as db:
-            row = db.execute("SELECT * FROM records WHERE id=? AND kind=?", (ident, kind)).fetchone()
+            row = db.execute("SELECT * FROM records WHERE id=? AND kind=? AND deleted_at IS NULL", (ident, kind)).fetchone()
         if not row:
             raise HTTPException(404, "Record not found.")
         return self.present(row)
@@ -254,6 +260,9 @@ class Store:
     def present(self, row):
         obj = json.loads(row["doc"])
         return {**obj, "id": row["id"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+                "version": row["version"],
+                **{k: json.loads(row["attribution"]).get(k) for k in
+                   ("created_by", "uploaded_by", "last_edited_by", "confirmed_by")},
                 "status": "confirmed" if row["kind"] == "purchase" or row["confirmed_purchase_id"] else "draft",
                 "confirmed_purchase_id": row["confirmed_purchase_id"],
                 "source_available": bool(row["upload_id"]), "demo": self.cfg.preview}
@@ -263,14 +272,14 @@ class Store:
         if db is None:
             with self.db() as connection:
                 return self.insert(doc, kind, upload_id, connection)
-        db.execute("INSERT INTO records VALUES (?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO records(id,kind,upload_id,confirmed_purchase_id,doc,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
                    (ident, kind, upload_id, None, json.dumps(doc), now, now))
         return ident
 
     def matching(self, filters):
         # Hard bound is explicit; never silently truncate aggregates/exports.
         with self.db() as db:
-            rows = db.execute("SELECT * FROM records WHERE kind='purchase' ORDER BY created_at DESC LIMIT ?",
+            rows = db.execute("SELECT * FROM records WHERE kind='purchase' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
                               (MAX_RECORDS + 1,)).fetchall()
         matches = []
         for row in rows:
@@ -288,7 +297,7 @@ class Store:
             matches.append(doc)
         if len(rows) > MAX_RECORDS:
             # Filter in SQLite by validated receipt dates first for large households.
-            clauses, values = ["kind='purchase'"], []
+            clauses, values = ["kind='purchase'", "deleted_at IS NULL"], []
             for key, op in (("start", ">="), ("end", "<=")):
                 if filters.get(key):
                     clauses.append(f"json_extract(doc,'$.date') {op} ?")
@@ -718,9 +727,20 @@ def create_app(config: Config | None = None):
     if cfg.preview:
         seed_demo(store)
     provider = Provider(cfg)
-    app = FastAPI(title="Private household spending", docs_url=None, redoc_url=None, openapi_url=None)
+    domain = Domain(store, validate_doc, NOW)
+    queue = ScanQueue(store, provider, domain, validate_file, validate_doc, uid, NOW, EDITABLE)
+    agent_tools = AgentTools(store, domain, queue, provider, pagination)
+    @asynccontextmanager
+    async def lifespan(app):
+        await queue.start()
+        try:
+            yield
+        finally:
+            await queue.stop()
+    app = FastAPI(title="Private household spending", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware)
     app.state.store, app.state.config, app.state.provider = store, cfg, provider
+    app.state.domain, app.state.queue = domain, queue
     templates = Jinja2Templates(directory=str(BASE / "templates"))
     app.mount("/static", StaticFiles(directory=str(BASE / "static"), check_dir=False), name="static")
     dummy_password = password_hash(secrets.token_urlsafe(24))
@@ -791,17 +811,18 @@ def create_app(config: Config | None = None):
         return {"authenticated": bool(user), "csrf": user["csrf"] if user else None,
                 "user": {k: user[k] for k in ("id", "username", "role")} if user else None,
                 "preview": cfg.preview, "demo": cfg.preview, "timezone": cfg.timezone, "currency": cfg.currency,
-                "readiness": provider.readiness(), "limits": {"upload_bytes": MAX_UPLOAD, "pdf_pages": MAX_PAGES},
+                "readiness": provider.readiness(), "limits": {"upload_bytes": MAX_UPLOAD, "pdf_pages": MAX_PAGES,
+                "batch_files": 20, "batch_file_bytes": MAX_FILE, "scan_daily_limit": cfg.scan_daily_limit},
                 "mcp_endpoint": "/mcp"}
 
-    async def json_body(request):
+    async def json_body(request, maximum=256 * 1024):
         if "application/json" not in request.headers.get("content-type", ""):
             raise HTTPException(415, "Use application/json.")
         raw = bytearray()
         async for chunk in request.stream():
             raw.extend(chunk)
-            if len(raw) > 256 * 1024:
-                raise HTTPException(413, "JSON request exceeds 256 KiB.")
+            if len(raw) > maximum:
+                raise HTTPException(413, "JSON request exceeds allowed bounds.")
         try:
             body = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
@@ -809,6 +830,89 @@ def create_app(config: Config | None = None):
         if not isinstance(body, dict):
             raise HTTPException(422, "Expected JSON object.")
         return body
+
+    def write_options(request):
+        version = request.headers.get("if-match")
+        if version is not None:
+            try:
+                version = int(version.strip('"'))
+            except ValueError:
+                raise HTTPException(422, "If-Match must contain the record version.")
+        return {"version": version, "key": request.headers.get("idempotency-key")}
+
+    @app.get("/api/audit")
+    async def all_audit(request: Request):
+        require_user(request)
+        return domain.history(limit=pagination(request.query_params)[0], offset=pagination(request.query_params)[1])
+
+    @app.get("/api/purchases/{ident}/audit")
+    async def purchase_audit(ident: str, request: Request):
+        require_user(request)
+        limit, offset = pagination(request.query_params)
+        return domain.history(ident, "purchase", limit, offset)
+
+    @app.get("/api/drafts/{ident}/audit")
+    async def draft_audit(ident: str, request: Request):
+        require_user(request)
+        limit, offset = pagination(request.query_params)
+        return domain.history(ident, "draft", limit, offset)
+
+    @app.post("/api/batches", status_code=201)
+    async def create_batch(request: Request):
+        actor = actor_for(require_user(request, mutate=True))
+        return await queue.batch(actor, await json_body(request), request.headers.get("idempotency-key"))
+
+    @app.get("/api/batches")
+    async def list_batches(request: Request):
+        require_user(request)
+        limit, offset = pagination(request.query_params)
+        with store.db() as db:
+            total = db.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+            rows = db.execute("SELECT id FROM batches ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            batches = [queue.batch_status(r["id"], db) for r in rows]
+        return {"batches": batches, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/batches/{ident}")
+    async def batch_status(ident: str, request: Request):
+        require_user(request)
+        return queue.batch_status(ident)
+
+    @app.post("/api/batches/{ident}/files", status_code=202)
+    async def batch_file(ident: str, request: Request, file: UploadFile = File(...)):
+        actor = actor_for(require_user(request, mutate=True))
+        data = await file.read(MAX_FILE + 1)
+        await file.close()
+        return queue.reserve(actor, ident, data, file.content_type, file.filename, request.headers.get("idempotency-key"))
+
+    @app.get("/api/jobs/{ident}")
+    async def job_status(ident: str, request: Request):
+        require_user(request)
+        return queue.status(ident)
+
+    @app.post("/api/jobs/{ident}/retry", status_code=202)
+    async def job_retry(ident: str, request: Request):
+        actor = actor_for(require_user(request, mutate=True))
+        body = await json_body(request)
+        if set(body) != {"acknowledge_cost"}:
+            raise HTTPException(422, "Supply acknowledge_cost:true only.")
+        return queue.control(ident, "retry", actor, body.get("acknowledge_cost"), request.headers.get("idempotency-key"))
+
+    @app.post("/api/jobs/{ident}/cancel")
+    async def job_cancel(ident: str, request: Request):
+        actor = actor_for(require_user(request, mutate=True))
+        if await json_body(request):
+            raise HTTPException(422, "Cancel accepts an empty object.")
+        return queue.control(ident, "cancel", actor, key=request.headers.get("idempotency-key"))
+
+    @app.get("/api/jobs/{ident}/source")
+    async def job_source(ident: str, request: Request):
+        require_user(request)
+        job = queue.status(ident)
+        with store.db() as db:
+            row = db.execute("SELECT filename,mime FROM uploads WHERE id=?", (job["upload_id"],)).fetchone()
+        if not row or not (store.files / row["filename"]).is_file():
+            raise HTTPException(404, "Private source unavailable.")
+        return FileResponse(store.files / row["filename"], media_type=row["mime"], filename="private-receipt" + Path(row["filename"]).suffix)
 
     @app.get("/")
     async def home(request: Request):
@@ -908,7 +1012,7 @@ def create_app(config: Config | None = None):
     async def categories(request: Request):
         require_user(request)
         with store.db() as db:
-            rows = db.execute("SELECT doc FROM records").fetchall()
+            rows = db.execute("SELECT doc FROM records WHERE deleted_at IS NULL").fetchall()
         labels = {i["category"] for r in rows for i in json.loads(r["doc"])["items"] if i["category"]}
         return {"categories": sorted(labels | set(SUGGESTED))}
 
@@ -923,71 +1027,40 @@ def create_app(config: Config | None = None):
     async def upload(request: Request, file: UploadFile = File(...), model: str = Form(...),
                      person: str = Form(...), source_type: str = Form("receipt")):
         user = require_user(request, mutate=True)
-        if source_type not in {"receipt", "price_screenshot"}:
-            raise HTTPException(422, "Source type must be receipt or price_screenshot.")
-        if not any(p["id"] == person and p["active"] for p in store.people()):
-            raise HTTPException(422, "Choose an active purchaser.")
         data = await file.read(MAX_UPLOAD + 1)
         await file.close()
-        cleaned, mime, extension = validate_file(data, file.content_type, file.filename, store.files)
-        content_hash = hashlib.sha256(cleaned).hexdigest()
-        with store.db() as db:
-            duplicate = db.execute("SELECT r.id,r.kind FROM uploads u JOIN records r ON r.upload_id=u.id "
-                                   "WHERE u.hash=? ORDER BY r.kind DESC LIMIT 1", (content_hash,)).fetchone()
-        if duplicate:
-            return JSONResponse({"detail": "Duplicate source already exists", "duplicate": dict(duplicate)}, status_code=409)
-        if not provider.readiness()["ocr_available"]:
-            raise HTTPException(503, provider.readiness()["message"])
-        catalog = await provider.catalog()
-        chosen = next((m for m in catalog["models"] if m["id"] == model), None)
-        if not chosen:
-            raise HTTPException(422, "Choose a model from the current live catalog.")
-        scan_id = uid()
-        today = datetime.now(ZoneInfo(cfg.timezone)).date()
-        with store.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            count = sum(datetime.fromisoformat(r["at"]).astimezone(ZoneInfo(cfg.timezone)).date() == today
-                        for r in db.execute("SELECT at FROM scans"))
-            running = db.execute("SELECT COUNT(*) FROM scans WHERE status='running' AND at>?",
-                                 ((datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(),)).fetchone()[0]
-            if count >= cfg.scan_daily_limit or running >= 2:
-                raise HTTPException(429, "Household scan limit reached (daily limit or two concurrent scans). Retry later.")
-            db.execute("INSERT INTO scans VALUES (?,?,?,?,?,NULL)", (scan_id, NOW(), user["id"], model, "running"))
-        try:
-            raw, usage = await provider.extract(cleaned, mime, chosen, source_type)
-            # Ignore upstream identity/person fields; selected purchaser is authoritative.
-            raw = {k: v for k, v in raw.items() if k in EDITABLE}
-            raw["person_id"] = person
-            doc = validate_doc(raw, store, ocr=True)
-            doc.update({"model": model, "usage": usage, "source_type": source_type})
-            upload_id = uid()
-            path = store.files / (upload_id + extension)
-            path.write_bytes(cleaned)
-            os.chmod(path, 0o600)
-            try:
-                with store.db() as db:
-                    db.execute("INSERT INTO uploads VALUES (?,?,?,?,?)", (upload_id, content_hash, path.name, mime, NOW()))
-                    ident = store.insert(doc, upload_id=upload_id, db=db)
-                    db.execute("UPDATE scans SET status='success',usage=? WHERE id=?", (json.dumps(usage), scan_id))
-            except sqlite3.IntegrityError:
-                path.unlink(missing_ok=True)
-                raise HTTPException(409, "Duplicate upload was created concurrently; refresh drafts.")
-            except Exception:
-                path.unlink(missing_ok=True)
-                raise
-            return store.read(ident, "draft")
-        except Exception:
+        validate_file(data, file.content_type, file.filename, store.files)
+        # Legacy synchronous response, same durable reservation and audit as bulk.
+        actor = actor_for(user)
+        key = request.headers.get("idempotency-key")
+        batch = await queue.batch(actor, {"model": model, "person": person, "source_type": source_type},
+                                  digest(key + ":batch") if key else None)
+        job = queue.reserve(actor, batch["id"], data, file.content_type, file.filename, key, maximum=MAX_UPLOAD)
+        if job["status"] == "duplicate":
             with store.db() as db:
-                db.execute("UPDATE scans SET status='failed' WHERE id=?", (scan_id,))
-            raise
+                row = db.execute("SELECT id,kind FROM records WHERE upload_id=? AND deleted_at IS NULL ORDER BY kind DESC LIMIT 1",
+                                 (job["upload_id"],)).fetchone()
+            return JSONResponse({"detail": "Duplicate source already exists",
+                                 "duplicate": dict(row) if row else {"kind": "job", "id": job["duplicate_of"]}}, status_code=409)
+        import asyncio
+        while job["status"] in {"queued", "running"}:
+            if not queue.tasks:
+                await queue.run_one()
+            else:
+                await asyncio.sleep(.1)
+            job = queue.status(job["id"])
+        if job["status"] != "needs_review":
+            raise HTTPException(502, {"message": job["error"] or "Scan did not complete.", "job_id": job["id"],
+                                      "source_url": f"/api/jobs/{job['id']}/source"})
+        return store.read(job["draft_id"], "draft")
 
     @app.get("/api/drafts")
     async def drafts(request: Request):
         require_user(request)
         limit, offset = pagination(request.query_params, 100)
         with store.db() as db:
-            total = db.execute("SELECT COUNT(*) FROM records WHERE kind='draft' AND confirmed_purchase_id IS NULL").fetchone()[0]
-            rows = db.execute("SELECT * FROM records WHERE kind='draft' AND confirmed_purchase_id IS NULL "
+            total = db.execute("SELECT COUNT(*) FROM records WHERE kind='draft' AND confirmed_purchase_id IS NULL AND deleted_at IS NULL").fetchone()[0]
+            rows = db.execute("SELECT * FROM records WHERE kind='draft' AND confirmed_purchase_id IS NULL AND deleted_at IS NULL "
                               "ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return {"drafts": [store.present(r) for r in rows], "total": total, "limit": limit, "offset": offset, "demo": cfg.preview}
 
@@ -996,76 +1069,25 @@ def create_app(config: Config | None = None):
         require_user(request)
         return store.read(ident, "draft")
 
-    def patch_record(ident, kind, body):
-        with store.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM records WHERE id=? AND kind=?", (ident, kind)).fetchone()
-            if not row:
-                raise HTTPException(404, "Record not found.")
-            if row["confirmed_purchase_id"]:
-                raise HTTPException(409, "Draft already confirmed. Edit its purchase instead.")
-            doc = validate_doc(body, store, json.loads(row["doc"]), strict=kind == "purchase")
-            db.execute("UPDATE records SET doc=?,updated_at=? WHERE id=?", (json.dumps(doc), NOW(), ident))
-        return store.read(ident, kind)
-
     @app.patch("/api/drafts/{ident}")
     async def patch_draft(ident: str, request: Request):
-        require_user(request, mutate=True)
-        return patch_record(ident, "draft", await json_body(request))
-
-    def delete_record(ident, kind):
-        filename = None
-        with store.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM records WHERE id=? AND kind=?", (ident, kind)).fetchone()
-            if not row:
-                raise HTTPException(404, "Record not found.")
-            if kind == "draft" and row["confirmed_purchase_id"]:
-                raise HTTPException(409, "Delete the confirmed purchase instead.")
-            db.execute("DELETE FROM records WHERE id=? OR confirmed_purchase_id=?", (ident, ident))
-            if row["upload_id"] and not db.execute("SELECT id FROM records WHERE upload_id=?", (row["upload_id"],)).fetchone():
-                source = db.execute("SELECT filename FROM uploads WHERE id=?", (row["upload_id"],)).fetchone()
-                filename = source["filename"] if source else None
-                db.execute("DELETE FROM uploads WHERE id=?", (row["upload_id"],))
-        if filename:
-            (store.files / filename).unlink(missing_ok=True)
-        return {"ok": True}
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("edit", "draft", actor, await json_body(request), ident, **write_options(request))
 
     @app.delete("/api/drafts/{ident}")
     async def delete_draft(ident: str, request: Request):
-        require_user(request, mutate=True)
-        return delete_record(ident, "draft")
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("delete", "draft", actor, ident=ident, **write_options(request))
 
     @app.post("/api/drafts/{ident}/confirm")
     async def confirm(ident: str, request: Request):
-        require_user(request, mutate=True)
-        await json_body(request)
-        already = False
-        with store.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM records WHERE id=? AND kind='draft'", (ident,)).fetchone()
-            if not row:
-                raise HTTPException(404, "Draft not found.")
-            if row["confirmed_purchase_id"]:
-                purchase_id, already = row["confirmed_purchase_id"], True
-            else:
-                doc = validate_doc({}, store, json.loads(row["doc"]), strict=True)
-                purchase_id = store.insert(doc, "purchase", row["upload_id"], db)
-                db.execute("UPDATE records SET confirmed_purchase_id=?,updated_at=? WHERE id=?", (purchase_id, NOW(), ident))
-        return {"purchase": store.read(purchase_id, "purchase"), "already_confirmed": already}
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("confirm", "draft", actor, await json_body(request), ident, **write_options(request))
 
     @app.post("/api/purchases", status_code=201)
     async def manual_purchase(request: Request):
-        require_user(request, mutate=True)
-        body = await json_body(request)
-        source_type = body.pop("source_type", "receipt")
-        if source_type not in ("receipt", "price_screenshot"):
-            raise HTTPException(422, "Source type must be receipt or price_screenshot.")
-        # POST is the explicit manual "Confirm purchase" action, not extraction.
-        # Existing provenance remains immutable on PATCH; uploads still create drafts only.
-        doc = validate_doc(body, store, strict=True)
-        doc["source_type"] = source_type
-        return store.read(store.insert(doc, "purchase"), "purchase")
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("create", "purchase", actor, await json_body(request), **write_options(request))
 
     @app.get("/api/purchases")
     async def purchases(request: Request):
@@ -1082,13 +1104,13 @@ def create_app(config: Config | None = None):
 
     @app.patch("/api/purchases/{ident}")
     async def patch_purchase(ident: str, request: Request):
-        require_user(request, mutate=True)
-        return patch_record(ident, "purchase", await json_body(request))
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("edit", "purchase", actor, await json_body(request), ident, **write_options(request))
 
     @app.delete("/api/purchases/{ident}")
     async def delete_purchase(ident: str, request: Request):
-        require_user(request, mutate=True)
-        return delete_record(ident, "purchase")
+        actor = actor_for(require_user(request, mutate=True))
+        return domain.mutate("delete", "purchase", actor, ident=ident, **write_options(request))
 
     def private_source(ident, kind):
         with store.db() as db:
@@ -1148,7 +1170,7 @@ def create_app(config: Config | None = None):
     async def agent_tokens(request: Request):
         require_user(request, owner=True)
         with store.db() as db:
-            rows = db.execute("SELECT id,name,scopes,created_at,expires_at,last_used_at,revoked FROM agent_tokens ORDER BY created_at DESC").fetchall()
+            rows = db.execute("SELECT id,name,agent_id,scopes,created_at,expires_at,last_used_at,revoked FROM agent_tokens ORDER BY created_at DESC").fetchall()
         return {"tokens": [{**dict(r), "scopes": json.loads(r["scopes"]), "revoked": bool(r["revoked"])} for r in rows]}
 
     @app.post("/api/agent-tokens", status_code=201)
@@ -1157,22 +1179,27 @@ def create_app(config: Config | None = None):
         if cfg.preview:
             raise HTTPException(403, "Agent credentials cannot be issued for DEMO preview.")
         body = await json_body(request)
-        if set(body) - {"name", "scopes", "expires_days"}:
+        if set(body) - {"name", "agent_id", "scopes", "expires_days"}:
             raise HTTPException(422, "Unknown token field.")
         name = text(body.get("name", ""), "name", 100)
-        scopes, days = body.get("scopes"), body.get("expires_days", 30)
+        scopes, days = body.get("scopes", ["purchases:read", "summary:read"]), body.get("expires_days", 30)
         if (not name or not isinstance(scopes, list) or not scopes or any(not isinstance(s, str) or s not in SCOPES for s in scopes)
                 or type(days) is not int or not 1 <= days <= 365):
-            raise HTTPException(422, "Token requires name, allowed read scopes and expiry days 1..365.")
+            raise HTTPException(422, "Token requires name, allowed scopes and expiry days 1..365.")
+        agent_id = body.get("agent_id")
+        if agent_id is not None and (not isinstance(agent_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", agent_id)):
+            raise HTTPException(422, "agent_id must be the exact stable fleet agent slug: lowercase letters/digits/_/- (1..64).")
+        if set(scopes) - READ_SCOPES and not agent_id:
+            raise HTTPException(422, "Write/delete/upload/confirm scopes require an immutable agent_id and a separate per-agent Vault connection/grant.")
         token, ident = "hh_" + secrets.token_urlsafe(32), uid()
         expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
         scopes = sorted(set(scopes))
         with store.db() as db:
             if db.execute("SELECT COUNT(*) FROM agent_tokens WHERE revoked=0").fetchone()[0] >= 50:
                 raise HTTPException(422, "Revoke unused tokens before issuing more (maximum 50 active).")
-            db.execute("INSERT INTO agent_tokens VALUES (?,?,?,?,?,?,NULL,0)",
-                       (ident, digest(token), name, json.dumps(scopes), NOW(), expires))
-        return {"token": token, "id": ident, "name": name, "scopes": scopes, "expires_at": expires}
+            db.execute("INSERT INTO agent_tokens(id,hash,name,scopes,created_at,expires_at,last_used_at,revoked,agent_id) VALUES (?,?,?,?,?,?,NULL,0,?)",
+                       (ident, digest(token), name, json.dumps(scopes), NOW(), expires, agent_id))
+        return {"token": token, "id": ident, "name": name, "agent_id": agent_id, "scopes": scopes, "expires_at": expires}
 
     @app.delete("/api/agent-tokens/{ident}")
     async def revoke_token(ident: str, request: Request):
@@ -1194,13 +1221,20 @@ def create_app(config: Config | None = None):
             if not row:
                 raise HTTPException(401, "Invalid, expired or revoked household token.")
             db.execute("UPDATE agent_tokens SET last_used_at=? WHERE id=?", (NOW(), row["id"]))
-        return set(json.loads(row["scopes"]))
+        return {"scopes": set(json.loads(row["scopes"])), "agent_id": row["agent_id"],
+                "actor": {"kind": "agent", "id": row["agent_id"] or row["id"], "display": row["agent_id"] or row["name"]}}
 
     @app.post("/mcp")
     async def mcp(request: Request):
-        scopes = agent(request)
+        principal = agent(request)
+        scopes = principal["scopes"]
         try:
-            body = await json_body(request)
+            body = await json_body(request, 8 * 1024 * 1024 if "uploads:create" in scopes else 256 * 1024)
+            if len(json.dumps(body).encode()) > 256 * 1024:
+                params_check = body.get("params")
+                if not (body.get("method") == "tools/call" and isinstance(params_check, dict)
+                        and params_check.get("name") == "household_upload"):
+                    raise HTTPException(413, "Only household_upload accepts JSON above 256 KiB.")
         except HTTPException as exc:
             code = -32700 if exc.status_code == 400 else -32600
             return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": str(exc.detail)}},
@@ -1223,19 +1257,27 @@ def create_app(config: Config | None = None):
                 return rpc_error(-32602, "Supported protocol versions: 2024-11-05, 2025-03-26, 2025-06-18.")
             result = {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
                       "serverInfo": {"name": "household-spending", "version": "1.0.0"},
-                      "instructions": f"Read-only authorized single household. Inclusive local dates in {cfg.timezone}; currency totals are separate. Use pagination, never presume draft screenshots are purchases."}
+                      "instructions": f"Explicitly scoped single household. Inclusive local dates in {cfg.timezone}; currency totals are separate. Use pagination, never presume draft screenshots are purchases. Identity is server-bound; purchaser is separate. Writes require stable retry keys and current versions."}
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": [tool for tool in MCP_TOOLS if TOOL_SCOPES[tool["name"]] in scopes]}
+            result = {"tools": [{**tool, **({"_meta": {"household_agent_id": principal["agent_id"]}} if principal["agent_id"] else {})}
+                                for tool in MCP_TOOLS + WRITE_TOOLS
+                                if {**TOOL_SCOPES, **WRITE_TOOL_SCOPES}[tool["name"]] in scopes]}
         elif method == "tools/call":
             name, arguments = params.get("name"), params.get("arguments", {})
-            if name not in TOOL_SCOPES or not isinstance(arguments, dict):
+            if not isinstance(name, str) or name not in {**TOOL_SCOPES, **WRITE_TOOL_SCOPES} or not isinstance(arguments, dict):
                 return rpc_error(-32602, "Unknown tool or invalid arguments.")
-            if TOOL_SCOPES[name] not in scopes:
-                return rpc_error(-32602, "Token lacks this read scope.")
+            if {**TOOL_SCOPES, **WRITE_TOOL_SCOPES}[name] not in scopes:
+                return rpc_error(-32602, "Token lacks the required scope.")
             try:
-                allowed = set(MCP_SCHEMA["properties"])
+                if name in WRITE_TOOL_SCOPES:
+                    if WRITE_TOOL_SCOPES[name] not in READ_SCOPES and not principal["agent_id"]:
+                        raise HTTPException(403, "Write capabilities require a bound agent identity.")
+                    value = await agent_tools.call(name, arguments, principal["actor"], scopes)
+                    result = {"content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}
+                    return {"jsonrpc": "2.0", "id": ident, "result": result}
+                allowed = set(next(t["inputSchema"]["properties"] for t in MCP_TOOLS if t["name"] == name))
                 if set(arguments) - allowed:
                     raise HTTPException(422, "Unknown tool argument.")
                 if arguments.get("month") and name != "household_snapshot":
@@ -1267,7 +1309,8 @@ def create_app(config: Config | None = None):
                     value = {**summarize(store, filters, item_only=name == "household_items"), "timezone": cfg.timezone}
                 result = {"content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}
             except HTTPException as exc:
-                result = {"content": [{"type": "text", "text": str(exc.detail)}], "isError": True}
+                result = {"content": [{"type": "text", "text": str(exc.detail)}], "isError": True,
+                          "structuredContent": {"status": exc.status_code, "detail": exc.detail}}
         else:
             return rpc_error(-32601, "Method not found.")
         return {"jsonrpc": "2.0", "id": ident, "result": result}
@@ -1286,7 +1329,10 @@ MCP_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "offset": {"type": "integer", "minimum": 0}}}
 TOOL_SCOPES = {"household_purchases": "purchases:read", "household_summary": "summary:read",
                "household_snapshot": "summary:read", "household_items": "summary:read"}
-MCP_TOOLS = [{"name": name, "description": description, "inputSchema": MCP_SCHEMA,
+MCP_TOOLS = [{"name": name, "description": description, "inputSchema": {
+                 **MCP_SCHEMA, "properties": {k: v for k, v in MCP_SCHEMA["properties"].items()
+                     if (k != "month" or name == "household_snapshot")
+                     and (k not in {"limit", "offset"} or name == "household_purchases")}},
               "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}}
              for name, description in (
                  ("household_purchases", "Query confirmed purchases only, with explicit pagination and total count."),

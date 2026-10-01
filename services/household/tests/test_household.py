@@ -283,7 +283,7 @@ def test_draft_crud_confirm_duplicate_private_source(env, monkeypatch):
     assert env.client.patch(f'/api/drafts/{draft["id"]}', json={}, headers=env.headers).status_code == 409
     assert env.client.get("/api/drafts").json()["total"] == 0
     env.client.delete("/api/purchases/" + p["id"], headers=env.headers)
-    assert not list(env.app.state.store.files.glob("*.jpg"))
+    assert list(env.app.state.store.files.glob("*.jpg"))  # private audit/source retention
     assert env.client.get(f'/api/drafts/{draft["id"]}').status_code == 404
 
 
@@ -294,7 +294,7 @@ def test_missing_ocr_fields_require_review_and_delete(env, monkeypatch):
     assert env.client.post(f'/api/drafts/{d["id"]}/confirm', json={}, headers=env.headers).status_code == 422
     assert env.client.patch(f'/api/drafts/{d["id"]}', json=receipt(env), headers=env.headers).status_code == 200
     assert env.client.delete(f'/api/drafts/{d["id"]}', headers=env.headers).status_code == 200
-    assert not list(env.app.state.store.files.glob("*.jpg"))
+    assert list(env.app.state.store.files.glob("*.jpg"))  # private audit/source retention
 
 
 def test_missing_ocr_currency_quantity_not_invented(env, monkeypatch):

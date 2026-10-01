@@ -31,6 +31,7 @@ AGENT_TOKENS = {
     OTHER: "isolated-test-other-vault-identity",
 }
 SUMMARY_TOOLS = {"household_summary", "household_snapshot", "household_items"}
+PURCHASE_TOOLS = {"household_purchases", "household_purchase", "household_people", "household_audit"}
 
 
 @pytest.fixture(autouse=True)
@@ -169,8 +170,8 @@ def test_preset_has_no_default_and_rejects_non_https(env, url):
 
 @pytest.mark.parametrize("scopes,expected", [
     (["summary:read"], SUMMARY_TOOLS),
-    (["purchases:read"], {"household_purchases"}),
-    (["purchases:read", "summary:read"], SUMMARY_TOOLS | {"household_purchases"}),
+    (["purchases:read"], PURCHASE_TOOLS),
+    (["purchases:read", "summary:read"], SUMMARY_TOOLS | PURCHASE_TOOLS),
 ])
 def test_real_household_handshake_scoped_manifest_and_selected_grants(env, scopes, expected):
     issued = env.issue(scopes)
@@ -227,7 +228,7 @@ def test_no_default_grants_scope_denial_and_both_revocation_layers(env):
     assert env.seen == []
     denied = call(env, tool="household_purchases")
     assert denied.status_code == 502  # Household's JSON-RPC scope denial
-    assert "Token lacks this read scope" in denied.json()["detail"]
+    assert "Token lacks the required scope" in denied.json()["detail"]
     assert issued["token"] not in denied.text
 
     grant(env, False)

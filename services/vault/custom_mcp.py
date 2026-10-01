@@ -45,6 +45,15 @@ _CID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # field names are never logged; ``notes`` is included because it is an
 # advertised optional create_client field.
 _SHAPE_FIELDS = ("name", "fullName", "email", "phone", "status", "notes")
+# Legacy shared tokens may only expose these established read-only tools.
+# Treat new/unknown tools as writes even if their readOnlyHint is incorrect.
+HOUSEHOLD_READ_TOOLS = frozenset({
+    "household_purchases", "household_summary", "household_snapshot",
+    "household_items", "household_purchase", "household_people",
+    "household_audit", "household_drafts", "household_draft",
+    "household_job", "household_draft_audit",
+})
+HOUSEHOLD_AGENT_META = "household_agent_id"
 
 
 class CustomMCPError(Exception):
@@ -58,6 +67,47 @@ class MCPTokenExpiredError(CustomMCPError):
     structured, agent-readable 401 rather than a generic 502.
     """
     pass
+
+
+def household_agent_binding(tools: Any) -> Optional[str]:
+    """Validate a Household manifest; never infer identity from call arguments.
+
+    Bound tokens advertise the same immutable fleet ID on *every* tool.
+    Missing, partial, malformed, or conflicting binding on a write-capable
+    manifest is unsafe. Legacy manifests may omit binding only for reads.
+    """
+    if not isinstance(tools, list) or not tools:
+        raise CustomMCPError("Household tool manifest is missing; ask the owner to Sync tools")
+    bindings = []
+    has_write = False
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+            raise CustomMCPError("Household tool manifest is invalid; ask the owner to Sync tools")
+        annotations = tool.get("annotations")
+        has_write |= (
+            tool["name"] not in HOUSEHOLD_READ_TOOLS
+            or not isinstance(annotations, dict)
+            or annotations.get("readOnlyHint") is not True
+        )
+        meta = tool.get("_meta", {})
+        if not isinstance(meta, dict):
+            raise CustomMCPError("Household agent binding metadata is invalid")
+        if HOUSEHOLD_AGENT_META not in meta:
+            bindings.append(None)
+            continue
+        agent_id = meta[HOUSEHOLD_AGENT_META]
+        if (not isinstance(agent_id, str) or not agent_id
+                or agent_id != agent_id.strip() or len(agent_id) > 64):
+            raise CustomMCPError("Household agent binding metadata is invalid")
+        bindings.append(agent_id)
+    bound = {value for value in bindings if value is not None}
+    if bound:
+        if len(bound) != 1 or None in bindings:
+            raise CustomMCPError("Household tool manifest has inconsistent agent binding")
+        return next(iter(bound))
+    if has_write:
+        raise CustomMCPError("Household write tools require an immutable agent binding")
+    return None
 
 
 def _is_ip_safe(addr: str) -> bool:
@@ -357,7 +407,7 @@ def _is_timeout(exc: BaseException) -> bool:
 
 
 async def list_tools(server_url: str, bearer_token: str) -> List[Dict[str, Any]]:
-    """Call tools/list against *server_url* using *bearer_token*."""
+    """Call tools/list, preserving full tool metadata (including identity _meta)."""
     _validate_server_url(server_url)
     msg = await _mcp_session(
         server_url, bearer_token,

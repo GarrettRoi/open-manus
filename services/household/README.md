@@ -47,7 +47,7 @@ At most two local accounts; purchaser entities are separate editable identities.
 
 ## OCR: configure explicitly, prefer the vault
 
-This is **Household → Vault → OpenRouter** for receipt scanning, independent of **agents → Vault → Household MCP** for read-only spending access. The two routes use different tokens and grants; configuring one does not enable the other.
+This is **Household → Vault → OpenRouter** for receipt scanning, independent of **agents → Vault → Household MCP** for owner-scoped spending access (read-only by default; writes optional). The two routes use different tokens and grants; configuring one does not enable the other.
 
 OpenRouter integration catalog lookup found no configured Replit OpenRouter connector during implementation. Existing workspace vault architecture is proxy-only. This add-on **does not automatically discover or grant access to connections**.
 
@@ -80,7 +80,14 @@ Catalog refreshes from the official endpoint with a bounded **five-minute cache*
 
 Prices are displayed as USD/million input/output tokens, plus per-image/request rates when supplied. Missing price is null, not zero; per-million-token prices are **not guaranteed per-photo quotes**. Actual provider usage cost is retained on the editable draft. The implementation explicitly selects `native` for file-input models and `cloudflare-ai` otherwise. Current docs label Cloudflare parser free; model tokens still cost money. `pdf-text` is deprecated. No implicit default engine or automatic paid Mistral fallback is used.
 
-Safety bounds: 10 MiB per source, 20 PDF pages, 24 megapixels, images stripped of EXIF and resized to 2400px, 200 line items, 6,000 output tokens, 90-second inference timeout, bounded upstream responses, two concurrent scans, **25 scans/day/household** (including failed attempted scans). `HOUSEHOLD_SCAN_DAILY_LIMIT` may be 1–100. Models with unavailable token rates, tiered price overrides, prompt >$20/million, completion >$100/million, or image/request fees >$1 are rejected rather than guessing cost. Bounds reduce exposure but are not a guaranteed dollar budget; operator should also set provider-side credit/budget limits.
+Safety bounds: legacy single browser upload 10 MiB; bulk/agent files 5 MiB each, 20 files per batch, 40 queued/running jobs, 100 batches/file reservations per UTC day. 20 PDF pages, 24 megapixels, images stripped of EXIF and resized to 2400px, 200 line items, 6,000 output tokens, 90-second inference timeout, bounded upstream responses, two concurrent scans, **25 scans/day/household** (local day, including failed attempted scans). `HOUSEHOLD_SCAN_DAILY_LIMIT` may be 1–100. Models with unavailable token rates, tiered price overrides, prompt >$20/million, completion >$100/million, or image/request fees >$1 are rejected rather than guessing cost. Bounds reduce exposure but are not a guaranteed dollar budget; operator should also set provider-side credit/budget limits.
+
+Bulk ingestion reserves a sanitized private file and content hash before inference.
+Two in-process workers consume a durable SQLite queue; run **one ASGI process**.
+Jobs independently become needs_review, duplicate, failed or interrupted. No automatic
+retry, model fallback or batch confirmation. Restart interrupts pending/running jobs;
+explicit retry must acknowledge possible prior billing. Failed sources remain available
+to signed-in users for manual entry. See API.md for the batch, job, retry and source routes.
 
 Supported files: JPEG, PNG, WebP, PDF. No HEIC, GIF, SVG, Office files. PDF type/signature/pages/encryption/readability validated with Poppler and a timeout; malformed/encrypted/oversized files fail explicitly. Receipt files are private, served only through authenticated API source routes. Uploads are sent only to the explicitly configured inference provider/vault. Review that provider's privacy/retention terms before uploading financial documents.
 
@@ -90,9 +97,16 @@ Integer cents for documented two-decimal currencies, never floats for ledger amo
 
 Without category/product filters, headline/person/time totals use receipt totals. With category/product filters, they use matched **item lines only**, exclude unrelated lines and receipt-level tax/discount. Category/item totals always use net line amounts and state that basis. Inclusive local dates, person/store/category/product filters, pagination and explicit all-match JSON/CSV exports are shared with MCP. Queries exceeding 10,000 purchase records require a narrower period, never silently truncate. CSV escapes formula-leading untrusted text and warns not to sum repeated receipt totals.
 
-Sources retained while a draft/purchase references them; deleting a draft or confirmed purchase removes its source when unreferenced. Confirmation retains a read-only draft link for retry idempotency; purchase deletion removes that link. No background retention deletion; operator is responsible for backups and desired deletion policy.
+Deletes are now soft deletes: records leave active views and totals, but immutable audit
+tombstones and authenticated private sources remain. Confirmation retains a read-only
+draft link. Audit contains server-derived actor kind/id/display, timestamp, action and
+field-level changes. Browser audit endpoints include deleted records. SQLite triggers
+reject audit updates/deletes; mutation and audit commit atomically. Existing data is
+preserved by additive migrations; unknown legacy attribution stays null, never guessed.
+No background retention deletion; operator must plan encrypted backups/storage and any
+legally required retention policy. Audit is intentionally not a user-editable ledger field.
 
-## Agent attachment through Vault (read-only MCP)
+## Agent attachment through Vault (read-only default; optional scoped writes)
 
 **Primary route: agents → Vault → Household MCP.** Household is not deployed yet; no live Household URL, Vault connection, tool sync or agent grant has been created or verified. The named **Household Spending** Vault preset is setup support, not a live connection. The fictional preview disables MCP and token issuance and cannot be used as an upstream service.
 
@@ -101,10 +115,27 @@ After the owner approves a dedicated Household deployment:
 1. Sign in to the **Household owner UI → Settings**. Issue a named expiring Household MCP token with only the needed read-only scopes (`purchases:read` and/or `summary:read`). The secret is shown once; Household stores only its SHA-256 hash.
 2. Open the existing **Vault → Services** and choose the **Household Spending** preset (`household_spending`). Enter the deployment's full HTTPS MCP endpoint URL, ending in `/mcp`. There is no default host; use the actual approved deployment URL.
 3. Paste the show-once **Household MCP token** into Vault's **Bearer token password field**. This is not the Household login password, a Vault agent identity token, or an OCR/OpenRouter key. Never copy the secret into agents, `mcpServers` configuration, prompts, model context, chat, screenshots or source files.
-4. **Save**, then **Sync tools** on the Vault connection. Verify the successful sync and scoped `household_*` manifest before granting access. `purchases:read` exposes `household_purchases`; `summary:read` exposes `household_summary`, `household_snapshot` and `household_items`. Every tool is read-only.
+4. **Save**, then **Sync tools** on the Vault connection. Verify the successful sync and scoped `household_*` manifest before granting access. `purchases:read` exposes purchase views/audit/purchaser IDs; `summary:read` exposes `household_summary`, `household_snapshot` and `household_items`. These default scopes remain read-only.
 5. In Vault's **Grants**, allow the connection **only for the agents the owner selects**. No fleet-wide default grant. Those agents use their existing Vault identity and native `vault_<connection>_<tool>` tools (or `POST /api/vault/mcp/{connection}` with a tool name and arguments). Vault injects the Household token server-side; it never enters the agent's context. Agents pick up tools on their next Vault sync or with `vault(action='refresh')`.
 
-Agent scopes cannot upload, mutate purchases, fetch private files, issue tokens or infer with provider credentials. Removing a Vault grant blocks that agent's next call. Revoking the Household token in the owner UI blocks all uses of that upstream token on the next request; after replacing it in Vault, Sync tools again to verify the current scopes.
+To opt an individual agent into input assistance, issue a **new separate token** with
+its exact fleet agent slug in immutable `agent_id` and only the intended scopes:
+`purchases:write`, `purchases:delete`, `uploads:create`, `drafts:read`, `drafts:write`,
+`drafts:confirm`. Any non-read scope requires a bound identity. Give each write-enabled
+agent its **own Vault connection and grant**; do not replace/upgrade a shared read token.
+Tools/list includes `_meta.household_agent_id` on every tool for a bound token so Vault
+can reject mismatched authenticated agents. A display name/tool argument never supplies
+identity. Direct token holders are the bound identity: keep the token secret.
+
+Owner scope selection explicitly authorizes these actions. Complete reconciled manual
+purchases may be confirmed by `purchases:write`; images always produce drafts until a
+human or `drafts:confirm` agent explicitly confirms. Purchaser is separate from creator,
+uploader, editor and confirmer. Agent mutations require retry idempotency keys and
+current versions for edit/delete/confirm. Browser clients should send Idempotency-Key
+and If-Match headers; old payloads remain supported. Agents cannot issue tokens, read
+provider credentials or fetch source URLs. Removing a Vault grant blocks its next call;
+revoking the Household token blocks every use of that token immediately. Sync tools
+after replacing a token and verify the scopes and binding before granting access.
 
 The upstream uses Streamable HTTP JSON-RPC: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, protocol versions 2024-11-05 / 2025-03-26 / 2025-06-18. Stateless responses, no SSE GET stream (405 permitted); do not use legacy SSE transport. Tools share the dashboard's isolated DB/query semantics; exact cents and timezone are disclosed. Snapshots support calendar months or custom periods; items support normalized labels (e.g. shampoo) and categories (e.g. snacks). Paginated purchase results include total count.
 

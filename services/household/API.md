@@ -1,5 +1,65 @@
 # Household API contract
 
+## Additive write / bulk contract (frontend integration)
+
+Records now include `version` (integer, starts at 1), `created_by`, `uploaded_by`,
+`last_edited_by`, `confirmed_by` (actor object or null). Actors are
+`{kind:"human"|"agent"|"system",id,display}` derived by the server, never purchaser
+identity. Old records have null attribution (not guessed). Attribution is not editable.
+Browser writes may send `Idempotency-Key` and `If-Match: <version>` headers;
+new clients should always do so. Legacy browser payloads remain accepted.
+Agent mutation tools require `idempotency_key`; edit/delete/confirm require
+`version`. Reusing a key with different arguments or a stale version returns 409.
+Deletes retain an audit tombstone and private source, excluded from normal lists/totals.
+
+- `GET /api/audit?limit=30&offset=0` → `{events,total,limit,offset}` (includes deleted).
+- `GET /api/purchases/{id}/audit`, `/api/drafts/{id}/audit` → same shape.
+  Events contain `id,record_id,record_kind,actor,at,action,diff,tombstone`.
+- `POST /api/batches` JSON `{model,person,source_type}` → 201 batch.
+  Explicitly selecting this model authorizes one scan per subsequently uploaded file.
+- `POST /api/batches/{id}/files` multipart `file` → 202 job; max 20 files/batch,
+  max 5 MiB/file; optional `Idempotency-Key`. Images/PDF use existing validation.
+- `GET /api/batches/{id}` → `{id,model,person,source_type,created_at,created_by,jobs:[job]}`.
+- `GET /api/batches?limit=30&offset=0` → `{batches,total,limit,offset}` to resume
+  retained work after a browser reload.
+- `GET /api/jobs/{id}` → job.
+- `POST /api/jobs/{id}/retry` JSON `{acknowledge_cost:true}` → 202 job.
+  Explicit consent required: failed/interrupted scans may have been billed.
+- `POST /api/jobs/{id}/cancel` JSON `{}` → job. Queued work only; running work
+  cannot safely be cancelled (409). No automatic retries or fallback models.
+- `GET /api/jobs/{id}/source` → authenticated retained source, including failures.
+  Job: `{id,batch_id,status,filename,upload_id,draft_id,error,created_at,updated_at,
+  uploaded_by,duplicate_of}`. Status: `queued|running|needs_review|failed|interrupted|duplicate|cancelled`.
+  Two durable queue workers; 40 pending jobs, 100 file reservations and 100 batches
+  per UTC day. Daily scan caps use household local time and include failed attempts. Restart marks
+  queued/running jobs interrupted for explicit retry; never silently re-spends.
+  Unconfigured inference returns 503 before accepting a batch. Preview manual writes
+  work; inference and credential issuance remain disabled.
+- Existing `POST /api/uploads` keeps synchronous 201 draft compatibility.
+
+Agent token issuance additionally accepts optional `agent_id` (stable lowercase slug,
+`[a-z0-9][a-z0-9_-]{0,63}`), **required for any non-read scope**. Allowed scopes:
+`purchases:read`, `summary:read`, `purchases:write`, `purchases:delete`,
+`uploads:create`, `drafts:read`, `drafts:write`, `drafts:confirm`.
+Omitted scopes default to the two original read scopes. Identity is bound to the
+hashed token at issuance and immutable. Each write agent needs its own Vault
+connection/grant; do not upgrade or share the old read-only token.
+Scoped MCP tools additionally provide `household_purchase_create/edit/delete`,
+`household_drafts`, `household_draft`, `household_draft_edit/confirm`,
+`household_upload`, `household_job`, `household_job_retry/cancel`,
+`household_people`, `household_models`, `household_purchase`, `household_audit`, and
+`household_draft_audit`.
+Use tools/list for exact per-tool schemas. Upload accepts `filename,mime,data_base64,
+model,person,source_type,idempotency_key`; no URLs/SSRF. Max decoded file 5 MiB;
+only upload tool accepts JSON up to 8 MiB (other JSON remains 256 KiB).
+Every tool advertised for an identity-bound token includes
+`_meta: {household_agent_id: "<exact fleet agent slug>"}`; old unbound read tokens
+omit this metadata. Vault must enforce that binding against its authenticated
+agent identity; callers cannot override attribution through tool arguments.
+Images always produce review drafts; `drafts:confirm` explicitly authorizes
+confirmation of complete reconciled drafts. `purchases:write` authorizes complete
+manual purchase creation/edit. Purchaser `person_id` is independent of actor.
+
 Independent add-on service; no imports, storage sharing, or changes to fleet/CRM/vault services. UI owns `templates/index.html` and `static/`. All financial amounts are **integer cents** (supported currencies with 2 decimal minor units only). IDs are strings. Dates are `YYYY-MM-DD` in the configured household timezone. Production never has demo records; preview records and responses have `demo: true`.
 
 ## Browser authentication
@@ -48,7 +108,7 @@ Item line totals are **net of line-level discounts**. Receipt-level `discount_ce
 - `GET /api/drafts` → `{drafts:[draft]}` (latest 100; `limit` 1–100 and `offset` ≥0 supported; response also `total,limit,offset`).
 - `GET /api/drafts/{id}` → draft.
 - `PATCH /api/drafts/{id}` → draft. Accept only editable top-level fields above (store/date/currency/person_id/items/subtotal_cents/tax_cents/discount_cents/total_cents/notes). Sending `items` replaces all items. Server recomputes warnings/reconciliation, normalizes product labels if blank; partial edits allowed.
-- `DELETE /api/drafts/{id}` → `{ok:true}`. Deletes private source when unreferenced.
+- `DELETE /api/drafts/{id}` → `{ok:true}`. Retains private source and audit tombstone; removed from active views.
 - `POST /api/drafts/{id}/confirm` `{}` → `{purchase:purchase,already_confirmed:boolean}`; idempotent, moves one draft into confirmed history. Retained confirmed draft is read-only.
 - `GET /api/drafts/{id}/source`, `GET /api/purchases/{id}/source` → authenticated private file.
 - `GET /api/purchases/{id}` → purchase (same fields with `status:"confirmed"`).
@@ -69,10 +129,10 @@ Item line totals are **net of line-level discounts**. Receipt-level `discount_ce
 ## Agent settings / MCP
 
 Owner only token management (partner can use all household purchase APIs):
-- `GET /api/agent-tokens` → `{tokens:[{id,name,scopes:[string],created_at,expires_at,last_used_at,revoked}]}` never secret/hash.
-- `POST /api/agent-tokens` `{name,scopes:["purchases:read","summary:read"],expires_days:integer(1..365)}` → `{token:"hh_…",id,name,scopes,expires_at}` **secret returned once**. Name is 1–100 characters. Scope subset only. Store only hashed token.
+- `GET /api/agent-tokens` → `{tokens:[{id,name,agent_id,scopes:[string],created_at,expires_at,last_used_at,revoked}]}` never secret/hash.
+- `POST /api/agent-tokens` `{name,agent_id?,scopes?:["purchases:read","summary:read"],expires_days:integer(1..365)}` → `{token:"hh_…",id,name,agent_id,scopes,expires_at}` **secret returned once**. Name is 1–100 characters. Scope subset only. Store only hashed token. Omitted scopes default to the original two read scopes; non-read scopes require the exact stable fleet agent slug.
 - `DELETE /api/agent-tokens/{id}` → `{ok:true}` revocation immediately effective.
-- `POST /mcp` Authorization Bearer token; JSON-RPC 2.0, stateless Streamable HTTP JSON responses. No write tools, no provider secrets, no automatic fleet grants. `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`. Tools `household_purchases` (purchases:read), `household_summary` (summary:read), `household_snapshot` (summary:read; month `YYYY-MM` or start/end, optional person/category/q), `household_items` (summary:read; item/category/date filters). Arguments reuse the above filters and pagination. Responses are MCP `content:[{type:"text",text:JSON-string}]` and `structuredContent`; tool failures use `isError:true`. Unsupported protocol/method/argument errors are JSON-RPC errors. Endpoint GET returns 405 (no SSE stream); initialization advertises only tools.
+- `POST /mcp` Authorization Bearer token; JSON-RPC 2.0, stateless Streamable HTTP JSON responses. Optional explicitly scoped write tools are documented above; no provider secrets, no automatic fleet grants. `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`. Original tools: `household_purchases` (purchases:read), `household_summary` (summary:read), `household_snapshot` (summary:read; month `YYYY-MM` or start/end, optional person/category/q), `household_items` (summary:read; item/category/date filters). Responses are MCP `content:[{type:"text",text:JSON-string}]` and `structuredContent`; tool failures use `isError:true` and structured `{status,detail}`. Unsupported protocol/method/argument errors are JSON-RPC errors. Endpoint GET returns 405 (no SSE stream); initialization advertises only tools.
 
 ## Deployment / preview
 

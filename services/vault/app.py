@@ -356,6 +356,77 @@ def require_agent(request: Request) -> str:
     return agent_name
 
 
+def _household_manifest_proof(server_url: str, bearer_token: str, tools: Any) -> str:
+    """Bind metadata to the stored canonical URL, token, and manifest."""
+    payload = json.dumps([server_url.rstrip("/"), bearer_token, tools],
+                         sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cache_mcp_tools(cid: str, server_url: str, bearer_token: str, tools: Any) -> None:
+    conn = store.get(cid) or {}
+    if conn.get("service") != "household_spending":
+        r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(tools))
+        return
+    # Atomic publication avoids pairing a new manifest with an old proof.
+    with r.pipeline(transaction=True) as pipe:
+        pipe.set(f"vault:conn:{cid}:mcp_tools", json.dumps(tools))
+        pipe.set(f"vault:conn:{cid}:household_manifest_proof",
+                 _household_manifest_proof(server_url, bearer_token, tools))
+        pipe.execute()
+
+
+def _invalidate_household_manifest(cid: str, service: str) -> None:
+    if service == "household_spending":
+        r.delete(f"vault:conn:{cid}:mcp_tools",
+                 f"vault:conn:{cid}:household_manifest_proof")
+
+
+def _require_household_agent(conn: Dict[str, Any], agent_name: str,
+                             secrets_d: Dict[str, Any],
+                             tool_name: Optional[str] = None) -> None:
+    """Extra authorization for this preset only, after real Vault authentication."""
+    if conn.get("service") != "household_spending":
+        return
+    cid = conn["id"]
+    try:
+        raw = r.get(f"vault:conn:{cid}:mcp_tools")
+        tools = json.loads(raw) if raw else None
+        bound_agent = custom_mcp.household_agent_binding(tools)
+    except (ValueError, TypeError, custom_mcp.CustomMCPError):
+        raise HTTPException(status_code=403, detail=(
+            "Household manifest is missing or has unsafe agent binding; "
+            "ask the owner to Sync tools"))
+    proof = r.get(f"vault:conn:{cid}:household_manifest_proof")
+    expected = _household_manifest_proof(
+        conn.get("base_url", ""), secrets_d.get("api_key", ""), tools)
+    # Pre-rollout, unbound, read-only manifests need no migration. All bound
+    # manifests require proof; any existing but outdated proof fails closed.
+    if ((bound_agent is not None and not proof)
+            or (proof and not secrets.compare_digest(proof, expected))):
+        raise HTTPException(status_code=403, detail=(
+            "Household manifest is stale; ask the owner to Sync tools"))
+    if bound_agent is not None and bound_agent != agent_name:
+        raise HTTPException(status_code=403, detail=(
+            "Household token is bound to a different authenticated fleet agent"))
+    if tool_name is not None:
+        if bound_agent is None and tool_name not in custom_mcp.HOUSEHOLD_READ_TOOLS:
+            raise HTTPException(status_code=403, detail=(
+                "Household writes require an agent-bound token and synced tool manifest"))
+        if bound_agent is not None and not any(t["name"] == tool_name for t in tools):
+            raise HTTPException(status_code=403, detail=(
+                "Household tool is not in this token's scoped manifest"))
+
+
+def _validate_household_grant(agent: str, cid: str) -> None:
+    conn = store.get(cid) or {}
+    # Owners may grant a connection before its first successful sync, but the
+    # forwarding guard always fails closed until its manifest is available.
+    if (conn.get("service") == "household_spending"
+            and r.get(f"vault:conn:{cid}:mcp_tools")):
+        _require_household_agent(conn, agent, store.get_secrets(cid))
+
+
 def _oauth_public_reason(raw_msg: str) -> str:
     """Map a raw OAuthError to a fixed, sanitized agent-facing reason.
 
@@ -1199,6 +1270,7 @@ async def approve_grant_request(request: Request, request_id: str = Form(...)):
     if len(parts) == 3 and parts[0] == "grant" and store.get_request(request_id):
         _, agent, cid = parts
         if agent in AGENT_NAMES and store.get(cid):
+            _validate_household_grant(agent, cid)
             store.set_grant(agent, cid, True)
             audit_log("admin", cid, "grant_added", f"Approved request from {agent}")
             store.delete_request(request_id)
@@ -1547,6 +1619,7 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
         if not base_url:
             return RedirectResponse(url="/services?error=Base+URL+required", status_code=303)
 
+    _invalidate_household_manifest(conn_id, service)
     store.save(
         conn_id, service=service, label=form.get("label") or tpl["label"],
         base_url=base_url, auth=auth, secrets=secrets_d,
@@ -1561,7 +1634,7 @@ async def add_service(request: Request, background_tasks: BackgroundTasks):
         _mcp_status_key = f"vault:conn:{conn_id}:mcp_status"
         try:
             tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
-            r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            _cache_mcp_tools(conn_id, base_url, secrets_d["api_key"], tools)
             r.delete(_mcp_status_key)
             logger.info("Synced %d MCP tools for connection %s", len(tools), conn_id)
         except custom_mcp.MCPTokenExpiredError as exc:
@@ -1776,6 +1849,9 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
             final_base_url = conn.get("base_url", "https://paper-api.alpaca.markets/v2")
     else:
         final_base_url = (form.get("base_url") or conn.get("base_url", "")).strip()
+    if ((conn.get("auth") or {}).get("kind") == "mcp_bearer"
+            and (new_token or final_base_url != conn.get("base_url", ""))):
+        _invalidate_household_manifest(conn_id, conn["service"])
     store.save(
         conn_id, service=conn["service"],
         label=form.get("label") or conn.get("label", ""),
@@ -1798,7 +1874,7 @@ async def update_service(request: Request, background_tasks: BackgroundTasks):
             if final_base_url and _mcp_tok:
                 try:
                     _tools = await custom_mcp.list_tools(final_base_url, _mcp_tok)
-                    r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(_tools))
+                    _cache_mcp_tools(conn_id, final_base_url, _mcp_tok, _tools)
                     r.delete(_mcp_status_key)  # clear flag on successful re-sync
                     logger.info("Re-synced %d MCP tools for %s after dashboard update",
                                 len(_tools), conn_id)
@@ -2161,6 +2237,11 @@ async def update_grants(request: Request):
         return resp
     form = await request.form()
     conn_ids = store.list_ids()
+    # Validate the whole update before changing any grants.
+    for agent in AGENT_NAMES:
+        for cid in conn_ids:
+            if f"grant_{agent}_{cid}" in form:
+                _validate_household_grant(agent, cid)
     for agent in AGENT_NAMES:
         for cid in conn_ids:
             granted = f"grant_{agent}_{cid}" in form
@@ -3551,6 +3632,11 @@ async def mcp_tool_call(conn_id: str, request: Request):
     if not server_url:
         raise HTTPException(status_code=409, detail="No MCP server URL stored — update the connection")
 
+    try:
+        _require_household_agent(conn, agent_name, secrets_d, tool_name)
+    except HTTPException:
+        audit_log(agent_name, cid, "mcp_denied", "Household agent binding guard")
+        raise
     audit_log(agent_name, cid, "mcp_call", f"tool={tool_name}")
     _mcp_status_key = f"vault:conn:{cid}:mcp_status"
     try:
@@ -3625,7 +3711,7 @@ async def mcp_sync_tools(conn_id: str, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"MCP tool sync failed: {exc}")
 
-    r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(tools))
+    _cache_mcp_tools(cid, server_url, bearer_token, tools)
     r.delete(_mcp_status_key)  # clear any stale token-expired flag on success
     audit_log("admin", cid, "mcp_sync_tools", f"{len(tools)} tools")
     logger.info("MCP tool sync for %s: %d tools", cid, len(tools))
@@ -3971,6 +4057,7 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
             eh[tpl.get("extra_secret_header", "APCA-API-SECRET-KEY")] = api_secret
             secrets_d["extra_headers"] = eh
 
+    _invalidate_household_manifest(conn_id, service)
     store.save(
         conn_id, service=service, label=form.get("label") or tpl["label"],
         base_url=base_url, auth=auth, secrets=secrets_d,
@@ -3985,7 +4072,7 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
         _mcp_status_key = f"vault:conn:{conn_id}:mcp_status"
         try:
             tools = await custom_mcp.list_tools(base_url, secrets_d["api_key"])
-            r.set(f"vault:conn:{conn_id}:mcp_tools", json.dumps(tools))
+            _cache_mcp_tools(conn_id, base_url, secrets_d["api_key"], tools)
             r.delete(_mcp_status_key)
             logger.info("Synced %d MCP tools for connection %s (admin API)", len(tools), conn_id)
         except custom_mcp.MCPTokenExpiredError as exc:
@@ -3998,6 +4085,9 @@ async def admin_add_connection(request: Request, background_tasks: BackgroundTas
             logger.warning("MCP tool sync failed for %s (admin API): %s", conn_id, exc)
 
     # Optional immediate grants for one or more agents.
+    for agent in (body.get("grant_agents") or []):
+        if agent in AGENT_NAMES:
+            _validate_household_grant(agent, conn_id)
     for agent in (body.get("grant_agents") or []):
         if agent in AGENT_NAMES:
             store.set_grant(agent, conn_id, True)
@@ -4228,6 +4318,10 @@ async def admin_update_connection(conn_id: str, request: Request,
     else:
         new_skill_description = conn.get("skill_description", "")
 
+    if ((conn_upd.get("auth") or {}).get("kind") == "mcp_bearer"
+            and ((new_base_url and new_base_url != conn.get("base_url", "").rstrip("/")) or
+                 (str(body.get("api_key") or body.get("bearer_token") or "")).strip())):
+        _invalidate_household_manifest(cid, conn["service"])
     store.save(
         cid,
         service=conn["service"],
@@ -4256,7 +4350,7 @@ async def admin_update_connection(conn_id: str, request: Request,
             if _mcp_url and _mcp_tok:
                 try:
                     _tools = await custom_mcp.list_tools(_mcp_url, _mcp_tok)
-                    r.set(f"vault:conn:{cid}:mcp_tools", json.dumps(_tools))
+                    _cache_mcp_tools(cid, _mcp_url, _mcp_tok, _tools)
                     r.delete(_mcp_status_key)  # clear flag on successful re-sync
                     logger.info("Re-synced %d MCP tools for %s after update", len(_tools), cid)
                 except custom_mcp.MCPTokenExpiredError as exc:
@@ -4343,6 +4437,8 @@ async def admin_set_grant(request: Request):
         raise HTTPException(status_code=400, detail="Unknown agent")
     if not store.get(cid):
         raise HTTPException(status_code=404, detail="Connection not found")
+    if granted:
+        _validate_household_grant(agent, cid)
     if store.set_grant(agent, cid, granted):
         audit_log("admin", cid,
                   "grant_added" if granted else "grant_removed",
