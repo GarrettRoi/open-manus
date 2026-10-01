@@ -1,6 +1,6 @@
 # Household spending — independent attachment
 
-A private FastAPI/Jinja add-on in the existing repository. This service has **its own URL, UI, auth, SQLite database, upload directory and deployment config**. It does not replace/migrate/import the fleet, agent CRM, vault app, or their storage. No Redis client is used. Existing agents may connect only after the household owner explicitly issues a scoped token. OCR can use the existing vault through HTTP; raw provider credentials never leave that vault.
+A private FastAPI/Jinja add-on in the existing repository. This service has **its own URL, UI, auth, SQLite database, upload directory and deployment config**. It does not replace/migrate/import the fleet, agent CRM, vault app, or their storage. No Redis client is used. The primary agent route is **agents → Vault → Household MCP**, with an owner-issued scoped token stored only in Vault and grants only to selected agents. OCR can use Vault in the opposite direction; raw provider credentials never leave that vault.
 
 The API contract is in `API.md`. The frontend lives exclusively in `templates/` and `static/`.
 
@@ -47,6 +47,8 @@ At most two local accounts; purchaser entities are separate editable identities.
 
 ## OCR: configure explicitly, prefer the vault
 
+This is **Household → Vault → OpenRouter** for receipt scanning, independent of **agents → Vault → Household MCP** for read-only spending access. The two routes use different tokens and grants; configuring one does not enable the other.
+
 OpenRouter integration catalog lookup found no configured Replit OpenRouter connector during implementation. Existing workspace vault architecture is proxy-only. This add-on **does not automatically discover or grant access to connections**.
 
 Preferred server-only adapter:
@@ -90,24 +92,21 @@ Without category/product filters, headline/person/time totals use receipt totals
 
 Sources retained while a draft/purchase references them; deleting a draft or confirmed purchase removes its source when unreferenced. Confirmation retains a read-only draft link for retry idempotency; purchase deletion removes that link. No background retention deletion; operator is responsible for backups and desired deletion policy.
 
-## Agent attachment (read-only MCP)
+## Agent attachment through Vault (read-only MCP)
 
-In the household owner UI, issue a named expiring token with only the needed scopes (`purchases:read`, `summary:read`). Secret displayed once; only SHA-256 hash stored. No fleet-wide default grant. Agent scopes cannot upload, mutate purchases, fetch private files, issue tokens or infer with provider credentials.
+**Primary route: agents → Vault → Household MCP.** Household is not deployed yet; no live Household URL, Vault connection, tool sync or agent grant has been created or verified. The named **Household Spending** Vault preset is setup support, not a live connection. The fictional preview disables MCP and token issuance and cannot be used as an upstream service.
 
-Configure the intended MCP-capable agent/client after owner approval:
+After the owner approves a dedicated Household deployment:
 
-```json
-{
-  "mcpServers": {
-    "household-spending": {
-      "url": "https://<independent-household-host>/mcp",
-      "headers": {"Authorization": "Bearer <owner-issued-household-token>"}
-    }
-  }
-}
-```
+1. Sign in to the **Household owner UI → Settings**. Issue a named expiring Household MCP token with only the needed read-only scopes (`purchases:read` and/or `summary:read`). The secret is shown once; Household stores only its SHA-256 hash.
+2. Open the existing **Vault → Services** and choose the **Household Spending** preset (`household_spending`). Enter the deployment's full HTTPS MCP endpoint URL, ending in `/mcp`. There is no default host; use the actual approved deployment URL.
+3. Paste the show-once **Household MCP token** into Vault's **Bearer token password field**. This is not the Household login password, a Vault agent identity token, or an OCR/OpenRouter key. Never copy the secret into agents, `mcpServers` configuration, prompts, model context, chat, screenshots or source files.
+4. **Save**, then **Sync tools** on the Vault connection. Verify the successful sync and scoped `household_*` manifest before granting access. `purchases:read` exposes `household_purchases`; `summary:read` exposes `household_summary`, `household_snapshot` and `household_items`. Every tool is read-only.
+5. In Vault's **Grants**, allow the connection **only for the agents the owner selects**. No fleet-wide default grant. Those agents use their existing Vault identity and native `vault_<connection>_<tool>` tools (or `POST /api/vault/mcp/{connection}` with a tool name and arguments). Vault injects the Household token server-side; it never enters the agent's context. Agents pick up tools on their next Vault sync or with `vault(action='refresh')`.
 
-Client header configuration varies; keep actual token in the client/vault secret store, not prompts or committed JSON. Streamable HTTP JSON-RPC: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, protocol versions 2024-11-05 / 2025-03-26 / 2025-06-18. Stateless responses, no SSE GET stream (405 permitted); do not use legacy SSE transport. Tools: `household_purchases`, `household_summary`, `household_snapshot` (calendar month or custom period), `household_items` (normalized labels e.g. shampoo, snacks category). Same isolated DB/query semantics as dashboard; exact cents and timezone disclosed. Paginated purchase results include total count. Owner revocation takes effect on the next request.
+Agent scopes cannot upload, mutate purchases, fetch private files, issue tokens or infer with provider credentials. Removing a Vault grant blocks that agent's next call. Revoking the Household token in the owner UI blocks all uses of that upstream token on the next request; after replacing it in Vault, Sync tools again to verify the current scopes.
+
+The upstream uses Streamable HTTP JSON-RPC: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, protocol versions 2024-11-05 / 2025-03-26 / 2025-06-18. Stateless responses, no SSE GET stream (405 permitted); do not use legacy SSE transport. Tools share the dashboard's isolated DB/query semantics; exact cents and timezone are disclosed. Snapshots support calendar months or custom periods; items support normalized labels (e.g. shampoo) and categories (e.g. snacks). Paginated purchase results include total count.
 
 ## Backup / restore
 
@@ -125,6 +124,9 @@ Restore with service stopped: replace only the dedicated `household.sqlite3` and
 
 ```sh
 python -m pytest services/household/tests -q --confcutdir=services/household/tests
+python -m pytest services/vault/tests/test_household_spending_mcp.py -q --confcutdir=services/vault/tests
 ```
 
 Tests clear credential/household/Redis environment variables, prohibit socket connections, create dedicated temporary SQLite databases, and use explicitly mocked inference/metadata HTTP responses only. They exercise authentication, CSRF, scopes/revocation, integer arithmetic, currency separation, filters/calendar boundaries, idempotency/draft exclusion, duplicate/privacy/file bounds, exports and persistence. Real Poppler validates test-generated bounded PDFs. Public official docs/catalog were read, but **live billable inference and production deployment remain unverified/not performed**.
+
+The focused Vault contract suite uses only fake Redis, temporary Household SQLite, in-process TestClients and MockTransport. It verifies the named preset, HTTPS/no-default URL, actual MCP handshake/scoped tools, selected-agent grants, denied scopes and both Vault-grant and Household-token revocation. It never uses workspace Redis or a live Household deployment.

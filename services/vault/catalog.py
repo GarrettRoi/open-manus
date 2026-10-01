@@ -619,6 +619,31 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "example_call": "Use the native vault_<name>_<tool> tools registered from Vowsok",
         # MCP kind: test uses tools/list — no test_probe needed
     },
+    "household_spending": {
+        "label": "Household Spending",
+        "auth": {"kind": "mcp_bearer"},
+        "is_mcp": True,
+        "base_url": "",
+        "allowed_hosts": [],
+        "fields": [
+            {"name": "base_url", "label": "Household MCP endpoint URL",
+             "placeholder": "Full deployed HTTPS URL ending in /mcp", "required": True},
+        ],
+        "setup_help": (
+            "After an owner-approved Household deployment, connect agents through Vault to Household Spending MCP. "
+            "No deployment URL is supplied: enter the full HTTPS endpoint ending in /mcp. "
+            "In the Household owner UI, create a named expiring Household MCP token with "
+            "only the needed read-only scopes (purchases:read and/or summary:read). "
+            "Paste that show-once token into the Bearer token password field here — "
+            "not a Household login password, Vault agent token, or OCR/provider key. "
+            "Save, Sync tools, verify the scoped household_* tool list, then grant this "
+            "connection only to selected agents. Vault injects the token server-side; "
+            "never copy it into agent configuration, prompts, or chat. "
+            "Household-to-Vault OCR access is a separate, opposite-direction connection."
+        ),
+        "example_call": "Use the native vault_<name>_household_* tools after owner-selected Vault grants",
+        # MCP kind: test uses tools/list — no test_probe needed
+    },
     "mcp_bearer": {
         "label": "Custom MCP (bearer token)",
         "auth": {"kind": "mcp_bearer"},
