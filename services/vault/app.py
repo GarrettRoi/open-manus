@@ -4454,6 +4454,85 @@ replit_mcp = replit_mcp_mod.ReplitMCP(r, encrypt_value, decrypt_value, PUBLIC_UR
 _REPLIT_PROJECTS_KEY = "replitmcp:projects"
 
 
+def _clarifications():
+    try:
+        from services.vault import dev_clarifications
+    except ImportError:
+        import dev_clarifications
+    return dev_clarifications
+
+
+class DeveloperQuestion(BaseModel):
+    question: str = Field(min_length=1, max_length=8000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class DeveloperChannelProvision(BaseModel):
+    destination: str = Field(min_length=1, max_length=200)
+    developer_id: str = Field(min_length=1, max_length=200)
+
+
+def _developer_bearer(request: Request) -> str:
+    # Deliberately separate from agent/admin authentication: no cookie fallback.
+    parts = request.headers.get("Authorization", "").split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(401, "Clarification bearer authorization required",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return parts[1]
+
+
+def _clarification_call(operation, *args):
+    module = _clarifications()
+    try:
+        return operation(*args)
+    except PermissionError:
+        raise HTTPException(401, "Invalid or expired clarification authorization",
+                            headers={"WWW-Authenticate": "Bearer"})
+    except module.RateLimited as exc:
+        raise HTTPException(429, "Developer clarification rate limit reached",
+                            headers={"Retry-After": str(exc.retry_after)})
+    except ValueError:
+        raise HTTPException(400, "Invalid clarification request or idempotency conflict")
+    except redis.exceptions.RedisError:
+        raise HTTPException(503, "Clarification channel temporarily unavailable")
+
+
+@app.post("/api/dev-requests/{request_id}/destinations/{destination}/clarifications")
+def developer_ask(request_id: str, destination: str, body: DeveloperQuestion,
+                  request: Request):
+    token = _developer_bearer(request)
+    store = _clarifications().ClarificationStore(r)
+    record = _clarification_call(
+        store.ask, token, request_id, destination, body.question, body.idempotency_key)
+    return JSONResponse(record, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/dev-requests/{request_id}/destinations/{destination}/clarifications/{question_id}")
+def developer_read(request_id: str, destination: str, question_id: str,
+                   request: Request):
+    token = _developer_bearer(request)
+    store = _clarifications().ClarificationStore(r)
+    record = _clarification_call(
+        store.read, token, request_id, destination, question_id)
+    return JSONResponse(record, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/admin/dev-requests/{request_id}/clarifications/provision")
+def developer_channel_provision(request_id: str, body: DeveloperChannelProvision,
+                                request: Request):
+    require_admin_api(request)
+    require_browser_csrf(request)
+    try:
+        replit_mcp_mod.clarification_public_url(PUBLIC_URL)
+    except ReplitMCPError:
+        raise HTTPException(503, "Configure an HTTPS vault public URL for clarifications")
+    store = _clarifications().ClarificationStore(r)
+    token = _clarification_call(
+        store.provision, request_id, body.destination, body.developer_id)
+    return JSONResponse({"token": token, "token_type": "Bearer", "expires_in": 86400},
+                        headers={"Cache-Control": "no-store"})
+
+
 def _project_registry():
     """Load the shared project-registry contract lazily.
 

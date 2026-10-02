@@ -269,6 +269,31 @@ def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[
 def dev_request_tool(args: dict, **_kw) -> str:
     action = str(args.get("action") or "submit").strip().lower()
     try:
+        if action == "answer_clarification":
+            from tools.dispatch_tickets import ticket_execution_context
+            from services.vault.dev_clarifications import ClarificationStore
+
+            ctx = ticket_execution_context.get() or {}
+            question_id = str(args.get("question_id") or "").strip()
+            agent = os.getenv("AGENT_NAME", "").strip().lower()
+            if (ctx.get("kind") != "dev_clarification" or not question_id
+                    or ctx.get("question_id") != question_id
+                    or ctx.get("ticket_id") != question_id or not ctx.get("token")):
+                raise PermissionError(
+                    "Answer requires the matching fenced developer clarification execution.")
+            if not agent:
+                raise PermissionError("AGENT_NAME is required to answer a clarification.")
+            if ctx.get("approval_required"):
+                raise PermissionError("Owner approval is required; this execution cannot answer.")
+            # Identity and token are private runtime values, never model-supplied.
+            item = ClarificationStore(_redis()).answer(
+                question_id, agent, args.get("answer"),
+                args.get("idempotency_key"), ctx["token"])
+            return json.dumps({
+                "answered": True, "question_id": item["id"],
+                "request_id": item["request_id"], "status": item["status"],
+                "note": "Answer recorded. Developer work is not automatically resumed.",
+            }, ensure_ascii=False)
         if action == "projects":
             return json.dumps({
                 "projects": configured_names(_redis()),
@@ -325,7 +350,7 @@ def dev_request_tool(args: dict, **_kw) -> str:
                      ("id", "title", "agent", "work_scope", "project", "status")}
                     for it in items]
             return json.dumps({"requests": slim, "filter": status}, ensure_ascii=False)
-        return json.dumps({"error": f"Unknown action '{action}'. Use submit, status, list, or projects."})
+        return json.dumps({"error": f"Unknown action '{action}'. Use submit, status, list, projects, or answer_clarification."})
     except Exception as e:
         logger.exception("dev request tool failed")
         return json.dumps({"error": f"Dev request failed: {e}"})
@@ -351,14 +376,16 @@ registry.register(
             "Every new submission must explicitly provide work_scope and project. "
             "fleet_platform always targets open-manus; project_app targets the "
             "actual application. Unknown names cannot be submitted. "
-            "Owner approval is always required."
+            "Owner approval is always required. The narrow answer_clarification "
+            "action records an answer only during your matching fenced developer "
+            "clarification execution; it is not general Q&A and does not resume developer work."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["submit", "status", "list", "projects"],
+                    "enum": ["submit", "status", "list", "projects", "answer_clarification"],
                 },
                 "title": {
                     "type": "string",
@@ -390,6 +417,18 @@ registry.register(
                 "filter": {
                     "type": "string",
                     "description": "list filter: pending, approved, denied, or all.",
+                },
+                "question_id": {
+                    "type": "string",
+                    "description": "Delivered clarification id (answer_clarification only).",
+                },
+                "answer": {
+                    "type": "string",
+                    "description": "Your answer, or specific missing information (answer_clarification).",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable key for this answer; reuse for identical retries (answer_clarification).",
                 },
             },
             "required": ["action"],

@@ -215,7 +215,14 @@ DEV_REQUEST_GUIDANCE = (
     "If request_dev_modification is unavailable (REDIS_URL not configured), "
     "state clearly that dev-request filing is unavailable due to a "
     "configuration issue and describe what change you would have requested, "
-    "so the owner can act on it manually."
+    "so the owner can act on it manually. "
+    "Limited exception: when the gateway delivers a fenced developer clarification "
+    "for your approved request, answer only that question with "
+    "request_dev_modification(action='answer_clarification', question_id=..., "
+    "answer=..., idempotency_key=...). Use a stable key for identical retries. "
+    "Do not complete it with agent_dispatch, override the originating agent, or "
+    "use retired inboxes/Discord as a reply channel. This is not general agent "
+    "Q&A; an answer is stored for the developer and does not automatically resume work."
 )
 
 KANBAN_GUIDANCE = (

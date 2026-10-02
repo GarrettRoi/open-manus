@@ -25,6 +25,7 @@ for path in (ROOT, VAULT):
         sys.path.insert(0, str(path))
 
 from services.vault import dev_projects
+from services.vault import dev_clarifications
 from services.vault import replit_mcp
 
 
@@ -51,7 +52,7 @@ class _OneIterationQueue:
 
 
 async def run_dispatch_iteration(mcp, req_id, renew_result=True,
-                                 pin_result=None):
+                                 pin_result=None, public_url="https://vault.invalid"):
     """Run one real dispatcher iteration with only Redis Lua mocked.
 
     fakeredis does not provide a Lua interpreter in the lightweight test
@@ -59,6 +60,15 @@ async def run_dispatch_iteration(mcp, req_id, renew_result=True,
     small persistence-preserving stand-ins; all queue, item, routing, prompt,
     and error handling remains in ``dispatch_loop`` itself.
     """
+    # Routing regressions exercise the real mandatory capability provisioner
+    # against fake Redis, with an explicit non-live HTTPS vault URL.
+    mcp.public_url = public_url
+    key = f"devreq:item:{req_id}"
+    raw = mcp.r.get(key)
+    if raw:
+        request = json.loads(raw)
+        request.setdefault("agent", "tester")
+        mcp.r.set(key, json.dumps(request), ex=86400)
     queue = _OneIterationQueue(req_id)
     redis_module = ModuleType("redis")
     redis_module.from_url = lambda *args, **kwargs: queue
@@ -109,6 +119,32 @@ def test_project_names_are_canonical_and_collisions_are_rejected():
         dev_projects.validate_projects({"one": "same", "two": "same"})
     with pytest.raises(ValueError, match="invalid project name"):
         dev_projects.validate_projects({"second/app": "one"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing-url", "redis-unavailable"])
+async def test_dispatch_refuses_to_start_without_clarification_channel(monkeypatch, failure):
+    r = redis()
+    put_projects(r, {"open-manus": "repl-one"})
+    r.set("devreq:item:channel-failure", json.dumps({
+        "id": "channel-failure", "project": "open-manus",
+        "agent": "tester", "status": "approved",
+    }), ex=86400)
+    mcp = replit_mcp.ReplitMCP(r, str, str, "")
+    mcp.start_agent_run = AsyncMock()
+    if failure == "redis-unavailable":
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("secret internal diagnostics")
+        monkeypatch.setattr(dev_clarifications.ClarificationStore, "provision", unavailable)
+    await run_dispatch_iteration(
+        mcp, "channel-failure",
+        public_url="" if failure == "missing-url" else "https://vault.invalid")
+    mcp.start_agent_run.assert_not_awaited()
+    stored = json.loads(r.get("devreq:item:channel-failure"))
+    assert stored["dispatch_status"] == "failed"
+    assert stored["dispatch_repl_id"] == "repl-one"
+    assert "secret internal diagnostics" not in stored["dispatch_error"]
+    assert "clarification channel" in stored["dispatch_error"]
 
 
 def test_legacy_target_is_default_only_and_explicit_registry_wins():

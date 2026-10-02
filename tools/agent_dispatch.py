@@ -433,6 +433,12 @@ def agent_dispatch_tool(args: dict, **_kw) -> str:
     action = str(args.get("action") or "").strip().lower()
     me = _agent_name()
     try:
+        context = ticket_execution_context.get() or {}
+        if (context.get("kind") == "dev_clarification"
+                and action not in ("search", "inspect_access", "roster", "status", "result", "list")):
+            raise PermissionError(
+                "Clarification execution permits only answer_clarification on "
+                "request_dev_modification; ordinary board mutations are not allowed.")
         if action in ("search", "inspect_access", "roster"):
             from tools.vault_tools import discover_agents
             query = dict(args)

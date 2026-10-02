@@ -31,6 +31,7 @@ import re
 import secrets as pysecrets
 import time
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -1067,6 +1068,60 @@ def _build_prompt(item: Dict[str, Any]) -> str:
     )
 
 
+def clarification_public_url(public_url: str) -> str:
+    """Fail closed rather than dispatch a developer without a reply channel."""
+    value = (public_url or "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError()
+        parsed.port
+    except ValueError:
+        raise ReplitMCPRoutingError(
+            "Developer clarification channel requires a configured HTTPS "
+            "VAULT_PUBLIC_URL")
+    return value
+
+
+def _provision_developer_prompt(mcp, req_id: str, item: dict,
+                               destination: str) -> str:
+    """Bearer exists only in this private provider prompt, never the item/log."""
+    base = clarification_public_url(mcp.public_url)
+    try:
+        from services.vault.dev_clarifications import ClarificationStore
+    except ImportError:
+        from dev_clarifications import ClarificationStore
+    try:
+        token = ClarificationStore(mcp.r).provision(
+            req_id, destination, f"replit:{destination}")
+    except Exception:
+        # Never expose Redis diagnostics or tokens in dispatch_error.
+        raise ReplitMCPRoutingError(
+            "Developer clarification channel provisioning failed; retry dispatch") from None
+    endpoint = (f"{base}/api/dev-requests/{quote(str(req_id), safe='')}"
+                f"/destinations/{quote(destination, safe='')}/clarifications")
+    return (
+        _build_prompt(item) +
+        "\n\nPRIVATE developer clarification channel (do not publish, log, "
+        "commit, or forward this credential):\n"
+        f"Authorization: Bearer {token}\n"
+        "This capability expires in 24 hours and only permits questions and "
+        "reply polling for this approved request and its pinned destination; "
+        "it is not an admin or fleet credential.\n"
+        f"Ask: POST {endpoint} with JSON "
+        '{"question":"your question","idempotency_key":"a unique stable key"}.\n'
+        "Reuse the same key and question when retrying; a different question "
+        "needs a new key. Keep questions focused on the approved work.\n"
+        f"Poll: GET {endpoint}/<id returned by ask> with the same Bearer header. "
+        "Read status, answer_state, and answer; a delivery acknowledgment is "
+        "not an answer. Wait between polls. For 429 wait Retry-After "
+        "seconds; for 503 retry with backoff. A 401 means the capability is "
+        "expired or revoked: stop and request authorized reprovisioning. "
+        "Never ask for or substitute admin credentials."
+    )
+
+
 async def _renew_lease_loop(r, req_id: str, token: str) -> None:
     """Background coroutine: renew the dispatch lease every LEASE_RENEW_INTERVAL
     seconds until cancelled. Logs a warning if the lease is lost (superseded by
@@ -1240,6 +1295,9 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                     # registry.
                     _project, dispatch_repl_id = await _resolve_and_pin_route(
                         mcp, req_id, lease_token, item)
+                    private_prompt = await asyncio.to_thread(
+                        _provision_developer_prompt, mcp, req_id, item,
+                        dispatch_repl_id)
 
                     # A force-dispatch may supersede this worker after route
                     # resolution (especially on a pinned retry or when route
@@ -1253,7 +1311,7 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
 
                     # Call the MCP (may take up to 120 s + token refresh)
                     result = await mcp.start_agent_run(
-                        _build_prompt(item), repl_id=dispatch_repl_id)
+                        private_prompt, repl_id=dispatch_repl_id)
                     item["dispatch_status"] = "started"
                     item["dispatched_at"] = int(time.time())
                     item["dispatch_result"] = _safe_dispatch_result(result)
