@@ -4750,18 +4750,27 @@ async def replit_mcp_config(body: ReplitMCPConfigBody, request: Request):
     # Redis MULTI/EXEC keeps a registry replacement and a legacy-target
     # replacement from being observed half-written by a dispatcher or status
     # reader.  All validation happens before opening the transaction.
-    pipe = r.pipeline(transaction=True)
-    if normalized is not None:
-        pipe.set(
-            _REPLIT_PROJECTS_KEY,
-            json.dumps(normalized, ensure_ascii=False, sort_keys=True),
-        )
-    if default_changed:
-        if default_target:
-            pipe.set(replit_mcp_mod.K_TARGET, default_target)
-        else:
-            pipe.delete(replit_mcp_mod.K_TARGET)
-    pipe.execute()
+    with r.pipeline(transaction=True) as pipe:
+        try:
+            pipe.watch(_REPLIT_PROJECTS_KEY, replit_mcp_mod.K_TARGET)
+            old_projects, old_target = pipe.mget(
+                [_REPLIT_PROJECTS_KEY, replit_mcp_mod.K_TARGET])
+            registry.effective_projects(
+                normalized if normalized is not None else registry._read_json_mapping(old_projects),
+                default_target if default_changed else registry._read_legacy_default(old_target))
+            pipe.multi()
+            if normalized is not None:
+                pipe.set(_REPLIT_PROJECTS_KEY, json.dumps(normalized, sort_keys=True))
+            if default_changed:
+                if default_target:
+                    pipe.set(replit_mcp_mod.K_TARGET, default_target)
+                else:
+                    pipe.delete(replit_mcp_mod.K_TARGET)
+            pipe.execute()
+        except redis.WatchError:
+            raise HTTPException(status_code=409, detail="Destinations changed; reload and retry")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     if normalized is not None:
         audit_log(
@@ -4822,7 +4831,10 @@ async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False
     #   result=0: live lease, force not set → 409
     #   result=1: enqueued normally
     #   result=2: enqueued, live lease superseded (force=true)
-    result = await _asyncio.to_thread(replit_mcp_mod.admin_enqueue, r, rid, force)
+    try:
+        result = await _asyncio.to_thread(replit_mcp_mod.admin_enqueue, r, rid, force)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
     if result == 0:
         # Live lease, force not set.
@@ -4831,8 +4843,7 @@ async def replit_mcp_dispatch(req_id: str, request: Request, force: bool = False
             "reason": "dispatch_in_progress",
             "detail": (
                 f"Request '{rid}' is currently being dispatched (active lease). "
-                "Use ?force=true to supersede the in-flight worker. "
-                "The superseded worker's finalize step will be a no-op."
+                "Wait for its outcome. Force retry cannot cancel or undo a provider call."
             ),
         })
 

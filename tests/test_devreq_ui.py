@@ -58,6 +58,7 @@ class _StubView:
         self.children = []
 
 class _StubButtonStyle:
+    secondary = 2
     success = 1
     danger = 2
 
@@ -84,6 +85,44 @@ if "httpx" not in sys.modules:
 
 def _fake_r() -> fakeredis.FakeRedis:
     return fakeredis.FakeRedis(decode_responses=True)
+
+
+@pytest.mark.asyncio
+async def test_older_blocked_approval_is_not_hidden_by_started_records():
+    import tools.dev_requests as dr
+    import plugins.platforms.discord.dev_requests_ui as ui
+    r = _fake_r()
+    for i in range(22):
+        item = _seed_item(r, str(i), "approved")
+        item["dispatch_status"] = "failed" if i == 0 else "started"
+        item["routing_blocked"] = i == 0
+        r.set(f"devreq:item:{i}", json.dumps(item))
+        r.rpush("devreq:approved", str(i))
+    interaction = _make_interaction()
+    with patch.object(dr, "_redis", return_value=r), patch.object(ui, "_store", return_value=dr):
+        await ui.handle_devrequests_slash(interaction)
+    assert any("**Dev request #0**" in str(call)
+               for call in interaction.followup.send.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_owner_can_lookup_older_request_by_id():
+    import tools.dev_requests as dr
+    import plugins.platforms.discord.dev_requests_ui as ui
+    r = _fake_r()
+    _seed_item(r, "old-record", "approved")
+    interaction = _make_interaction()
+    with patch.object(dr, "_redis", return_value=r), patch.object(ui, "_store", return_value=dr):
+        await ui.handle_devrequests_slash(interaction, request_id="old-record")
+    assert any("**Dev request #old-record**" in str(call)
+               for call in interaction.followup.send.call_args_list)
+
+
+@pytest.fixture(autouse=True)
+def owner_review_surface(monkeypatch):
+    monkeypatch.setenv("DISCORD_OWNER_ID", "owner")
+    with patch("plugins.platforms.discord.dev_requests_ui._is_owner", return_value=True):
+        yield
 
 
 def _seed_item(r, req_id: str, status: str = "pending") -> dict:
@@ -703,7 +742,8 @@ class TestSubmitListApproveFlow:
 
             # Approve (skip _enqueue_if_unclaimed — it uses Lua eval)
             with patch("tools.dev_requests._enqueue_if_unclaimed", return_value=True):
-                decided = dr.set_status(req_id, "approved", decided_by="owner")
+                decided = dr.set_status(req_id, "approved", decided_by="owner",
+                                        expected_review=dr.routing_preview(dr.get_request(req_id))["token"])
 
             assert decided["status"] == "approved"
             assert decided.get("conflict") is None
@@ -727,9 +767,10 @@ class TestSubmitListApproveFlow:
                 "Title", "Desc", "open-manus", "fleet_platform")
             req_id = "1"
             with patch("tools.dev_requests._enqueue_if_unclaimed", return_value=True):
-                dr.set_status(req_id, "approved", decided_by="owner")
+                dr.set_status(req_id, "approved", decided_by="owner",
+                              expected_review=dr.routing_preview(dr.get_request(req_id))["token"])
                 # Second attempt
-                result = dr.set_status(req_id, "approved", decided_by="owner2")
+                result = dr.set_status(req_id, "approved", decided_by="owner")
             assert result.get("conflict") == "already decided"
 
     def test_queue_counts_after_approval(self):
@@ -745,7 +786,8 @@ class TestSubmitListApproveFlow:
                 "T2", "D2", "open-manus", "fleet_platform")
             req_id = "1"
             with patch("tools.dev_requests._enqueue_if_unclaimed", return_value=True):
-                dr.set_status(req_id, "approved", decided_by="owner")
+                dr.set_status(req_id, "approved", decided_by="owner",
+                              expected_review=dr.routing_preview(dr.get_request(req_id))["token"])
 
             counts = dr.queue_counts()
             assert counts["pending_live"] == 1

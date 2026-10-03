@@ -62,6 +62,16 @@ def _save(client, payload, *, csrf=CSRF, content_type="application/json"):
     return client.post("/api/admin/replit-mcp/config", json=payload, headers=headers)
 
 
+def test_effective_default_collisions_across_partial_updates(client):
+    assert _save(client, {"target_repl": "default-id"}).status_code == 200
+    assert _save(client, {"projects": {"other": "default-id"}}).status_code == 422
+    assert _save(client, {"projects": {"other": "other-id"}}).status_code == 200
+    assert _save(client, {"target_repl": "other-id"}).status_code == 422
+    assert _save(client, {"projects": {"open-manus": "override", "other": "default-id"}}).status_code == 200
+    # Deleting explicit default exposes the legacy fallback collision.
+    assert _save(client, {"projects": {"other": "default-id"}}).status_code == 422
+
+
 def test_configuration_requires_admin_and_browser_csrf(client):
     no_cookie = TestClient(vault_app.app)
     response = no_cookie.post(

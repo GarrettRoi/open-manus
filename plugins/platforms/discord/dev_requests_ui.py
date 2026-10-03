@@ -45,6 +45,14 @@ def _store():
     return dev_requests
 
 
+def _is_owner(interaction):
+    try:
+        from .vault_ui import _resolve_vault_owner_id
+    except ImportError:
+        from vault_ui import _resolve_vault_owner_id
+    return str(interaction.user.id) == str(_resolve_vault_owner_id() or "")
+
+
 async def _poll_dispatch_outcome(channel, req_id: str, title: str, project: str = "open-manus") -> None:
     """Post a follow-up in the channel once the vault resolves the dispatch.
 
@@ -99,14 +107,15 @@ async def _poll_dispatch_outcome(channel, req_id: str, title: str, project: str 
 class DevRequestApprovalView(discord.ui.View):
     """Approve / Deny buttons for one dev modification request."""
 
-    def __init__(self, req_id: str, reviewer_id: int):
+    def __init__(self, req_id: str, reviewer_id: int, review_token: str = ""):
         super().__init__(timeout=600)
         self.req_id = req_id
         self.reviewer_id = reviewer_id  # only the /devrequests invoker decides
         self.resolved = False
+        self.review_token = review_token
 
     async def _guard(self, interaction) -> bool:
-        if interaction.user.id != self.reviewer_id:
+        if interaction.user.id != self.reviewer_id or not _is_owner(interaction):
             await interaction.response.send_message(
                 "Only the reviewer who opened /devrequests can decide this.",
                 ephemeral=True)
@@ -127,7 +136,7 @@ class DevRequestApprovalView(discord.ui.View):
             # Redis is synchronous — keep it off the Discord event loop.
             item = await asyncio.to_thread(
                 _store().set_status, self.req_id, status,
-                str(interaction.user))
+                str(interaction.user.id), self.review_token)
         except Exception as e:
             logger.exception("dev request decision failed")
             try:
@@ -202,13 +211,52 @@ class DevRequestApprovalView(discord.ui.View):
     async def deny(self, interaction, button):
         await self._decide(interaction, "denied", "❌ Denied")
 
+    @discord.ui.button(label="Correct routing", style=discord.ButtonStyle.secondary)
+    async def correct(self, interaction, button):
+        if not await self._guard(interaction):
+            return
+        parent = self
+
+        class Correction(discord.ui.Modal, title="Correct code ownership"):
+            scope = discord.ui.TextInput(label="fleet_platform or project_app", max_length=32)
+            project = discord.ui.TextInput(label="Canonical project name", max_length=64)
+
+            async def on_submit(self, event):
+                if not await parent._guard(event):
+                    return
+                await event.response.defer(ephemeral=True)
+                try:
+                    item = await asyncio.to_thread(
+                        _store().correct_routing, parent.req_id, str(self.scope),
+                        str(self.project), parent.review_token, str(event.user.id))
+                    evidence = await asyncio.to_thread(_store().routing_preview, item)
+                    item["_routing"] = evidence
+                    await event.followup.send(
+                        _format_request(item) + "\nRouting corrected; fresh approval required.",
+                        view=DevRequestApprovalView(item["id"], event.user.id, evidence["token"]),
+                        ephemeral=True)
+                    parent.resolved = True
+                except Exception as exc:
+                    await event.followup.send(str(exc), ephemeral=True)
+        await interaction.response.send_modal(Correction())
+
 
 def _format_request(item: dict) -> str:
     scope = item.get("work_scope") or "legacy (stored before scoped routing)"
-    project = item.get("project") or "legacy default: open-manus"
+    project = item.get("project") or "UNSELECTED — routing review required"
+    route = item.get("_routing") or {}
     head = (f"**Dev request #{item['id']}** — {item.get('title', '')}\n"
             f"From: `{item.get('agent', '?')}` · Scope: `{scope}` · "
-            f"Project: `{project}`\n\n")
+            f"Project: `{project}`\n"
+            f"Replit identity: `{route.get('repl_id') or item.get('submitted_repl_id') or 'MISSING'}`\n"
+            f"Routing: {route.get('reason', 'Review required')}\n"
+            f"Approved target: `{item.get('dispatch_repl_id') or 'none'}` · "
+            f"Provider attempt: `{item.get('provider_repl_id') or 'not recorded'}` "
+            f"({item.get('provider_disposition') or 'no disposition recorded'})\n\n")
+    original = item.get("original_submission") or {}
+    if original:
+        head += (f"Original: `{original.get('work_scope')}` / `{original.get('project')}` / "
+                 f"`{original.get('submitted_repl_id')}`\n")
     body = item.get("description", "")
     if len(head) + len(body) > MSG_LIMIT:
         body = body[: MSG_LIMIT - len(head) - 20] + "\n… (truncated)"
@@ -311,12 +359,16 @@ async def _handle_diag(interaction) -> None:
         logger.exception("/devrequests diag: could not deliver diagnostics")
 
 
-async def handle_devrequests_slash(interaction, action: str = "list") -> None:
+async def handle_devrequests_slash(interaction, action: str = "list",
+                                  request_id: str = "") -> None:
     """Entry point called by the /devrequests slash command.
 
     ``action`` is either "list" (default — show pending requests with
     Approve/Deny buttons) or "diag" (Redis health and queue counts).
     """
+    if not _is_owner(interaction):
+        await interaction.response.send_message("Only the configured owner may review routing.", ephemeral=True)
+        return
     if action.strip().lower() == "diag":
         await _handle_diag(interaction)
         return
@@ -325,7 +377,16 @@ async def handle_devrequests_slash(interaction, action: str = "list") -> None:
     await interaction.response.defer()
 
     try:
-        pending = await asyncio.to_thread(_store().list_requests, "pending")
+        if request_id:
+            item = await asyncio.to_thread(_store().get_request, request_id)
+            if not item:
+                await interaction.followup.send("Request not found.", ephemeral=True)
+                return
+            pending = [item]
+        else:
+            pending = await asyncio.to_thread(_store().list_requests, "pending")
+            approved = await asyncio.to_thread(_store().list_requests, "approved", 20, True)
+            pending += approved
     except Exception as e:
         logger.exception("/devrequests: list_requests failed")
         try:
@@ -350,8 +411,9 @@ async def handle_devrequests_slash(interaction, action: str = "list") -> None:
     # ── Count line ─────────────────────────────────────────────────────────
     try:
         await interaction.followup.send(
-            f"{len(pending)} pending dev request(s) — full text below, "
-            "approve or deny each:"
+            f"{len(pending)} dev request(s) — full text below. "
+            "For older records use /devrequests request_id:<id>. "
+            "Started records are inspection-only; corrections require fresh approval:"
         )
     except Exception as e:
         logger.exception("/devrequests: could not send count message")
@@ -362,10 +424,28 @@ async def handle_devrequests_slash(interaction, action: str = "list") -> None:
     # ── One card per request ───────────────────────────────────────────────
     for item in pending:
         try:
+            evidence = await asyncio.to_thread(_store().routing_preview, item)
+            item["_routing"] = evidence
             await interaction.followup.send(
                 _format_request(item),
-                view=DevRequestApprovalView(item["id"], interaction.user.id),
+                view=DevRequestApprovalView(item["id"], interaction.user.id, evidence["token"]),
             )
+            # Do not lose the full request when the routing evidence makes the
+            # card too long. Confirmation digest covers the entire description.
+            description = item.get("description") or ""
+            if description not in _format_request(item):
+                for offset in range(0, len(description), MSG_LIMIT - 80):
+                    await interaction.followup.send(
+                        f"Request #{item['id']} — full details:\n"
+                        + description[offset:offset + MSG_LIMIT - 80])
+            for event in item.get("routing_history", []):
+                await interaction.followup.send(
+                    f"Request #{item['id']} routing correction at {event.get('at')}: "
+                    f"prior scope `{event.get('work_scope')}`, project `{event.get('project')}`, "
+                    f"submitted ID `{event.get('submitted_repl_id')}`, "
+                    f"approved ID `{event.get('dispatch_repl_id')}`. "
+                    f"Prior decision at {event.get('decided_at')}; "
+                    f"prior dispatch status `{event.get('dispatch_status')}`.")
         except Exception as e:
             logger.exception("Failed to post dev request card for %s", item.get("id"))
             # Always deliver a visible error so the owner knows a card was dropped.

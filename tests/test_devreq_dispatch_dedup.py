@@ -39,13 +39,30 @@ if "httpx" not in sys.modules:
     sys.modules["httpx"] = MagicMock()
 
 import replit_mcp  # noqa: E402
+from services.vault.dev_routing import content_digest
+
+
+@pytest.fixture(autouse=True)
+def owner_identity(monkeypatch):
+    monkeypatch.setenv("DISCORD_OWNER_ID", "owner")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _r() -> fakeredis.FakeRedis:
-    return fakeredis.FakeRedis(decode_responses=True)
+    r = fakeredis.FakeRedis(decode_responses=True)
+    r.set("replitmcp:target_repl", "fleet-id")
+    # Low-level enqueue cases use these IDs without list membership.
+    for rid in range(1, 101):
+        item = {"id": str(rid), "status": "approved",
+                "project": "open-manus", "work_scope": "fleet_platform",
+                "submitted_repl_id": "fleet-id", "dispatch_project": "open-manus",
+                "dispatch_repl_id": "fleet-id", "decided_by": "owner", "decided_at": 1}
+        item["owner_confirmation"] = {"version": 1, "owner_id": "owner"}
+        item["approval_digest"] = content_digest(item)
+        r.set(f"devreq:item:{rid}", json.dumps(item))
+    return r
 
 
 def _seed_approved(r, req_id: str, dispatch_status: str | None = None) -> dict:
@@ -55,9 +72,15 @@ def _seed_approved(r, req_id: str, dispatch_status: str | None = None) -> dict:
         "description": "some description",
         "agent": "testbot",
         "status": "approved",
+        "project": "open-manus", "work_scope": "fleet_platform",
+        "submitted_repl_id": "fleet-id", "dispatch_project": "open-manus",
+        "dispatch_repl_id": "fleet-id", "decided_by": "owner", "decided_at": 1,
     }
     if dispatch_status is not None:
         item["dispatch_status"] = dispatch_status
+        item["routing_blocked"] = True  # pre-provider failures are eligible for retry
+    item["owner_confirmation"] = {"version": 1, "owner_id": "owner"}
+    item["approval_digest"] = content_digest(item)
     r.set(f"devreq:item:{req_id}", json.dumps(item), ex=86400)
     r.rpush("devreq:approved", req_id)
     return item
@@ -179,7 +202,7 @@ class TestDurableLease:
         item = {"id": "15", "dispatch_status": "started"}
         written = replit_mcp.finalize_lease(r, "15", tok2, item, 86400)
         assert written is False
-        assert not r.exists("devreq:item:15")  # item was NOT written
+        assert json.loads(r.get("devreq:item:15")).get("dispatch_status") is None
 
     def test_finalize_returns_false_when_lease_gone(self):
         """Lease expired mid-call — finalize must not write the item."""
@@ -350,9 +373,9 @@ class TestAdminEnqueue:
         token = str(uuid.uuid4())
         replit_mcp.acquire_lease(r, "62", token)
         result = replit_mcp.admin_enqueue(r, "62", force=True)
-        assert result == 2
-        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
-        assert not r.exists(replit_mcp.K_LEASE + "62")  # lease cleared
+        assert result == 0
+        assert r.llen(replit_mcp.DISPATCH_QUEUE) == 0
+        assert r.get(replit_mcp.K_LEASE + "62") == token
 
     def test_claim_exists_no_force_returns_3(self):
         """Claim already set (item queued or in cooldown) + no force → 3."""
@@ -398,13 +421,13 @@ class TestAdminEnqueue:
         old_token = str(uuid.uuid4())
         replit_mcp.acquire_lease(r, "65", old_token)
         result = replit_mcp.admin_enqueue(r, "65", force=True)
-        assert result == 2
+        assert result == 0
         item = {"id": "65", "dispatch_status": "started", "source": "old"}
         written = replit_mcp.finalize_lease(r, "65", old_token, item, 86400)
-        assert written is False
+        assert written is True
         stored_raw = r.get("devreq:item:65")
         if stored_raw:
-            assert json.loads(stored_raw).get("source") != "old"
+            assert json.loads(stored_raw).get("source") == "old"
 
     def test_no_live_lease_force_clears_stale_claim(self):
         """force=True with no live lease DELs any stale claim and re-enqueues."""
@@ -467,6 +490,8 @@ class TestSetStatusAtomicEnqueue:
             "description": "desc",
             "agent": "testbot",
             "status": "pending",
+            "project": "open-manus", "work_scope": "fleet_platform",
+            "submitted_repl_id": "fleet-id",
             "created_at": int(time.time()),
         }
         r.set("devreq:item:50", json.dumps(item), ex=86400)
@@ -478,7 +503,8 @@ class TestSetStatusAtomicEnqueue:
         r, _ = self._make_redis_and_seed()
         import dev_requests as dr
         with patch.object(dr, "_redis", return_value=r):
-            result = dr.set_status("50", "approved", "owner")
+            result = dr.set_status("50", "approved", "owner",
+                                   dr.routing_preview(dr.get_request("50"))["token"])
         assert result is not None
         assert result.get("status") == "approved"
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1
@@ -488,7 +514,8 @@ class TestSetStatusAtomicEnqueue:
         r, _ = self._make_redis_and_seed()
         import dev_requests as dr
         with patch.object(dr, "_redis", return_value=r):
-            dr.set_status("50", "approved", "owner")
+            dr.set_status("50", "approved", "owner",
+                          dr.routing_preview(dr.get_request("50"))["token"])
         if not r.lpos("devreq:approved", "50"):
             r.rpush("devreq:approved", "50")
         requeued = replit_mcp.sweep_dispatch_backlog(r)
@@ -499,7 +526,8 @@ class TestSetStatusAtomicEnqueue:
         r, _ = self._make_redis_and_seed()
         import dev_requests as dr
         with patch.object(dr, "_redis", return_value=r):
-            dr.set_status("50", "approved", "owner")
+            dr.set_status("50", "approved", "owner",
+                          dr.routing_preview(dr.get_request("50"))["token"])
         queued = replit_mcp.enqueue_if_unclaimed(r, "50")
         assert queued is False
         assert r.llen(replit_mcp.DISPATCH_QUEUE) == 1

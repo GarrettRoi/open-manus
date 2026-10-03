@@ -5216,7 +5216,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 name="diag — Redis health & queue counts", value="diag"),
         ])
         async def slash_devrequests(
-            interaction: discord.Interaction, action: str = "list"
+            interaction: discord.Interaction, action: str = "list", request_id: str = ""
         ):
             if not await self._check_slash_authorization(interaction, "/devrequests"):
                 return
@@ -5225,7 +5225,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     from dev_requests_ui import handle_devrequests_slash
                 except ImportError:
                     from .dev_requests_ui import handle_devrequests_slash
-                await handle_devrequests_slash(interaction, action=action)
+                await handle_devrequests_slash(interaction, action=action, request_id=request_id)
             except Exception as e:
                 logger.exception("/devrequests failed")
                 _msg = f"Dev request review failed: {e}"

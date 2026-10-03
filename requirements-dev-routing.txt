@@ -1,0 +1,4 @@
+# Isolated routing/CAS tests require Lua, not a reachable fleet datastore.
+fakeredis[lua]>=2.34
+pytest
+pytest-asyncio

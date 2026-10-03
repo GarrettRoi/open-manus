@@ -177,7 +177,17 @@ def _read_snapshot(r) -> tuple[dict[str, str], str]:
     values = r.mget([K_PROJECTS, K_TARGET])
     if len(values) != 2:  # pragma: no cover - defensive for non-Redis clients
         values = list(values) + [None] * (2 - len(values))
-    return _read_json_mapping(values[0]), _read_legacy_default(values[1])
+    projects, legacy = _read_json_mapping(values[0]), _read_legacy_default(values[1])
+    effective_projects(projects, legacy)
+    return projects, legacy
+
+
+def effective_projects(projects, legacy):
+    """Validate uniqueness including the compatibility fallback."""
+    effective = dict(projects)
+    if DEFAULT_PROJECT not in effective and legacy:
+        effective[DEFAULT_PROJECT] = _read_legacy_default(legacy)
+    return validate_projects(effective)
 
 
 def list_projects(r) -> dict[str, str]:

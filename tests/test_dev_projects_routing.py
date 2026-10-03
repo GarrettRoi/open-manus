@@ -27,6 +27,12 @@ for path in (ROOT, VAULT):
 from services.vault import dev_projects
 from services.vault import dev_clarifications
 from services.vault import replit_mcp
+from services.vault.dev_routing import content_digest
+
+
+@pytest.fixture(autouse=True)
+def owner_identity(monkeypatch):
+    monkeypatch.setenv("DISCORD_OWNER_ID", "owner")
 
 
 def redis():
@@ -68,6 +74,19 @@ async def run_dispatch_iteration(mcp, req_id, renew_result=True,
     if raw:
         request = json.loads(raw)
         request.setdefault("agent", "tester")
+        if req_id != "corrected-route" and not request.get("work_scope"):
+            project = dev_projects.normalize_project(request.get("project"))
+            request.update(project=project,
+                           work_scope="fleet_platform" if project == "open-manus" else "project_app",
+                           decided_by="owner", decided_at=1)
+            try:
+                _, target = dev_projects.resolve_project(mcp.r, project)
+            except ValueError:
+                target = "missing-id"
+            request.update(submitted_repl_id=target, dispatch_project=project,
+                           dispatch_repl_id=target)
+            request["owner_confirmation"] = {"version": 1, "owner_id": "owner"}
+            request["approval_digest"] = content_digest(request)
         mcp.r.set(key, json.dumps(request), ex=86400)
     queue = _OneIterationQueue(req_id)
     redis_module = ModuleType("redis")
@@ -86,6 +105,7 @@ async def run_dispatch_iteration(mcp, req_id, renew_result=True,
             r.set(key, json.dumps(item), ex=item_ttl)
         else:
             r.set(key, json.dumps(item))
+        r.delete(replit_mcp.K_LEASE + request_id)
         return True
 
     pin_side_effect = pin_result or pin_route
@@ -96,9 +116,7 @@ async def run_dispatch_iteration(mcp, req_id, renew_result=True,
     )
     with patch.dict(sys.modules, {"redis": redis_module}), \
             patch.dict("os.environ", {"REDIS_URL": "redis://dispatch-test"}), \
-            patch.object(replit_mcp, "acquire_lease", return_value=True), \
             patch.object(replit_mcp, "renew_lease", **renew_kwargs), \
-            patch.object(replit_mcp, "release_lease", return_value=True), \
             patch.object(replit_mcp, "pin_dispatch_route",
                          side_effect=pin_side_effect), \
             patch.object(replit_mcp, "finalize_lease",
@@ -203,7 +221,12 @@ async def test_route_is_pinned_before_retry_and_survives_registry_change():
         "id": req_id,
         "project": "second app",
         "status": "approved",
+        "work_scope": "project_app", "submitted_repl_id": "repl-two",
+        "dispatch_project": "second-app", "dispatch_repl_id": "repl-two",
+        "decided_by": "owner", "decided_at": 1,
+        "owner_confirmation": {"version": 1, "owner_id": "owner"},
     }
+    item["approval_digest"] = content_digest(item)
     r.set(f"devreq:item:{req_id}", json.dumps(item), ex=86400)
     mcp = replit_mcp.ReplitMCP(r, lambda x: x, lambda x: x, "")
     token = "lease-token"
@@ -226,8 +249,8 @@ async def test_route_is_pinned_before_retry_and_survives_registry_change():
     # The target is deleted/reassigned after the first attempt.  The durable
     # route, not current registry state, controls the retry.
     put_projects(r, {"open-manus": "repl-one"})
-    retry = await replit_mcp._resolve_and_pin_route(mcp, req_id, token, stored)
-    assert retry == ("second-app", "repl-two")
+    with pytest.raises(replit_mcp.ReplitMCPRoutingError, match="unknown project"):
+        await replit_mcp._resolve_and_pin_route(mcp, req_id, token, stored)
 
 
 @pytest.mark.asyncio
@@ -337,11 +360,10 @@ async def test_unknown_project_retries_after_registry_is_corrected():
     put_projects(r, {"open-manus": "repl-one", "new-app": "repl-fixed"})
     await run_dispatch_iteration(mcp, req_id)
 
-    mcp.start_agent_run.assert_awaited_once()
-    assert mcp.start_agent_run.call_args.kwargs["repl_id"] == "repl-fixed"
+    mcp.start_agent_run.assert_not_awaited()
     stored = json.loads(r.get(f"devreq:item:{req_id}"))
-    assert stored["dispatch_status"] == "started"
-    assert stored["dispatch_repl_id"] == "repl-fixed"
+    assert stored["dispatch_status"] == "failed"
+    assert "needs-routing-review" in stored["dispatch_error"]
 
 
 @pytest.mark.asyncio
@@ -457,10 +479,9 @@ async def test_pinned_route_survives_changed_registry_on_retry():
     assert [call.kwargs["repl_id"]
             for call in mcp.start_agent_run.await_args_list] == [
                 "repl-original",
-                "repl-original",
             ]
     stored = json.loads(r.get(f"devreq:item:{req_id}"))
-    assert stored["dispatch_status"] == "started"
+    assert stored["dispatch_status"] == "failed"
     assert stored["dispatch_repl_id"] == "repl-original"
 
 
@@ -612,6 +633,7 @@ async def test_dispatch_does_not_persist_arbitrary_provider_exception_body():
             "project": "open-manus",
             "status": "approved",
             "dispatch_error": "stale error from an earlier attempt",
+            "routing_blocked": True,
         }),
         ex=86400,
     )
@@ -643,6 +665,7 @@ async def test_success_stores_minimal_result_and_clears_stale_provider_error():
             "project": "open-manus",
             "status": "approved",
             "dispatch_error": "old provider failure",
+            "routing_blocked": True,
         }),
         ex=86400,
     )
@@ -697,3 +720,114 @@ def test_release_lease_is_token_compare_and_delete():
         f"{replit_mcp.K_LEASE}req-1",
         "lease-token",
     )
+
+
+@pytest.mark.asyncio
+async def test_missing_oauth_then_reconnect_is_safe_to_retry():
+    r = redis()
+    put_projects(r, {"open-manus": "repl-one"})
+    r.set("devreq:item:oauth-retry", json.dumps({
+        "id": "oauth-retry", "project": "open-manus", "status": "approved"}))
+    mcp = replit_mcp.ReplitMCP(r, str, str, "")
+    with patch.object(replit_mcp.httpx, "AsyncClient",
+                      side_effect=AssertionError("Network forbidden without OAuth")) as http:
+        await run_dispatch_iteration(mcp, "oauth-retry")
+        http.assert_not_called()
+    failed = json.loads(r.get("devreq:item:oauth-retry"))
+    assert failed["provider_disposition"] == "not_issued"
+    assert not failed.get("provider_attempt_at")
+    assert failed["dispatch_error"] == replit_mcp.PROVIDER_AUTH_FAILURE
+    assert replit_mcp.admin_enqueue(r, "oauth-retry", force=True) == 1
+
+    # Reconnect is represented by a stored test-only token. Only the actual
+    # network transport is mocked; auth, MCP initialization and call routing run.
+    r.set(replit_mcp.K_TOKENS, json.dumps({"access_token": "test-only"}))
+    calls = []
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def post(self, url, **kwargs):
+            calls.append(kwargs["json"])
+            return httpx.Response(200, json={"result": {}})
+    with patch.object(replit_mcp.httpx, "AsyncClient", Client):
+        await run_dispatch_iteration(mcp, "oauth-retry")
+    tools = [c for c in calls if c["method"] == "tools/call"]
+    assert len(tools) == 1
+    assert tools[0]["params"]["arguments"]["replId"] == "repl-one"
+    started = json.loads(r.get("devreq:item:oauth-retry"))
+    assert started["dispatch_status"] == "started"
+    assert started["provider_attempt_at"]
+    assert started["provider_attempt_history"][0]["disposition"] == "not_issued"
+    with pytest.raises(ValueError, match="already issued"):
+        replit_mcp.admin_enqueue(r, "oauth-retry", True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_method", ["initialize", "tools/call"])
+async def test_transport_distinguishes_not_issued_from_ambiguous(fail_method):
+    r = redis()
+    mcp = replit_mcp.ReplitMCP(r, str, str, "")
+    mcp._access_token = AsyncMock(return_value="test-only")
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def post(self, url, **kwargs):
+            if kwargs["json"]["method"] == fail_method:
+                raise TimeoutError("not safe to echo")
+            return httpx.Response(200, json={"result": {}})
+    with patch.object(replit_mcp.httpx, "AsyncClient", Client):
+        with pytest.raises(replit_mcp.ReplitMCPProviderError) as err:
+            await mcp.start_agent_run("change", repl_id="repl-one")
+    assert isinstance(err.value, replit_mcp.ReplitMCPNotIssuedError) == (fail_method == "initialize")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["approval_digest", "owner_confirmation", "wrong_owner"])
+async def test_historical_scoped_approval_requires_fresh_owner_confirmation(missing):
+    from tools import dev_requests as dr
+    from services.vault import dev_routing
+    r = redis()
+    put_projects(r, {"open-manus": "repl-one"})
+    item = {
+        "id": "historical", "agent": "tester", "title": "Historical",
+        "description": "May not be the reviewed content", "status": "approved",
+        "project": "open-manus", "work_scope": "fleet_platform",
+        "submitted_repl_id": "repl-one", "dispatch_project": "open-manus",
+        "dispatch_repl_id": "repl-one", "decided_by": "owner", "decided_at": 1,
+        "owner_confirmation": {"version": 1, "owner_id": "owner"},
+    }
+    item["approval_digest"] = content_digest(item)
+    if missing == "wrong_owner":
+        item["decided_by"] = "historical-reviewer"
+    else:
+        item.pop(missing)
+    r.set("devreq:item:historical", json.dumps(item))
+    r.rpush("devreq:approved", "historical")
+    assert replit_mcp.sweep_dispatch_backlog(r) == []
+    for force in (False, True):
+        with pytest.raises(ValueError, match="needs-routing-review"):
+            replit_mcp.admin_enqueue(r, "historical", force)
+    assert r.llen(replit_mcp.DISPATCH_QUEUE) == 0
+    mcp = replit_mcp.ReplitMCP(r, str, str, "")
+    mcp.start_agent_run = AsyncMock(return_value={"accepted": True})
+    await run_dispatch_iteration(mcp, "historical")
+    mcp.start_agent_run.assert_not_awaited()
+    blocked = json.loads(r.get("devreq:item:historical"))
+    assert blocked["routing_blocked"]
+    corrected = dev_routing.correct_route(
+        r, "historical", "fleet_platform", "open-manus",
+        dev_routing.review_token(r, blocked), "owner")
+    with patch.object(dr, "_redis", return_value=r):
+        dr.set_status("historical", "approved", "owner",
+                      dev_routing.review_token(r, corrected))
+    await run_dispatch_iteration(mcp, "historical")
+    mcp.start_agent_run.assert_awaited_once()
+    assert mcp.start_agent_run.call_args.kwargs["repl_id"] == "repl-one"

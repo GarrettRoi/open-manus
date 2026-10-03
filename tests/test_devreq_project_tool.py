@@ -8,6 +8,12 @@ import pytest
 
 from tools import dev_requests as dr
 from services.vault import replit_mcp
+from services.vault.dev_routing import content_digest
+
+
+@pytest.fixture(autouse=True)
+def owner_identity(monkeypatch):
+    monkeypatch.setenv("DISCORD_OWNER_ID", "owner")
 
 
 def test_discovery_returns_names_not_ids_or_tokens():
@@ -117,7 +123,8 @@ def test_approval_pins_submission_snapshot():
             patch.object(dr, "_enqueue_if_unclaimed", return_value=True):
         item = dr.submit_request(
             "Feature", "Details", "vowsok", "project_app")
-        approved = dr.set_status(item["id"], "approved", "owner")
+        approved = dr.set_status(item["id"], "approved", "owner",
+                                 dr.routing_preview(item)["token"])
     assert approved["dispatch_project"] == "vowsok"
     assert approved["dispatch_repl_id"] == "stable-id"
 
@@ -132,7 +139,7 @@ def test_unpinned_scoped_dispatch_refuses_changed_registry():
     mcp = type("MCP", (), {"r": r})()
     with pytest.raises(
             replit_mcp.ReplitMCPRoutingError,
-            match="changed since submission"):
+            match="needs-routing-review"):
         asyncio.run(replit_mcp._resolve_and_pin_route(
             mcp, "41", "lease-token", item))
 
@@ -145,7 +152,10 @@ def test_started_record_keeps_immutable_dispatch_pin_after_registry_change():
         "work_scope": "project_app", "project": "vowsok",
         "submitted_repl_id": "old-id",
         "dispatch_project": "vowsok", "dispatch_repl_id": "old-id",
+        "decided_by": "owner", "decided_at": 1,
+        "owner_confirmation": {"version": 1, "owner_id": "owner"},
     }
+    item["approval_digest"] = content_digest(item)
     mcp = type("MCP", (), {"r": r})()
     route = asyncio.run(replit_mcp._resolve_and_pin_route(
         mcp, "42", "lease-token", item))

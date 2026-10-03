@@ -75,15 +75,8 @@ if not _redis_url_at_import:
 
 def _enqueue_if_unclaimed(r, req_id: str) -> bool:
     """Atomic SETNX+LPUSH via Lua. Returns True if enqueued, False if already claimed."""
-    result = r.eval(
-        _ENQUEUE_LUA,
-        2,
-        _CLAIM_PREFIX + req_id,
-        _DISPATCH_QUEUE,
-        str(_CLAIM_TTL),
-        req_id,
-    )
-    return bool(result)
+    from services.vault.dev_routing import enqueue
+    return enqueue(r, req_id) == 1
 
 
 def _redis():
@@ -165,19 +158,22 @@ def _clean_stale_ids(r, list_key: str) -> Tuple[int, List[str]]:
     return len(removed), removed
 
 
-def list_requests(status: str = "pending", limit: int = LIST_MAX) -> List[Dict[str, Any]]:
+def list_requests(status: str = "pending", limit: int = LIST_MAX,
+                  exclude_started: bool = False) -> List[Dict[str, Any]]:
     r = _redis()
     if status in ("pending", "approved"):
         # Actively sweep stale IDs before reading the list so the owner sees
         # an accurate count and "no pending" is never a lie.
         _clean_stale_ids(r, f"devreq:{status}")
-        ids = r.lrange(f"devreq:{status}", -limit, -1)
+        ids = r.lrange(f"devreq:{status}", 0 if exclude_started else -limit, -1)
     else:  # any status — scan the id space via the counter
         top = int(r.get("devreq:seq") or 0)
         ids = [str(i) for i in range(max(1, top - 100), top + 1)]
     out = []
     for rid in ids:
         item = get_request(rid)
+        if item and exclude_started and item.get("dispatch_status") == "started":
+            continue
         if item and (status in ("pending", "approved") or item.get("status") == status
                      or status == "all"):
             out.append(item)
@@ -210,57 +206,60 @@ def queue_counts() -> Dict[str, Any]:
     }
 
 
-def set_status(req_id: str, status: str, decided_by: str = "") -> Optional[Dict[str, Any]]:
+def set_status(req_id: str, status: str, decided_by: str = "",
+               expected_review: str = "") -> Optional[Dict[str, Any]]:
     """Decide a PENDING request (used by the Discord approval UI).
 
     Atomic via LREM: removing the id from the pending list is the claim.
     If another reviewer already decided it, LREM returns 0 and we return the
     item unchanged with a "conflict" marker — no duplicate approvals.
     """
+    from services.vault.dev_routing import approval_route, review_token, content_digest, require_owner
+    from services.vault.dev_projects import K_PROJECTS, K_TARGET
+    from redis.exceptions import WatchError
+    if status not in ("approved", "denied") or not decided_by:
+        raise ValueError("Owner identity and approved/denied decision required")
+    require_owner(decided_by)
     r = _redis()
-    item = get_request(req_id)
-    if not item:
-        return None
-    if item.get("status") != "pending":
-        item["conflict"] = "already decided"
-        return item
-    if status == "approved" and item.get("work_scope"):
-        # Scoped records are new submissions.  Revalidate their exact
-        # submission-time destination before consuming the pending claim, then
-        # pin that approved target for every dispatch/retry.
-        scope, project = validate_work_scope(
-            item.get("work_scope"), item.get("project"))
-        submitted_repl_id = str(item.get("submitted_repl_id") or "")
-        if not submitted_repl_id:
-            raise ValueError(
-                "request has no submission-time destination snapshot; "
-                "refusing approval")
-        current_project, current_repl_id = resolve_project(r, project)
-        if current_project != project or current_repl_id != submitted_repl_id:
-            raise ValueError(
-                f"destination mapping for '{project}' changed since submission; "
-                "deny this request and submit a new one")
-        item["work_scope"] = scope
-        item["dispatch_project"] = project
-        item["dispatch_repl_id"] = submitted_repl_id
-    if r.lrem("devreq:pending", 0, req_id) == 0:
-        item = get_request(req_id) or item
-        item["conflict"] = "already decided"
-        return item
-    item["status"] = status
-    item["decided_by"] = decided_by
-    item["decided_at"] = int(time.time())
-    r.set(f"devreq:item:{req_id}", json.dumps(item, ensure_ascii=False),
-          ex=ITEM_TTL)
+    key = f"devreq:item:{req_id}"
+    with r.pipeline() as p:
+        try:
+            p.watch(key, K_PROJECTS, K_TARGET, "devreq:pending")
+            raw = p.get(key)
+            item = json.loads(raw) if raw else None
+            if not item:
+                return None
+            if item.get("status") != "pending":
+                return {**item, "conflict": "already decided"}
+            if status == "approved":
+                project, target = approval_route(p, item)
+                if not expected_review or expected_review != review_token(p, item):
+                    raise ValueError("Review changed or missing; reopen /devrequests")
+                item.update(dispatch_project=project, dispatch_repl_id=target,
+                            approval_digest=content_digest(item),
+                            owner_confirmation={"version": 1, "owner_id": decided_by})
+            item.update(status=status, decided_by=decided_by, decided_at=int(time.time()))
+            p.multi()
+            p.lrem("devreq:pending", 0, req_id)
+            p.set(key, json.dumps(item, ensure_ascii=False), ex=ITEM_TTL)
+            if status == "approved":
+                p.rpush("devreq:approved", req_id)
+            p.execute()
+        except WatchError:
+            raise ValueError("Request or destinations changed; reopen /devrequests") from None
     if status == "approved":
-        r.rpush("devreq:approved", req_id)
-        r.ltrim("devreq:approved", -PENDING_MAX, -1)
-        # Auto-dispatch: atomic Lua claim+LPUSH so concurrent sweep or manual
-        # retry can't double-queue the same request.
-        queued = _enqueue_if_unclaimed(r, req_id)
-        if not queued:
-            logger.info("Dev request %s already claimed/queued at approval time", req_id)
+        _enqueue_if_unclaimed(r, req_id)
     return item
+
+
+def routing_preview(item):
+    from services.vault.dev_routing import preview
+    return preview(_redis(), item)
+
+
+def correct_routing(req_id, scope, project, expected, actor):
+    from services.vault.dev_routing import correct_route
+    return correct_route(_redis(), req_id, scope, project, expected, actor)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +312,10 @@ def dev_request_tool(args: dict, **_kw) -> str:
                 },
                 "note": (
                     "Choose an explicit work_scope and configured project. "
-                    "No destination is inferred; owner approval is still required.")
+                    "Your home app, incidental app names and available connections "
+                    "do not establish code ownership. If uncertain, ask the owner "
+                    "to clarify before submitting. No destination is inferred; "
+                    "owner approval is still required.")
             })
         if action == "submit":
             title = str(args.get("title") or "").strip()

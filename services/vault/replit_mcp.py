@@ -35,6 +35,11 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+try:
+    from . import dev_routing
+except ImportError:
+    import dev_routing
+
 logger = logging.getLogger("vault.replit_mcp")
 
 # The vault service runs this module both as ``replit_mcp`` (its Docker
@@ -297,6 +302,10 @@ class ReplitMCPProviderError(ReplitMCPError):
             else PROVIDER_RETRY_FAILURE)
 
 
+class ReplitMCPNotIssuedError(ReplitMCPProviderError):
+    """Transport proves tools/call was never attempted; retry is safe."""
+
+
 def _provider_failure_for_status(status_code: Any) -> str:
     """Map an HTTP status to a fixed, actionable provider message."""
     try:
@@ -360,14 +369,7 @@ def enqueue_if_unclaimed(r, req_id: str) -> bool:
     Uses a single Lua script so SETNX and LPUSH are one Redis operation.
     Returns True if enqueued (claim acquired), False if already claimed.
     """
-    result = r.eval(
-        _ENQUEUE_SCRIPT, 2,
-        K_CLAIM + req_id,   # KEYS[1]
-        DISPATCH_QUEUE,     # KEYS[2]
-        str(CLAIM_TTL),     # ARGV[1]
-        req_id,             # ARGV[2]
-    )
-    return bool(result)
+    return dev_routing.enqueue(r, req_id) == 1
 
 
 def acquire_lease(r, req_id: str, token: str) -> bool:
@@ -488,6 +490,33 @@ def has_live_lease(r, req_id: str) -> bool:
     return bool(r.exists(K_LEASE + req_id))
 
 
+def mark_provider_attempt(r, req_id, token, item):
+    """CAS the route/content and lease immediately before the provider call."""
+    from redis.exceptions import WatchError
+    key = f"devreq:item:{req_id}"
+    with r.pipeline() as p:
+        try:
+            p.watch(key, K_LEASE + req_id, K_PROJECTS, K_TARGET)
+            current = json.loads(p.get(key) or "{}")
+            route = dev_routing.dispatch_route(p, current)
+            if (p.get(K_LEASE + req_id) != token or current.get("provider_attempt_at")
+                    or current.get("dispatch_status") == "started"
+                    or dev_routing.content_digest(current) != dev_routing.content_digest(item)
+                    or route != (item.get("dispatch_project"), item.get("dispatch_repl_id"))):
+                return False
+            current.update(provider_attempt_at=int(time.time()),
+                           provider_project=route[0], provider_repl_id=route[1],
+                           provider_disposition="issued_or_unknown")
+            ttl = p.ttl(key)
+            p.multi()
+            p.set(key, json.dumps(current), ex=ttl if ttl > 0 else None)
+            p.execute()
+            item.update(current)
+            return True
+        except WatchError:
+            return False
+
+
 def admin_enqueue(r, req_id: str, force: bool = False) -> int:
     """Atomically check-lease / check-claim / enqueue for the /dispatch admin endpoint.
 
@@ -502,16 +531,7 @@ def admin_enqueue(r, req_id: str, force: bool = False) -> int:
           post-failure cooldown TTL is still live) → caller should 409 "already
           queued or in cooldown, use ?force=true to override"
     """
-    result = r.eval(
-        _ADMIN_ENQUEUE_SCRIPT, 3,
-        K_LEASE + req_id,       # KEYS[1]
-        K_CLAIM + req_id,       # KEYS[2]
-        DISPATCH_QUEUE,         # KEYS[3]
-        "1" if force else "0",  # ARGV[1]
-        str(CLAIM_TTL),         # ARGV[2]
-        req_id,                 # ARGV[3]
-    )
-    return int(result)
+    return dev_routing.enqueue(r, req_id, force)
 
 
 class ReplitMCP:
@@ -819,18 +839,19 @@ class ReplitMCP:
                              timeout: float = 120.0) -> Dict[str, Any]:
         try:
             token = await self._access_token()
-        except ReplitMCPProviderError:
-            raise
+        except ReplitMCPProviderError as exc:
+            raise ReplitMCPNotIssuedError(str(exc)) from None
         except Exception:
             # Do not let a token-provider exception (which may contain an
             # echoed response body) cross this boundary.
-            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
+            raise ReplitMCPNotIssuedError(PROVIDER_RETRY_FAILURE) from None
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
+        tool_call_attempted = False
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 init = await client.post(MCP_URL, headers=headers, json={
@@ -855,6 +876,7 @@ class ReplitMCP:
                     headers["Mcp-Session-Id"] = session_id
                 await client.post(MCP_URL, headers=headers, json={
                     "jsonrpc": "2.0", "method": "notifications/initialized"})
+                tool_call_attempted = True
                 resp = await client.post(MCP_URL, headers=headers, json={
                     "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                     "params": {"name": tool, "arguments": arguments},
@@ -863,12 +885,15 @@ class ReplitMCP:
                     raise ReplitMCPProviderError(
                         _provider_failure_for_status(resp.status_code))
                 msg = self._parse_mcp_response(resp)
-        except ReplitMCPProviderError:
+        except ReplitMCPProviderError as exc:
+            if not tool_call_attempted:
+                raise ReplitMCPNotIssuedError(str(exc)) from None
             raise
         except Exception:
             # HTTP client and parser failures must not reflect arbitrary
             # provider response text to the caller or dispatch record.
-            raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE) from None
+            error = ReplitMCPProviderError if tool_call_attempted else ReplitMCPNotIssuedError
+            raise error(PROVIDER_RETRY_FAILURE) from None
         if not msg:
             raise ReplitMCPProviderError(PROVIDER_RETRY_FAILURE)
         if msg.get("error"):
@@ -951,7 +976,12 @@ def sweep_dispatch_backlog(r) -> list:
         if has_live_lease(r, req_id):
             logger.debug("Sweep: request %s has active lease, skipping", req_id)
             continue
-        if not enqueue_if_unclaimed(r, req_id):
+        try:
+            queued = enqueue_if_unclaimed(r, req_id)
+        except ValueError as exc:
+            logger.warning("Routing blocked request %s: %s", req_id, exc)
+            continue
+        if not queued:
             logger.debug("Sweep: request %s already claimed/queued, skipping", req_id)
             continue
         requeued.append(req_id)
@@ -977,67 +1007,12 @@ async def _resolve_and_pin_route(mcp: ReplitMCP, req_id: str,
                                  lease_token: str,
                                  item: Dict[str, Any]) -> tuple[str, str]:
     """Resolve a request destination and durably pin it before the MCP call."""
-    pinned = _pinned_route(item)
-    if pinned:
-        project, repl_id = pinned
-        # Older/partially written items may have an ID but no display name.
-        # Fill the label without ever resolving the ID through live config.
-        if item.get("dispatch_project") != project:
-            if not await asyncio.to_thread(
-                    pin_dispatch_route, mcp.r, req_id, lease_token, item,
-                    project, repl_id):
-                raise ReplitMCPRoutingError(
-                    "Dispatch route changed before it could be pinned; retrying")
-            item["dispatch_project"] = project
-        item["dispatch_repl_id"] = repl_id
-        return project, repl_id
-
-    requested = item.get("project") or DEFAULT_PROJECT
-    if item.get("work_scope"):
-        try:
-            _scope, requested = validate_work_scope(
-                item.get("work_scope"), item.get("project"))
-        except ValueError as exc:
-            raise ReplitMCPRoutingError(str(exc)) from exc
+    # Approval is the only place a route may be pinned. Legacy/inconsistent
+    # records must be corrected by the owner, never healed by the worker.
     try:
-        project, repl_id = await asyncio.to_thread(
-            resolve_project, mcp.r, requested)
+        return dev_routing.dispatch_route(mcp.r, item)
     except ValueError as exc:
-        # Registry/configuration details are safe and actionable for the
-        # operator.  Keep them distinct from opaque provider failures so the
-        # dispatcher can persist the useful routing explanation.
         raise ReplitMCPRoutingError(str(exc)) from exc
-    submitted_repl_id = str(item.get("submitted_repl_id") or "")
-    if item.get("work_scope") and (
-            not submitted_repl_id or repl_id != submitted_repl_id):
-        raise ReplitMCPRoutingError(
-            "Destination mapping changed since submission and was not pinned "
-            "at approval; refusing dispatch")
-    if not await asyncio.to_thread(
-            pin_dispatch_route, mcp.r, req_id, lease_token, item,
-            project, repl_id):
-        # A concurrent worker may have pinned the route just before our CAS.
-        # If so, use that durable value.  Never resolve the current registry
-        # again, since it may now point to a different project.
-        raw = await asyncio.to_thread(mcp.r.get, f"devreq:item:{req_id}")
-        if isinstance(raw, bytes):
-            raw = raw.decode()
-        try:
-            current = json.loads(raw) if raw else {}
-        except (TypeError, ValueError):
-            current = {}
-        pinned = _pinned_route(current)
-        if pinned:
-            item.clear()
-            item.update(current)
-            return pinned
-        raise ReplitMCPRoutingError(
-            "Dispatch route could not be pinned; retry after the request is "
-            "re-queued")
-    item["dispatch_project"] = project
-    item["dispatch_repl_id"] = repl_id
-    return project, repl_id
-
 
 def _build_prompt(item: Dict[str, Any]) -> str:
     try:
@@ -1280,7 +1255,10 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                     await asyncio.to_thread(
                         release_lease, mcp.r, req_id, lease_token)
                     continue
-                if item.get("dispatch_status") == "started":
+                if (item.get("dispatch_status") == "started" or item.get("provider_attempt_at")
+                        or (item.get("dispatch_status") == "failed"
+                            and not item.get("routing_blocked")
+                            and item.get("provider_disposition") != "not_issued")):
                     logger.info(
                         "Dispatch: request %s already started — releasing lease",
                         req_id)
@@ -1309,6 +1287,11 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                         raise ReplitMCPError(
                             "Dispatch lease was lost before the provider call")
 
+                    # Persist exact provider target before any external side effect.
+                    # An interrupted/ambiguous call may not be retried or rerouted.
+                    if not await asyncio.to_thread(
+                            mark_provider_attempt, mcp.r, req_id, lease_token, item):
+                        raise ReplitMCPRoutingError("Request changed before provider call")
                     # Call the MCP (may take up to 120 s + token refresh)
                     result = await mcp.start_agent_run(
                         private_prompt, repl_id=dispatch_repl_id)
@@ -1319,8 +1302,20 @@ async def dispatch_loop(mcp: ReplitMCP) -> None:
                     # failure.  Do not leave stale error text in the record.
                     item.pop("dispatch_error", None)
                     logger.info("Dispatched dev request %s to Replit Agent", req_id)
+                except ReplitMCPNotIssuedError as exc:
+                    item.setdefault("provider_attempt_history", []).append({
+                        "at": item.get("provider_attempt_at"),
+                        "project": item.get("provider_project"),
+                        "repl_id": item.get("provider_repl_id"),
+                        "disposition": "not_issued",
+                    })
+                    item.pop("provider_attempt_at", None)
+                    item["provider_disposition"] = "not_issued"
+                    item["dispatch_status"] = "failed"
+                    item["dispatch_error"] = str(exc)
                 except ReplitMCPRoutingError as exc:
                     item["dispatch_status"] = "failed"
+                    item["routing_blocked"] = True
                     # Routing details are generated locally from the
                     # configured registry and are intentionally kept separate
                     # from opaque provider diagnostics.

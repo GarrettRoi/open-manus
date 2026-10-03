@@ -134,13 +134,8 @@ def _resolve_vault_owner_id() -> str:
     closed).  Callers must treat an empty return as "no owner configured —
     reject all".
     """
-    raw = os.environ.get("DISCORD_OWNER_ID")
-    if raw is None:
-        # Env var absent → use hardcoded fallback.
-        return _VAULT_OWNER_FALLBACK
-    stripped = raw.strip()
-    # Env var present but empty → explicit "no owner" → fail closed.
-    return stripped
+    from services.vault.dev_routing import owner_id
+    return owner_id()
 
 
 async def _vault_owner_gate(adapter, interaction) -> bool:  # noqa: ARG001
