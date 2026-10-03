@@ -32,13 +32,19 @@ S = {"type": "string"}
 ID = {"id": S}
 REV = {**ID, "revision": {"type": "integer", "minimum": 1}}
 LEAD_SCHEMA = obj(LEAD_FIELDS)
+READ_FILTERS = {
+    **{k: S for k in ("query", "business", "status", "source_id", "assigned_agent")},
+    "archived": {"type": "boolean"},
+}
+URGENCY = {"type": "string", "enum": ["all", "ready_now", "overdue"]}
+PAGE = {"page": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100}}
 ACTIONS = {
     "discover": obj({}),
-    "list": obj({**{k: S for k in ("query", "business", "status", "source_id", "assigned_agent")},
-                 "archived": {"type": "boolean"},
-                 "page": {"type": "integer", "minimum": 1},
-                 "limit": {"type": "integer", "minimum": 1, "maximum": 100}}),
-    "summary": obj({}),
+    "list": obj({**READ_FILTERS, **PAGE, "urgency": URGENCY,
+                 "sort": {"type": "string", "enum": ["newest", "next_action"]}}),
+    "summary": obj({**READ_FILTERS, "urgency": URGENCY}),
+    "activity": obj({**READ_FILTERS, **PAGE}),
     "get": obj(ID, ["id"]),
     "roster": obj({}),
     "history": obj({**ID, "page": {"type": "integer", "minimum": 1},
@@ -74,7 +80,8 @@ ADMIN = {"source_save", "source_rotate_secret", "field_save", "settings_save", "
 DESCRIPTIONS = {
     "discover": "Read allowed actions, exact input schemas and current typed custom-field definitions before calling other actions.",
     "list": "Search contact name/email/phone/company/external ID; filter business/status/source/assignee/archive. Returns items,total,page,limit; pages start at 1 and limit is at most 100.",
-    "summary": "Count nonarchived leads by business and status.",
+    "summary": "Count filtered leads by business/status and urgency. Returns timezone/today; ready_now is active and due today or earlier, overdue is strictly before today.",
+    "activity": "Read paginated cross-lead audit activity, newest first, with lead links and authenticated actors. Filters use current lead values; archived defaults false.",
     "get": "Read a lead by ID with its current revision and latest 100 notes/history entries. Use notes/history actions for older entries.",
     "roster": "List canonical fleet agent names and roles to choose an explicit valid assignee.",
     "history": "Read attributable lead changes newest first; page starts at 1, limit is at most 100.",

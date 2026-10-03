@@ -21,8 +21,22 @@ authenticated delivery attempt. `connected` means that generic delivery succeede
 not that native website/provider connectivity has been verified.
 Notification retries reject active leases and clear expired leases. Reassignment
 rejects an already chained undelivered notification instead of risking duplicate dispatch.
-List args: query,business,status,source_id,assigned_agent,archived,page (1+),limit (1..100).
-List result: `{items,total,page,limit}`; summary result `{total,by_business,by_status}`.
+List args: query,business,status,source_id,assigned_agent,archived,page (1..1000),
+limit (1..100), urgency (all|ready_now|overdue), sort (newest|next_action).
+Summary accepts the same filters, excluding page/limit/sort. List result:
+`{items,total,page,limit,timezone,today}`; summary:
+`{total,by_business,by_status,urgency:{ready_now,overdue},timezone,today}`.
+Ready now means active (not archived/won/lost) and next_action_date <= today;
+overdue is strictly earlier. Missing dates are never due. Calendar uses
+`CRM_TIMEZONE` (IANA; UTC default), never client timezone. Urgency lists default
+to earliest next-action date; newest remains the normal list default.
+`activity` accepts list filters except urgency/sort, and returns
+`{items,total,page,limit,timezone,today}`. Items are
+`{lead_id,lead_name,business,action,actor,at,revision}` from existing audit history,
+newest first with stable ID/revision ties; filters use current lead metadata.
+The same owner/agent/source role boundaries apply. Read work is capped at
+5,000 leads/32 MiB scanned payload and 100,000 matching activity events; over
+budget returns unavailable rather than partial totals. See `crm-owner-access.md`.
 get args `{id}` result lead. create args `{lead,idempotency_key}`; mutations
 update `{id,revision,changes}`, note `{id,revision,text}`, assign
 `{id,revision,assigned_agent}`, status `{id,revision,status}`, archive `{id,revision}`.

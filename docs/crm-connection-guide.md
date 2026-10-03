@@ -22,7 +22,7 @@ server-side bridge is needed. Do not put the credential in browser JavaScript.
 
 ## Configure and test a source
 
-1. Open **CRM → Sources** in the authenticated dashboard. Choose a source or
+1. Open **Lead desk → Sources & routing** in the authenticated dashboard. Choose a source or
    add one. Set business classification explicitly; the defaults make no
    assumptions about a website's business.
 2. Choose an agent from the fleet roster, or configure business routing.
@@ -81,7 +81,7 @@ its existing dispatch channel and Redis configuration must be available.
 Discord is the audit surface, not the trigger. Lead text is untrusted data,
 not instructions, and notifications do not authorize contacting a lead.
 
-Use **CRM → Notifications** to inspect unassigned, unavailable, retrying,
+Use **Lead desk → Delivery health** to inspect unassigned, unavailable, retrying,
 failed, and delivered events. Configure an assignment before retrying an
 unassigned event. Restore an offline agent before retrying failures. Active
 delivery leases or already-created dispatch assignments can block reassignment

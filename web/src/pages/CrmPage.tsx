@@ -1,17 +1,35 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Archive, ArrowLeft, Bell, ChevronLeft, ChevronRight, CircleAlert, Download, FileClock, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
 import { HERMES_BASE_PATH } from "@/lib/api";
-import { crm, CrmError, editableLead, serializeLeadInput, type Business, type FieldDefinition, type Lead, type LeadInput, type LeadStatus, type ListArgs, type Notification, type Source } from "@/lib/crm";
+import { crm, crmReadState, crmScope, CrmError, editableLead, leadUrgency, serializeLeadInput, type ActivityList, type Business, type CrmReadSnapshot, type FieldDefinition, type Lead, type LeadInput, type LeadList, type LeadSort, type LeadStatus, type LeadSummary, type ListArgs, type Notification, type Source, type Urgency } from "@/lib/crm";
 
 const businesses: Business[] = ["dj_wedding", "real_estate", "other"];
 const statuses: LeadStatus[] = ["new", "contacted", "qualified", "proposal", "won", "lost"];
 const businessLabel: Record<Business, string> = { dj_wedding: "DJ / Wedding", real_estate: "Real estate", other: "Other" };
 const title = (value: string) => value.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 const auditValue = (value: unknown) => value === null || value === undefined || value === "" ? "—" : typeof value === "object" ? JSON.stringify(value) : String(value);
-const dateText = (value?: string | number) => value ? new Date(typeof value === "number" && value < 1e11 ? value * 1000 : value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—";
+const dateText = (value?: string | number, timeZone?: string) => value ? new Date(typeof value === "number" && value < 1e11 ? value * 1000 : value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short", ...(timeZone ? { timeZone } : {}) }) : "—";
 const blankLead = (): LeadInput => ({ name: "", email: "", phone: "", company: "", source_id: "", external_id: "", business: "other", lead_type: "", status: "new", assigned_agent: "", estimated_value: "", currency: "USD", acquisition_date: "", action_timeframe: "", next_action_date: "", wedding_date: "", custom_fields: {} });
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const isConflict = (error: unknown) => error instanceof CrmError && /conflict|revision/i.test(error.code + error.message);
+
+/** Key each snapshot to its exact request. Never render results belonging to
+ * a previous filter/page, including the render before the effect runs. */
+function useCrmRead<T>(action: string, args: Record<string, unknown>, revision: number, enabled = true) {
+  const key = JSON.stringify({ action, args, revision });
+  const [snapshot, setSnapshot] = useState<CrmReadSnapshot<T> | null>(null);
+  useEffect(() => {
+    if (!enabled) { setSnapshot(null); return; }
+    let active = true;
+    const request = JSON.parse(key) as { action: string; args: Record<string, unknown> };
+    setSnapshot(null);
+    crm<T>(request.action, request.args)
+      .then(data => { if (active) setSnapshot({ key, data, error: "" }); })
+      .catch(error => { if (active) setSnapshot({ key, data: null, error: message(error) }); });
+    return () => { active = false; };
+  }, [key, enabled]);
+  return crmReadState(snapshot, key, enabled);
+}
 
 function Control({ label, children }: { label: string; children: ReactNode }) {
   return <label className="crm-label">{label}{children}</label>;
@@ -72,13 +90,12 @@ function LeadDetail({ lead, fields, sources, roster, refresh, onBack, onEdit, ru
   const [note, setNote] = useState("");
   const [notePage, setNotePage] = useState(1);
   const [historyPage, setHistoryPage] = useState(1);
-  const [noteData, setNoteData] = useState<{ items: NonNullable<Lead["notes"]>; total: number } | null>(null);
-  const [historyData, setHistoryData] = useState<{ items: NonNullable<Lead["history"]>; total: number } | null>(null);
-  const [activityError, setActivityError] = useState("");
   const [activityReload, setActivityReload] = useState(0);
+  const noteRead = useCrmRead<{ items: NonNullable<Lead["notes"]>; total: number }>("notes", { id: lead.id, page: notePage, limit: 20 }, lead.revision + activityReload);
+  const historyRead = useCrmRead<{ items: NonNullable<Lead["history"]>; total: number }>("history", { id: lead.id, page: historyPage, limit: 20 }, lead.revision + activityReload);
+  const noteData = noteRead.data;
+  const historyData = historyRead.data;
   useEffect(() => { setNotePage(1); setHistoryPage(1); }, [lead.id]);
-  useEffect(() => { let active = true; crm<{ items: NonNullable<Lead["notes"]>; total: number }>("notes", { id: lead.id, page: notePage, limit: 20 }).then(result => { if (active) { setNoteData(result); setActivityError(""); } }).catch(e => { if (active) setActivityError(message(e)); }); return () => { active = false; }; }, [lead.id, lead.revision, notePage, activityReload]);
-  useEffect(() => { let active = true; crm<{ items: NonNullable<Lead["history"]>; total: number }>("history", { id: lead.id, page: historyPage, limit: 20 }).then(result => { if (active) { setHistoryData(result); setActivityError(""); } }).catch(e => { if (active) setActivityError(message(e)); }); return () => { active = false; }; }, [lead.id, lead.revision, historyPage, activityReload]);
   const source = sources.find(s => s.id === lead.source_id);
   const mutate = async (action: string, extra: Record<string, unknown> = {}) => { const result = await run(action, { id: lead.id, revision: lead.revision, ...extra }); if (result && action === "note") setNote(""); };
   return <div className="space-y-5">
@@ -92,9 +109,10 @@ function LeadDetail({ lead, fields, sources, roster, refresh, onBack, onEdit, ru
         <div className="space-y-5"><div><Control label="ASSIGNED AGENT"><AgentSelect value={lead.assigned_agent || ""} roster={roster} onChange={v => void mutate("assign", { assigned_agent: v })} /></Control></div><div><Control label="STATUS"><Select value={lead.status} onChange={v => void mutate("status", { status: v })}>{statuses.map(s => <option key={s} value={s}>{title(s)}</option>)}</Select></Control></div>{fields.length > 0 && <div><div className="crm-kicker mb-3">CUSTOM FIELDS</div><dl className="grid grid-cols-2 gap-3 text-sm">{fields.map(f => <div key={f.id}><dt className="crm-muted">{f.label}</dt><dd className="font-semibold">{lead.custom_fields?.[f.id] == null ? "—" : String(lead.custom_fields[f.id])}</dd></div>)}</dl></div>}</div>
       </div>
     </div>
-    {activityError && <ErrorBlock text={activityError} retry={() => setActivityReload(k => k + 1)} />}
-    <div className="grid gap-5 lg:grid-cols-2"><section className="crm-panel p-5"><div className="crm-kicker mb-4">NOTES · {noteData?.total ?? lead.notes_total ?? 0}</div><form onSubmit={async e => { e.preventDefault(); if (note.trim()) { await mutate("note", { text: note.trim() }); setNotePage(1); } }} className="mb-5 space-y-2"><textarea className="crm-input min-h-24 resize-y" placeholder="Add context for the team…" value={note} onChange={e => setNote(e.target.value)} /><button className="crm-btn crm-btn-primary" disabled={!note.trim() || busy}>Add note</button></form><div className="space-y-3">{noteData ? noteData.items.length ? noteData.items.map((n, i) => <div key={n.id || i} className="border-t pt-3 text-sm" style={{ borderColor: "var(--crm-line)" }}><div className="crm-muted mb-1 text-xs">{n.actor || n.author || "Team member"} · {dateText(n.created_at)}</div><p className="whitespace-pre-wrap break-words">{n.text}</p></div>) : <p className="crm-muted text-sm">No notes yet. Add the first update above.</p> : <Skeleton />}</div><Pager page={notePage} total={noteData?.total || 0} limit={20} change={setNotePage} /></section>
-    <section className="crm-panel p-5"><div className="crm-kicker mb-4">CHANGE HISTORY · {historyData?.total ?? lead.history_total ?? 0}</div><div className="space-y-4">{historyData ? historyData.items.length ? historyData.items.map((h, i) => <div key={h.id || i} className="relative border-l pl-4 text-sm" style={{ borderColor: "var(--crm-line)" }}><strong>{title(h.action || "Updated")}</strong><div className="crm-muted text-xs">{h.actor || "System"} · {dateText(h.at || h.created_at || h.timestamp)}</div>{h.changes && Object.entries(h.changes).map(([field, change]) => <div key={field} className="crm-muted mt-1 break-words text-xs"><strong>{title(field)}</strong>: {auditValue(change.old)} → {auditValue(change.new)}</div>)}</div>) : <p className="crm-muted text-sm">No changes recorded yet.</p> : <Skeleton />}</div><Pager page={historyPage} total={historyData?.total || 0} limit={20} change={setHistoryPage} /></section></div>
+    {noteRead.error && <ErrorBlock text={`Notes: ${noteRead.error}`} retry={() => setActivityReload(k => k + 1)} />}
+    {historyRead.error && <ErrorBlock text={`History: ${historyRead.error}`} retry={() => setActivityReload(k => k + 1)} />}
+    <div className="grid gap-5 lg:grid-cols-2"><section className="crm-panel p-5"><div className="crm-kicker mb-4">NOTES · {noteData?.total ?? lead.notes_total ?? "—"}</div><form onSubmit={async e => { e.preventDefault(); if (note.trim()) { await mutate("note", { text: note.trim() }); setNotePage(1); } }} className="mb-5 space-y-2"><textarea className="crm-input min-h-24 resize-y" placeholder="Add context for the team…" value={note} onChange={e => setNote(e.target.value)} /><button className="crm-btn crm-btn-primary" disabled={!note.trim() || busy}>Add note</button></form><div className="space-y-3">{noteData ? noteData.items.length ? noteData.items.map((n, i) => <div key={n.id || i} className="border-t pt-3 text-sm" style={{ borderColor: "var(--crm-line)" }}><div className="crm-muted mb-1 text-xs">{n.actor || n.author || "Team member"} · {dateText(n.created_at)}</div><p className="whitespace-pre-wrap break-words">{n.text}</p></div>) : <p className="crm-muted text-sm">No notes yet. Add the first update above.</p> : noteRead.loading ? <Skeleton /> : <p className="crm-muted text-sm">Notes unavailable. Retry above.</p>}</div><Pager page={notePage} total={noteData?.total || 0} limit={20} change={setNotePage} /></section>
+    <section className="crm-panel p-5"><div className="crm-kicker mb-4">CHANGE HISTORY · {historyData?.total ?? lead.history_total ?? "—"}</div><div className="space-y-4">{historyData ? historyData.items.length ? historyData.items.map((h, i) => <div key={h.id || i} className="relative border-l pl-4 text-sm" style={{ borderColor: "var(--crm-line)" }}><strong>{title(h.action || "Updated")}</strong><div className="crm-muted text-xs">{h.actor || "System"} · {dateText(h.at || h.created_at || h.timestamp)}</div>{h.changes && Object.entries(h.changes).map(([field, change]) => <div key={field} className="crm-muted mt-1 break-words text-xs"><strong>{title(field)}</strong>: {auditValue(change.old)} → {auditValue(change.new)}</div>)}</div>) : <p className="crm-muted text-sm">No changes recorded yet.</p> : historyRead.loading ? <Skeleton /> : <p className="crm-muted text-sm">History unavailable. Retry above.</p>}</div><Pager page={historyPage} total={historyData?.total || 0} limit={20} change={setHistoryPage} /></section></div>
   </div>;
 }
 
@@ -104,21 +122,17 @@ function Pager({ page, total, limit, change }: { page: number; total: number; li
 }
 
 export default function CrmPage() {
-  const [tab, setTab] = useState<"leads" | "sources" | "fields" | "notifications">("leads");
+  const [tab, setTab] = useState<"leads" | "activity" | "sources" | "fields" | "notifications">("leads");
   const [roster, setRoster] = useState<string[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [fields, setFields] = useState<FieldDefinition[]>([]);
-  const [summary, setSummary] = useState<{ total: number; by_business: Record<string, number>; by_status: Record<string, number> } | null>(null);
-  const [list, setList] = useState<{ items: Lead[]; total: number; page: number; limit: number } | null>(null);
-  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationPage, setNotificationPage] = useState(1);
-  const [notificationTotal, setNotificationTotal] = useState(0);
-  const [filters, setFilters] = useState<ListArgs>({ query: "", business: "", status: "", source_id: "", assigned_agent: "", archived: false, page: 1, limit: 20 });
+  const [filters, setFilters] = useState<ListArgs>({ query: "", business: "", status: "", source_id: "", assigned_agent: "", archived: false, urgency: "all", sort: "newest", page: 1, limit: 20 });
+  const [activityPage, setActivityPage] = useState(1);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Lead | null>(null);
   const [editor, setEditor] = useState<Lead | "new" | null>(null);
   const [loading, setLoading] = useState(true);
-  const [listLoading, setListLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [conflict, setConflict] = useState(false);
@@ -126,26 +140,39 @@ export default function CrmPage() {
   const [notice, setNotice] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
   const refresh = useCallback(() => setRefreshKey(k => k + 1), []);
-  const updateFilter = <K extends keyof ListArgs>(key: K, value: ListArgs[K]) => setFilters(f => ({ ...f, [key]: value, page: 1 }));
-  useEffect(() => { const timer = window.setTimeout(() => updateFilter("query", search), 280); return () => clearTimeout(timer); }, [search]);
+  const scope = crmScope(filters);
+  const globalRead = useCrmRead<LeadSummary>("summary", { archived: false }, refreshKey);
+  const summaryRead = useCrmRead<LeadSummary>("summary", scope, refreshKey);
+  const listRead = useCrmRead<LeadList>("list", { ...scope, urgency: filters.urgency, sort: filters.sort, page: filters.page, limit: filters.limit }, refreshKey, tab === "leads");
+  const activityRead = useCrmRead<ActivityList>("activity", { ...scope, page: activityPage, limit: 20 }, refreshKey, tab === "activity");
+  const notificationRead = useCrmRead<{ items: Notification[]; total: number }>("notifications", { page: notificationPage, limit: 30 }, refreshKey, tab === "notifications");
+  const notifications = notificationRead.data?.items ?? [];
+  const notificationTotal = notificationRead.data?.total ?? 0;
+  const summary = summaryRead.data;
+  const globalSummary = globalRead.data;
+  const list = listRead.data;
+  const searchPending = search !== (filters.query || "");
+  const listLoading = listRead.loading || searchPending;
+  const updateFilter = <K extends keyof ListArgs>(key: K, value: ListArgs[K]) => { setActivityPage(1); setFilters(f => ({ ...f, [key]: value, page: 1 })); };
+  useEffect(() => { const timer = window.setTimeout(() => { setActivityPage(1); setFilters(f => ({ ...f, query: search, page: 1 })); }, 280); return () => clearTimeout(timer); }, [search]);
   useEffect(() => {
     let active = true;
     setLoading(true);
-    Promise.all([crm<{ items: Source[] }>("sources"), crm<{ items: FieldDefinition[] }>("fields"), crm<typeof summary>("summary"), crm<{ items: Array<{ agent: string; role: string }> }>("roster")])
-      .then(([s, f, totals, members]) => { if (!active) return; setSources((s.items || []).map(source => ({ ...source, instructions: source.instructions || source.setup, auth_requirements: source.auth_requirements || source.authentication, example_payload: source.example_payload || source.example, last_test_status: source.last_delivery_ok === true ? "Authenticated delivery accepted" : source.last_delivery_ok === false ? `Delivery rejected${source.last_error ? `: ${source.last_error}` : ""}` : "Not tested" }))); setFields(f.items || []); setSummary(totals); setRoster((members.items || []).map(member => member.agent).filter(Boolean)); setError(""); })
+    Promise.all([crm<{ items: Source[] }>("sources"), crm<{ items: FieldDefinition[] }>("fields"), crm<{ items: Array<{ agent: string; role: string }> }>("roster")])
+      .then(([s, f, members]) => { if (!active) return; setSources((s.items || []).map(source => ({ ...source, instructions: source.instructions || source.setup, auth_requirements: source.auth_requirements || source.authentication, example_payload: source.example_payload || source.example, last_test_status: source.last_delivery_ok === true ? "Authenticated delivery accepted" : source.last_delivery_ok === false ? `Delivery rejected${source.last_error ? `: ${source.last_error}` : ""}` : "Not tested" }))); setFields(f.items || []); setRoster((members.items || []).map(member => member.agent).filter(Boolean)); setError(""); })
       .catch(e => { if (active) setError(message(e)); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [refreshKey]);
-  useEffect(() => {
-    let active = true;
-    setListLoading(true);
-    crm<{ items: Lead[]; total: number; page: number; limit: number }>("list", Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== "")))
-      .then(result => { if (active) { setList(result); setError(""); } })
-      .catch(e => { if (active) setError(message(e)); }).finally(() => { if (active) setListLoading(false); });
-    return () => { active = false; };
-  }, [filters, refreshKey]);
-  useEffect(() => { if (tab !== "notifications") return; let active = true; crm<{ items: Notification[]; total: number }>("notifications", { page: notificationPage, limit: 30 }).then(r => { if (active) { setNotifications(r.items || []); setNotificationTotal(r.total || 0); setError(""); } }).catch(e => { if (active) setError(message(e)); }); return () => { active = false; }; }, [tab, refreshKey, notificationPage]);
-  const loadSelected = useCallback(async () => { if (!selected) return; try { setSelected(await crm<Lead>("get", { id: selected.id })); setActionError(""); setConflict(false); refresh(); } catch (e) { setActionError(message(e)); } }, [selected?.id, refresh]);
+  const selectionRequest = useRef(0);
+  const loadSelected = useCallback(async () => {
+    if (!selected) return;
+    const request = ++selectionRequest.current;
+    try {
+      const latest = await crm<Lead>("get", { id: selected.id });
+      if (request !== selectionRequest.current) return;
+      setSelected(latest); setActionError(""); setConflict(false); refresh();
+    } catch (e) { if (request === selectionRequest.current) setActionError(message(e)); }
+  }, [selected?.id, refresh]);
   const run = async (action: string, args: Record<string, unknown>): Promise<unknown> => {
     setBusy(true); setActionError(""); setConflict(false);
     try { const result = await crm<unknown>(action, args); if (["create", "update", "note", "assign", "status", "archive"].includes(action) && result && typeof result === "object" && "id" in result && "revision" in result) setSelected(result as Lead); setNotice("Saved"); refresh(); return result; }
@@ -158,23 +185,73 @@ export default function CrmPage() {
     if (result && editor === "new") setCreateKey(crypto.randomUUID());
     if (result) { setSelected(result as Lead); setEditor(null); }
   };
-  const selectLead = async (lead: Lead) => { setSelected(lead); setActionError(""); try { setSelected(await crm<Lead>("get", { id: lead.id })); } catch (e) { setActionError(message(e)); } };
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [detailId, setDetailId] = useState("");
+  const selectLead = async (lead: Pick<Lead, "id">) => {
+    const request = ++selectionRequest.current;
+    setTab("leads"); setSelected(null); setDetailId(lead.id); setDetailError(""); setDetailLoading(true); setActionError("");
+    try { const result = await crm<Lead>("get", { id: lead.id }); if (request === selectionRequest.current) setSelected(result); }
+    catch (e) { if (request === selectionRequest.current) setDetailError(message(e)); }
+    finally { if (request === selectionRequest.current) setDetailLoading(false); }
+  };
+  const leaveDetail = () => { selectionRequest.current++; setSelected(null); setDetailLoading(false); setDetailError(""); };
   const exportData = async () => { const snapshot = await run("export", {}); if (!snapshot) return; const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `crm-export-${new Date().toISOString().slice(0,10)}.json`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); };
   const totalPages = Math.max(1, Math.ceil((list?.total || 0) / filters.limit));
-  const tabItems = [{ id: "leads", label: "Leads", icon: Search }, { id: "sources", label: "Sources & routing", icon: SlidersHorizontal }, { id: "fields", label: "Custom fields", icon: Settings2 }, { id: "notifications", label: "Delivery health", icon: Bell }] as const;
+  const tabItems = [{ id: "leads", label: "Leads", icon: Search }, { id: "activity", label: "Recent activity", icon: FileClock }, { id: "sources", label: "Sources & routing", icon: SlidersHorizontal }, { id: "fields", label: "Custom fields", icon: Settings2 }, { id: "notifications", label: "Delivery health", icon: Bell }] as const;
   const sourceName = (id?: string) => sources.find(s => s.id === id)?.name || id || "Manual";
+  const chooseQueue = (urgency: Urgency) => {
+    leaveDetail(); setTab("leads");
+    setFilters(f => ({ ...f, urgency, page: 1, ...(urgency !== "all" ? { archived: false, sort: "next_action", status: f.status === "won" || f.status === "lost" ? "" : f.status } : {}) }));
+  };
+  const filterControls = <div className="crm-panel grid gap-3 p-4 md:grid-cols-3 xl:grid-cols-[2fr_repeat(4,1fr)]">
+    <Control label="SEARCH"><div className="relative"><Search className="pointer-events-none absolute left-3 top-3 opacity-50" size={16} /><input className="crm-input !pl-9" placeholder="Name, email, phone, company…" value={search} onChange={e => setSearch(e.target.value)} /></div></Control>
+    <Control label="BUSINESS"><Select value={filters.business || ""} onChange={v => updateFilter("business", v)}><option value="">All businesses</option>{businesses.map(b => <option key={b} value={b}>{businessLabel[b]}</option>)}</Select></Control>
+    <Control label="STATUS"><Select value={filters.status || ""} onChange={v => updateFilter("status", v)}><option value="">All statuses</option>{statuses.map(s => <option key={s} value={s}>{title(s)}</option>)}</Select></Control>
+    <Control label="SOURCE"><Select value={filters.source_id || ""} onChange={v => updateFilter("source_id", v)}><option value="">All sources</option>{sources.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</Select></Control>
+    <Control label="ASSIGNEE"><AgentSelect value={filters.assigned_agent || ""} onChange={v => updateFilter("assigned_agent", v)} roster={roster} includeAll /></Control>
+    <div className="flex flex-wrap items-center justify-between gap-3 md:col-span-3 xl:col-span-5">
+      <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={!!filters.archived} onChange={e => updateFilter("archived", e.target.checked)} /> Show archived leads</label>
+      <button className="crm-btn !min-h-8" onClick={() => { setSearch(""); setActivityPage(1); setFilters({ query: "", business: "", status: "", source_id: "", assigned_agent: "", archived: false, urgency: "all", sort: "newest", page: 1, limit: 20 }); }}>Reset filters</button>
+    </div>
+  </div>;
   return <main className="crm-workspace mx-auto w-full max-w-[1480px] min-h-[100dvh] pb-16">
     <div className="mb-6 flex flex-wrap items-end justify-between gap-4 border-b pb-6" style={{ borderColor: "var(--crm-line)" }}><div><div className="crm-kicker mb-2">FLEET / SHARED WORKSPACE</div><h1 className="crm-title">Lead desk<span className="opacity-35">.</span></h1><p className="crm-muted mt-2 text-sm">One record of every opportunity, from first inquiry to follow-through.</p></div><div className="flex flex-wrap gap-2"><button className="crm-btn" onClick={refresh} aria-label="Refresh CRM"><RefreshCw size={15} /> Refresh</button><button className="crm-btn" onClick={() => void exportData()} disabled={busy}><Download size={15} /> Export</button><button className="crm-btn crm-btn-primary" onClick={() => { setActionError(""); setEditor("new"); }}><Plus size={16} /> New lead</button></div></div>
     {notice && <div role="status" className="mb-4 flex items-center justify-between rounded border border-current/20 px-3 py-2 text-sm">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss notification"><X size={14} /></button></div>}
     {error && <div className="mb-5"><ErrorBlock text={error} retry={refresh} /></div>}
-    {loading && !summary && <div className="mb-5"><Skeleton /></div>}
-    <div className="mb-5 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6"><div className="crm-panel col-span-2 px-5 py-4 sm:col-span-1"><div className="crm-kicker">TOTAL LEADS</div><div className="mt-2 text-3xl font-bold tabular-nums">{summary?.total ?? "—"}</div></div>{businesses.map(b => <button key={b} className="crm-panel px-4 py-4 text-left transition-opacity hover:opacity-75" onClick={() => { setTab("leads"); updateFilter("business", b); setSelected(null); }}><div className="crm-kicker">{businessLabel[b]}</div><div className="mt-2 text-2xl font-bold tabular-nums">{summary?.by_business?.[b] ?? 0}</div></button>)}<div className="crm-panel col-span-2 px-4 py-4"><div className="crm-kicker">PIPELINE</div><div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm">{statuses.map(s => <span key={s}>{title(s)} <strong className="tabular-nums">{summary?.by_status?.[s] ?? 0}</strong></span>)}</div></div></div>
-    <div className="mb-6 flex gap-6 overflow-x-auto border-b" style={{ borderColor: "var(--crm-line)" }} role="tablist" aria-label="CRM sections">{tabItems.map(item => <button key={item.id} className="crm-tab flex shrink-0 items-center gap-2" role="tab" aria-selected={tab === item.id} onClick={() => { setTab(item.id); setSelected(null); setActionError(""); }}><item.icon size={15} />{item.label}</button>)}</div>
-    {tab === "leads" && (selected ? <LeadDetail key={selected.id} lead={selected} fields={fields} sources={sources} roster={roster} refresh={() => void loadSelected()} onBack={() => setSelected(null)} onEdit={() => { setActionError(""); setEditor(selected); }} run={run} busy={busy} error={actionError} conflict={conflict} /> : <div className="space-y-4"><div className="crm-panel grid gap-3 p-4 md:grid-cols-3 xl:grid-cols-[2fr_repeat(4,1fr)]"><Control label="SEARCH"><div className="relative"><Search className="pointer-events-none absolute left-3 top-3 opacity-50" size={16} /><input className="crm-input !pl-9" placeholder="Name, email, company…" value={search} onChange={e => setSearch(e.target.value)} /></div></Control><Control label="BUSINESS"><Select value={filters.business || ""} onChange={v => updateFilter("business", v)}><option value="">All businesses</option>{businesses.map(b => <option key={b} value={b}>{businessLabel[b]}</option>)}</Select></Control><Control label="STATUS"><Select value={filters.status || ""} onChange={v => updateFilter("status", v)}><option value="">All statuses</option>{statuses.map(s => <option key={s} value={s}>{title(s)}</option>)}</Select></Control><Control label="SOURCE"><Select value={filters.source_id || ""} onChange={v => updateFilter("source_id", v)}><option value="">All sources</option>{sources.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</Select></Control><Control label="ASSIGNEE"><AgentSelect value={filters.assigned_agent || ""} onChange={v => updateFilter("assigned_agent", v)} roster={roster} includeAll /></Control><label className="flex items-center gap-2 text-xs md:col-span-3 xl:col-span-5"><input type="checkbox" checked={!!filters.archived} onChange={e => updateFilter("archived", e.target.checked)} /> Show archived leads</label></div>
-    {listLoading && !list ? <Skeleton /> : <section className="crm-panel overflow-hidden">{listLoading && <div className="crm-kicker px-4 pt-3">UPDATING RESULTS…</div>}{list?.items.length ? <><div className="overflow-x-auto"><table className="crm-table"><thead><tr><th>Contact</th><th>Business / type</th><th>Status</th><th>Source</th><th>Assigned to</th><th>Next action</th><th></th></tr></thead><tbody>{list.items.map(lead => <tr key={lead.id}><td><button className="text-left font-semibold hover:underline" onClick={() => void selectLead(lead)}>{lead.name}</button><div className="crm-muted text-xs">{lead.email || lead.phone || lead.company || lead.id}</div></td><td>{businessLabel[lead.business] || title(lead.business)}<div className="crm-muted text-xs">{lead.lead_type || "—"}</div></td><td><span className="crm-pill"><span className="crm-dot" />{title(lead.status)}</span></td><td>{sourceName(lead.source_id)}</td><td>{lead.assigned_agent?.replace(/^agent-/, "") || <span className="crm-muted">Unassigned</span>}</td><td>{lead.next_action_date || "—"}</td><td><button className="crm-btn !min-h-8" onClick={() => void selectLead(lead)}>Open <ChevronRight size={13} /></button></td></tr>)}</tbody></table></div><div className="flex flex-wrap items-center justify-between gap-3 border-t p-4 text-xs" style={{ borderColor: "var(--crm-line)" }}><span className="crm-muted">Showing {(filters.page - 1) * filters.limit + 1}–{Math.min(filters.page * filters.limit, list.total)} of {list.total}</span><div className="flex items-center gap-2"><button className="crm-btn !min-h-8" disabled={filters.page <= 1} onClick={() => setFilters(f => ({ ...f, page: f.page - 1 }))}><ChevronLeft size={14} /> Previous</button><span className="px-2">Page {filters.page} / {totalPages}</span><button className="crm-btn !min-h-8" disabled={filters.page >= totalPages} onClick={() => setFilters(f => ({ ...f, page: f.page + 1 }))}>Next <ChevronRight size={14} /></button></div></div></> : <Empty heading="No leads in this view" text="Try removing a filter, or create the first lead to start the record." action={<button className="crm-btn crm-btn-primary mt-3" onClick={() => setEditor("new")}><Plus size={15} /> New lead</button>} />}</section>}</div>)}
+    {loading && <div className="crm-kicker mb-3" role="status">LOADING WORKSPACE SETTINGS…</div>}
+    <section className="mb-4" aria-label="Global business totals">
+      <div className="crm-kicker mb-2">GLOBAL TOTALS · NONARCHIVED · ALL BUSINESSES · NOT FILTERED</div>
+      {globalRead.error ? <ErrorBlock text={`Business totals: ${globalRead.error}`} retry={refresh} /> : globalRead.loading ? <Skeleton /> : <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <button className="crm-panel px-5 py-4 text-left" onClick={() => { leaveDetail(); setTab("leads"); updateFilter("business", ""); }}><div className="crm-kicker">ALL LEADS</div><div className="mt-2 text-3xl font-bold tabular-nums">{globalSummary?.total ?? "—"}</div></button>
+        {businesses.map(b => <button key={b} aria-pressed={filters.business === b} className="crm-panel px-4 py-4 text-left transition-opacity hover:opacity-75" onClick={() => { leaveDetail(); setTab("leads"); updateFilter("business", b); }}><div className="crm-kicker">{businessLabel[b]}</div><div className="mt-2 flex items-end justify-between gap-3"><strong className="text-2xl tabular-nums">{globalSummary?.by_business[b] ?? 0}</strong><span className="crm-muted text-xs">{filters.business === b ? "Selected" : "View leads"}</span></div></button>)}
+      </div>}
+    </section>
+    <section className="mb-5 crm-panel p-4" aria-label="Filtered pipeline">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-2"><div><div className="crm-kicker">FILTERED PIPELINE · {filters.business ? businessLabel[filters.business as Business] : "ALL BUSINESSES"}</div><p className="crm-muted mt-1 text-xs">Matches business, search, status, source, assignee and archive filters. Queue and sort do not change these counts.</p></div><span className="crm-pill">{searchPending || !summary ? "—" : summary.total} matching leads</span></div>
+      {searchPending || summaryRead.loading ? <div className="crm-skeleton h-8" aria-label="Loading pipeline" /> : summaryRead.error ? <ErrorBlock text={`Pipeline: ${summaryRead.error}`} retry={refresh} /> : <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm">{statuses.map(s => <button key={s} className="hover:underline" aria-pressed={filters.status === s} onClick={() => { leaveDetail(); setTab("leads"); updateFilter("status", filters.status === s ? "" : s); }}>{title(s)} <strong className="ml-1 tabular-nums">{summary?.by_status[s] ?? 0}</strong></button>)}</div>}
+      <div className="crm-muted mt-3 text-xs">CRM calendar: {summary && !searchPending ? <><strong>{summary.today}</strong> · {summary.timezone}</> : "Awaiting calendar from server"}. Ready now = next action on or before today; overdue = before today. Both exclude won, lost, archived and undated leads.</div>
+    </section>
+    <div className="mb-6 flex gap-6 overflow-x-auto border-b" style={{ borderColor: "var(--crm-line)" }} role="tablist" aria-label="CRM sections">{tabItems.map(item => <button key={item.id} className="crm-tab flex shrink-0 items-center gap-2" role="tab" aria-selected={tab === item.id} onClick={() => { leaveDetail(); setTab(item.id); setActionError(""); }}><item.icon size={15} />{item.label}</button>)}</div>
+    {tab === "leads" && (detailLoading ? <Skeleton /> : detailError ? <div className="space-y-3"><button className="crm-btn" onClick={leaveDetail}><ArrowLeft size={15} /> All leads</button><ErrorBlock text={`Could not open lead: ${detailError}`} retry={() => void selectLead({ id: detailId })} /></div> : selected ? <LeadDetail key={selected.id} lead={selected} fields={fields} sources={sources} roster={roster} refresh={() => void loadSelected()} onBack={leaveDetail} onEdit={() => { setActionError(""); setEditor(selected); }} run={run} busy={busy} error={actionError} conflict={conflict} /> : <div className="space-y-4">
+      {filterControls}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div className="flex flex-wrap gap-2" aria-label="Urgency views">{([{ value: "all", label: "All leads" }, { value: "ready_now", label: "Ready now" }, { value: "overdue", label: "Overdue" }] as const).map(q => <button key={q.value} className={`crm-btn ${filters.urgency === q.value ? "crm-btn-primary" : ""}`} aria-pressed={filters.urgency === q.value} onClick={() => chooseQueue(q.value)}>{q.label}<span className="tabular-nums">{searchPending || !summary ? "—" : q.value === "all" ? summary.total : summary.urgency[q.value]}</span></button>)}</div>
+        <Control label="ORDER"><Select value={filters.sort || "newest"} onChange={v => updateFilter("sort", v as LeadSort)}><option value="newest">Newest leads first</option><option value="next_action">Next action · earliest first</option></Select></Control>
+      </div>
+      <p className="crm-muted text-xs">{filters.urgency === "all" ? "All matching leads, including those without a next action." : "Active follow-ups only. Counts above match the current pipeline filters; opening a queue switches to nonarchived leads and clears won/lost status."} {filters.sort === "next_action" && "Dated actions first; undated leads last."}</p>
+      {listLoading ? <Skeleton /> : listRead.error ? <ErrorBlock text={`Lead list: ${listRead.error}`} retry={refresh} /> : <section className="crm-panel overflow-hidden">{list?.items.length ? <><div className="overflow-x-auto"><table className="crm-table"><thead><tr><th>Contact</th><th>Business / type</th><th>Status</th><th>Source</th><th>Assigned to</th><th>Next action</th><th></th></tr></thead><tbody>{list.items.map(lead => <tr key={lead.id}><td><button className="text-left font-semibold hover:underline" onClick={() => void selectLead(lead)}>{lead.name}</button><div className="crm-muted text-xs">{lead.email || lead.phone || lead.company || lead.id}</div></td><td>{businessLabel[lead.business] || title(lead.business)}<div className="crm-muted text-xs">{lead.lead_type || "—"}</div></td><td><span className="crm-pill"><span className="crm-dot" />{title(lead.status)}</span></td><td>{sourceName(lead.source_id)}</td><td>{lead.assigned_agent?.replace(/^agent-/, "") || <span className="crm-muted">Unassigned</span>}</td><td><span className="tabular-nums">{lead.next_action_date || "—"}</span>{leadUrgency(lead, list.today) && <div className="crm-muted text-xs font-semibold">{leadUrgency(lead, list.today) === "overdue" ? "Overdue" : "Due today"}</div>}</td><td><button className="crm-btn !min-h-8" onClick={() => void selectLead(lead)}>Open <ChevronRight size={13} /></button></td></tr>)}</tbody></table></div><div className="flex flex-wrap items-center justify-between gap-3 border-t p-4 text-xs" style={{ borderColor: "var(--crm-line)" }}><span className="crm-muted">Showing {(list.page - 1) * list.limit + 1}–{Math.min(list.page * list.limit, list.total)} of {list.total} · {list.timezone}</span><div className="flex items-center gap-2"><button className="crm-btn !min-h-8" disabled={filters.page <= 1} onClick={() => setFilters(f => ({ ...f, page: f.page - 1 }))}><ChevronLeft size={14} /> Previous</button><span className="px-2">Page {filters.page} / {totalPages}</span><button className="crm-btn !min-h-8" disabled={filters.page >= totalPages} onClick={() => setFilters(f => ({ ...f, page: f.page + 1 }))}>Next <ChevronRight size={14} /></button></div></div></> : <Empty heading={filters.urgency === "all" ? "No leads in this view" : "No follow-ups in this queue"} text="Try another queue or remove a filter. Only dated, active leads can appear in Ready now or Overdue." action={<button className="crm-btn crm-btn-primary mt-3" onClick={() => setEditor("new")}><Plus size={15} /> New lead</button>} />}</section>}
+    </div>)}
+    {tab === "activity" && <div className="space-y-4">
+      {filterControls}
+      <div className="flex flex-wrap items-end justify-between gap-2"><div><h2 className="text-lg font-bold">Recent cross-lead activity</h2><p className="crm-muted text-xs">Newest changes first · Uses pipeline filters, not the urgency queue or lead sort.</p></div>{activityRead.data && !searchPending && <span className="crm-muted text-xs">{activityRead.data.total} changes · Times in {activityRead.data.timezone}</span>}</div>
+      {activityRead.loading || searchPending ? <Skeleton /> : activityRead.error ? <ErrorBlock text={`Recent activity: ${activityRead.error}`} retry={refresh} /> : <section className="crm-panel overflow-hidden">
+        {activityRead.data?.items.length ? <><div className="overflow-x-auto"><table className="crm-table"><thead><tr><th>Lead</th><th>Business</th><th>Change</th><th>Actor</th><th>When</th><th>Revision</th></tr></thead><tbody>{activityRead.data.items.map((item, i) => <tr key={`${item.lead_id}:${item.revision}:${i}`}><td><button className="text-left font-semibold hover:underline" onClick={() => void selectLead({ id: item.lead_id })}>{item.lead_name || item.lead_id}</button><div className="crm-muted text-xs">{item.lead_id}</div></td><td>{businessLabel[item.business]}</td><td>{title(item.action)}</td><td>{item.actor || "System"}</td><td className="tabular-nums">{dateText(item.at, activityRead.data?.timezone)}</td><td className="tabular-nums">{item.revision}</td></tr>)}</tbody></table></div><div className="px-4 pb-4"><Pager page={activityRead.data.page} total={activityRead.data.total} limit={activityRead.data.limit} change={setActivityPage} /></div></> : <Empty heading="No recent activity in this view" text="Changes to matching leads will appear here. Try removing a filter to see more of the team's work." action={activityPage > 1 ? <button className="crm-btn mt-3" onClick={() => setActivityPage(1)}>First page</button> : undefined} />}
+      </section>}
+    </div>}
     {tab === "sources" && <><BusinessRouting roster={roster} /><div className="mt-6"><SourcesPanel sources={sources} roster={roster} run={run} busy={busy} error={actionError} /></div></>}
     {tab === "fields" && <FieldsPanel fields={fields} run={run} busy={busy} error={actionError} />}
-    {tab === "notifications" && <section className="crm-panel overflow-hidden"><div className="flex items-center justify-between p-5"><div><h2 className="text-lg font-bold">Notification outbox</h2><p className="crm-muted text-xs">Failed, retrying and unassigned deliveries stay visible until resolved.</p></div><button className="crm-btn" onClick={refresh}><RefreshCw size={14} /> Refresh</button></div>{notifications.length ? <div className="overflow-x-auto"><table className="crm-table"><thead><tr><th>Lead</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Recovery</th></tr></thead><tbody>{notifications.map(n => <tr key={n.id}><td><button className="font-semibold underline" onClick={async () => { setTab("leads"); try { setSelected(await crm<Lead>("get", { id: n.lead_id })); } catch (e) { setError(message(e)); } }}>{n.lead_id}</button></td><td>{n.recipient || "Unassigned"}</td><td><span className="crm-pill"><span className="crm-dot" />{title(n.status)}</span>{n.error && <div className="mt-1 max-w-xs break-words text-xs text-red-400">{n.error}</div>}</td><td>{n.attempts}</td><td>{dateText(n.updated_at)}</td><td><button className="crm-btn !min-h-8" disabled={busy || n.status === "delivered"} onClick={() => void run("retry", { id: n.id })}><RefreshCw size={13} /> Retry</button></td></tr>)}</tbody></table></div> : <Empty heading="No deliveries to review" text="New lead notifications and their delivery attempts will appear here." />}{actionError && <p role="alert" className="p-4 text-sm text-red-400">{actionError}</p>}</section>}
+    {tab === "notifications" && <section className="crm-panel overflow-hidden"><div className="flex items-center justify-between p-5"><div><h2 className="text-lg font-bold">Notification outbox</h2><p className="crm-muted text-xs">Failed, retrying and unassigned deliveries stay visible until resolved.</p></div><button className="crm-btn" onClick={refresh}><RefreshCw size={14} /> Refresh</button></div>{notificationRead.loading ? <Skeleton /> : notificationRead.error ? <ErrorBlock text={`Delivery health: ${notificationRead.error}`} retry={refresh} /> : notifications.length ? <div className="overflow-x-auto"><table className="crm-table"><thead><tr><th>Lead</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Recovery</th></tr></thead><tbody>{notifications.map(n => <tr key={n.id}><td><button className="font-semibold underline" onClick={() => void selectLead({ id: n.lead_id })}>{n.lead_id}</button></td><td>{n.recipient || "Unassigned"}</td><td><span className="crm-pill"><span className="crm-dot" />{title(n.status)}</span>{n.error && <div className="mt-1 max-w-xs break-words text-xs text-red-400">{n.error}</div>}</td><td>{n.attempts}</td><td>{dateText(n.updated_at)}</td><td><button className="crm-btn !min-h-8" disabled={busy || n.status === "delivered"} onClick={() => void run("retry", { id: n.id })}><RefreshCw size={13} /> Retry</button></td></tr>)}</tbody></table></div> : <Empty heading="No deliveries to review" text="New lead notifications and their delivery attempts will appear here." />}{actionError && <p role="alert" className="p-4 text-sm text-red-400">{actionError}</p>}</section>}
     {tab === "notifications" && notificationTotal > 30 && <div className="mt-3 flex items-center justify-end gap-2 text-xs"><span className="crm-muted">{notificationTotal} deliveries · Page {notificationPage} of {Math.ceil(notificationTotal / 30)}</span><button className="crm-btn" disabled={notificationPage <= 1} onClick={() => setNotificationPage(n => n - 1)}><ChevronLeft size={14} /> Previous</button><button className="crm-btn" disabled={notificationPage >= Math.ceil(notificationTotal / 30)} onClick={() => setNotificationPage(n => n + 1)}>Next <ChevronRight size={14} /></button></div>}
     {editor && <LeadEditor key={editor === "new" ? "new" : `${editor.id}:${editor.revision}`} initial={editor === "new" ? undefined : editor} fields={fields} sources={sources} roster={roster} save={saveLead} close={() => setEditor(null)} busy={busy} error={actionError} conflict={conflict} reloadLatest={async () => { if (!editor || editor === "new") return; try { const latest = await crm<Lead>("get", { id: editor.id }); setEditor(latest); setSelected(latest); setActionError(""); setConflict(false); } catch (e) { setActionError(message(e)); } }} />}
   </main>;

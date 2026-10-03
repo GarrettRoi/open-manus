@@ -28,7 +28,33 @@ export type Notification = {
   id: string; lead_id: string; recipient?: string; status: string; attempts: number;
   error?: string; created_at?: string | number; updated_at?: string | number; next_attempt_at?: number;
 };
-export type ListArgs = { query?: string; business?: string; status?: string; source_id?: string; assigned_agent?: string; archived?: boolean; page: number; limit: number };
+export type Urgency = "all" | "ready_now" | "overdue";
+export type LeadSort = "newest" | "next_action";
+export type ListArgs = { query?: string; business?: string; status?: string; source_id?: string; assigned_agent?: string; archived?: boolean; urgency?: Urgency; sort?: LeadSort; page: number; limit: number };
+export type CrmCalendar = { timezone: string; today: string };
+export type LeadList = CrmCalendar & { items: Lead[]; total: number; page: number; limit: number };
+export type LeadSummary = CrmCalendar & { total: number; by_business: Record<string, number>; by_status: Record<string, number>; urgency: { ready_now: number; overdue: number } };
+export type ActivityItem = { lead_id: string; lead_name: string; business: Business; action: string; actor: string; at: number; revision: number };
+export type ActivityList = CrmCalendar & { items: ActivityItem[]; total: number; page: number; limit: number };
+export type CrmReadSnapshot<T> = { key: string; data: T | null; error: string };
+
+export function crmReadState<T>(snapshot: CrmReadSnapshot<T> | null, key: string, enabled = true) {
+  const current = enabled && snapshot?.key === key ? snapshot : null;
+  // Errors must never retain the last successful payload.
+  return { data: current?.error ? null : current?.data ?? null, error: current?.error ?? "", loading: enabled && !current };
+}
+
+/** Shared scope for pipeline and activity; pagination and queue ordering are
+ * list-only. Empty selectors are omitted, but archived=false is meaningful. */
+export function crmScope(filters: ListArgs): Record<string, unknown> {
+  return Object.fromEntries(["business", "status", "source_id", "assigned_agent", "query", "archived"]
+    .map(key => [key, filters[key as keyof ListArgs]])
+    .filter(([, value]) => value !== "" && value !== undefined));
+}
+export function leadUrgency(lead: Lead, today: string): "overdue" | "today" | null {
+  if (!today || lead.archived || lead.status === "won" || lead.status === "lost" || !lead.next_action_date) return null;
+  return lead.next_action_date < today ? "overdue" : lead.next_action_date === today ? "today" : null;
+}
 
 /** A lead returned by the API contains immutable metadata and history. Never
  * spread that record into a form or mutation payload: schemas reject it. */

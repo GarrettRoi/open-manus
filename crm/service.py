@@ -10,6 +10,7 @@ from datetime import date
 
 from crm.contracts import ACTIONS, ADMIN, BUSINESSES, DESCRIPTIONS, LEAD_FIELDS, STATUSES
 from crm.store import CRMStore, PREFIX
+from crm.read_views import view, ReadLimitError
 
 
 class CRMError(Exception):
@@ -39,6 +40,8 @@ class CRMService:
             return {"ok": True, "result": result}
         except CRMError as exc:
             return {"ok": False, "error": {"code": exc.code, "message": exc.message}}
+        except ReadLimitError as exc:
+            return {"ok": False, "error": {"code": "unavailable", "message": str(exc)}}
         except Exception:
             # Never return Redis connection URLs, submitted payloads or credentials.
             return {"ok": False, "error": {"code": "unavailable", "message": "CRM storage unavailable; retry later"}}
@@ -143,20 +146,8 @@ class CRMService:
             if not lead:
                 raise CRMError("not_found", "Lead not found")
             return self._detail(lead)
-        if action in {"list", "summary"}:
-            rows = self.store.records("leads")
-            rows = [r for r in rows if r["archived"] == args.get("archived", False)]
-            for k in ("business", "status", "source_id", "assigned_agent"):
-                if k in args:
-                    rows = [r for r in rows if r.get(k) == args[k]]
-            if args.get("query"):
-                query = args["query"].casefold()
-                rows = [r for r in rows if query in " ".join(str(r.get(k, "")) for k in ("name", "email", "phone", "company", "external_id")).casefold()]
-            if action == "summary":
-                return {"total": len(rows), "by_business": {k: sum(r.get("business") == k for r in rows) for k in BUSINESSES},
-                        "by_status": {k: sum(r.get("status") == k for r in rows) for k in STATUSES}}
-            rows.sort(key=lambda r: r["created_at"], reverse=True)
-            return self._page([{k: v for k, v in r.items() if k not in {"notes", "history"}} for r in rows], args)
+        if action in {"list", "summary", "activity"}:
+            return view(self.redis, action, args)
         if action == "notifications":
             return self._page(sorted(self.store.events(), key=lambda e: e["created_at"], reverse=True), args)
         if action == "export":

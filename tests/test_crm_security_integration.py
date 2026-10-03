@@ -46,6 +46,49 @@ def test_actual_token_auth_owner_and_rejection(boundary):
     assert len(svc.store.records("leads")) == 1
 
 
+@pytest.mark.parametrize("action,args", [
+    ("summary", {"business": "real_estate"}),
+    ("list", {"urgency": "overdue"}),
+    ("activity", {"page": 1, "limit": 20}),
+])
+def test_owner_read_view_boundaries(boundary, action, args):
+    svc, web, client = boundary
+    payload = {"action": action, "args": args}
+    assert client.post("/api/crm/action", json=payload).status_code == 401
+    result = client.post("/api/crm/action", json=payload,
+                         headers={web._SESSION_HEADER_NAME: web._SESSION_TOKEN})
+    assert result.status_code == 200
+    assert result.json()["ok"]
+
+
+def test_service_identity_cannot_become_owner(boundary):
+    from crm.api import owner
+    _, web, _ = boundary
+    request = SimpleNamespace(
+        state=SimpleNamespace(token_authenticated=True,
+                              session=SimpleNamespace(provider="test", user_id="service")),
+        app=web.app)
+    assert owner(request) is None
+
+
+def test_crm_deep_link_and_proxy_prefix(boundary, monkeypatch, tmp_path):
+    from fastapi import FastAPI
+    _, web, _ = boundary
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "index.html").write_text(
+        '<html><head></head><body><script src="/assets/test.js"></script></body></html>')
+    monkeypatch.setattr(web, "WEB_DIST", tmp_path)
+    monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
+    application = FastAPI()
+    web.mount_spa(application)
+    client = TestClient(application)
+    response = client.get("/crm", headers={"X-Forwarded-Prefix": "/fleet"})
+    assert response.status_code == 200
+    assert 'window.__HERMES_BASE_PATH__="/fleet"' in response.text
+    assert 'src="/fleet/assets/test.js"' in response.text
+    assert "no-store" in response.headers["cache-control"]
+
+
 def test_actual_gated_auth_owner_and_rejection(boundary, monkeypatch):
     svc, web, client = boundary
     from hermes_cli.dashboard_auth import middleware
@@ -109,7 +152,7 @@ def test_mapping_rate_limit_and_secret_redaction(boundary, caplog, monkeypatch):
     assert secret not in caplog.text
     assert "Private payload marker" not in caplog.text
     # Storage errors must not expose the exception's embedded secret/payload.
-    monkeypatch.setattr(svc.store, "records", lambda _: (_ for _ in ()).throw(RuntimeError(secret)))
+    monkeypatch.setattr(svc.redis, "hlen", lambda _: (_ for _ in ()).throw(RuntimeError(secret)))
     error = svc.execute("list", {}, "agent:test", "agent")
     assert error["error"]["code"] == "unavailable"
     assert secret not in json.dumps(error) + caplog.text
